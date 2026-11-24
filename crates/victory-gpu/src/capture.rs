@@ -807,7 +807,7 @@ pub(crate) fn probe(
 /// Whether every pixel [`probe`] read is (near) black.
 pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copies finished (the present drained them).
+    // SAFETY: the copies finished (the next present settled them).
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return false;

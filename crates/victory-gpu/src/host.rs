@@ -1159,6 +1159,20 @@ impl Host {
         }
     }
 
+    /// Before a frame is presented: finishes the previous frame's
+    /// submissions, `previous` from [`Host::frame_done`] at its present.
+    fn previous_frame(&self, previous: Option<u64>) {
+        if let Some(value) = previous {
+            self.settle(value);
+        }
+    }
+
+    /// After a frame is presented: the newest submission, which the next
+    /// present waits for (the frame's own may still run until then).
+    fn frame_done(&self) -> Option<u64> {
+        self.timeline.span().map(|(_, newest)| newest)
+    }
+
     /// Finishes every submission made so far.
     pub(crate) fn drain(&self) {
         if let Some((_, newest)) = self.timeline.span() {
@@ -2794,6 +2808,14 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// The newest submission when the last frame was presented (its copy
+    /// to the back buffer included): the next present waits for it, so one
+    /// frame's GPU work runs on past its present.
+    presented: Option<u64>,
+    /// Diagnostics: the last presented frame and its probe, read at the
+    /// next present once that frame's GPU work has finished.
+    #[cfg(feature = "diagnostics")]
+    probed: Option<(u64, ID3D12Resource)>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -2935,9 +2957,16 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// as frame `frame` (saved if captures are on). Waits for the previous
+    /// frame's submissions, not this one's. In diagnostics builds: the
+    /// previous probed frame and whether it was black (read once its GPU
+    /// work has finished); else `None`.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+    ) -> Option<(u64, bool)> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -2972,6 +3001,15 @@ impl Host {
                 }
             }
         }
+        // The previous frame's GPU work (and its copy, whose list is reused
+        // below) finishes before this frame is presented; this frame's may
+        // still run. The title waits for its fences, not for the present:
+        // its submission thread calls PresentX before it hands its ring
+        // slots back (#1118), so a present that waits for the frame it
+        // presents holds that thread for the frame's whole GPU time.
+        self.previous_frame(p.presented.take());
+        #[cfg(feature = "diagnostics")]
+        let shown = p.probed.take().map(|(f, b)| (f, crate::capture::black(&b)));
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
@@ -2980,6 +3018,9 @@ impl Host {
                 return None;
             };
             p.copy.reset();
+            // The copy may still run after this returns: it holds the
+            // texture, which the title may release before the next present.
+            p.copy.keep(texture);
             let list = &p.copy.list;
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -3009,21 +3050,21 @@ impl Host {
             p.copy.close();
             self.execute(&[&p.copy]);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            // shortcut: the frame's submissions are finished before the
-            // present returns, as when every submission was waited for (the
-            // title may take a present for the GPU being done with the
-            // frame). Only work within a frame overlaps; let one frame run
-            // on once titles are known to wait for their fences instead.
-            self.drain();
+            p.presented = self.frame_done();
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
+                // A saved frame is read back now: its copy has to be done.
+                self.drain();
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            {
+                p.probed = probe.map(|b| (frame, b));
+                shown
+            }
             #[cfg(not(feature = "diagnostics"))]
-            Some(false)
+            None
         }
     }
 
@@ -3067,6 +3108,9 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                presented: None,
+                #[cfg(feature = "diagnostics")]
+                probed: None,
             })
         }
     }
@@ -3565,6 +3609,33 @@ mod submissions {
         };
         assert_eq!((a, b), (7, 9));
         assert!(!list.running());
+    }
+
+    /// A present waits for the previous frame's submissions, not its own:
+    /// the frame it presents is still running when it returns, and is
+    /// finished (bottom-of-pipe write included) once the next one begins.
+    #[test]
+    fn a_present_waits_for_the_previous_frame_not_its_own() {
+        let Some(host) = super::host() else { return }; // no host GPU here
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let word = Box::new(0u64);
+        let list = host.new_list().unwrap();
+        list.defer_write((&raw const *word).cast_mut().cast(), Written::Value(5), 8);
+        list.close();
+        let gate = Gate::new(host);
+        host.execute_gated(&[&list], &gate.0);
+        // This frame is presented while its GPU work is held back.
+        let presented = host.frame_done();
+        assert!(presented.is_some());
+        assert!(list.running());
+        // SAFETY: our word; nothing has written it yet.
+        assert_eq!(unsafe { std::ptr::read_volatile(&*word) }, 0);
+        gate.release();
+        // The next frame's present finishes it first.
+        host.previous_frame(presented);
+        assert!(!list.running());
+        // SAFETY: our word; the finishing thread is done with it.
+        assert_eq!(unsafe { std::ptr::read_volatile(&*word) }, 5);
     }
 
     /// A submission naming one list twice: the repeat's prelude records into

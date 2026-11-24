@@ -319,19 +319,30 @@ extern "system" fn present(
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was
-/// not, with what was presented and how many draws ran since.
+/// not, with what was presented and how many draws ran since (one frame
+/// late: a frame is read back once its GPU work has finished).
 #[cfg(all(windows, feature = "diagnostics"))]
-fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
+fn blinks(frame: u64, resource: This, state: u32, shown: Option<(u64, bool)>) {
+    /// The presented frame whose probe is read at the next present: its
+    /// number, what was presented (its address, only logged), the draw
+    /// count then and its draws.
+    type Presented = (u64, usize, u32, u64, Vec<String>);
+    static PENDING: std::sync::Mutex<Option<Presented>> = std::sync::Mutex::new(None);
     static LAST: std::sync::Mutex<(bool, u64, u64)> = std::sync::Mutex::new((false, 0, 0));
+    let now = (frame, resource as usize, state, crate::draw::drawn(), crate::draw::take_frame());
+    let Some((frame, resource, state, drawn, draws)) =
+        PENDING.lock().unwrap_or_else(|e| e.into_inner()).replace(now)
+    else {
+        return;
+    };
+    // A frame is probed once its GPU work is done, at the next present.
+    let black = shown.is_some_and(|(probed, black)| probed == frame && black);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    let drawn = crate::draw::drawn();
-    let black = shown.unwrap_or(false);
-    let draws = crate::draw::take_frame();
     if black && !last.0 {
         last.2 += 1;
         tracing::warn!(
             frame,
-            resource = ?resource,
+            resource = format_args!("{resource:#x}"),
             state = format_args!("{state:#x}"),
             draws = drawn - last.1,
             copied = shown.is_some(),
