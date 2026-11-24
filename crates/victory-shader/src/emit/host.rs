@@ -3,10 +3,14 @@
 
 use std::ffi::CString;
 
+#[cfg(test)]
+use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+#[cfg(test)]
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, PCSTR};
 
 use super::HostShader;
@@ -60,6 +64,45 @@ fn target_format(e: &SigElement) -> DXGI_FORMAT {
 
 fn err(e: windows::core::Error) -> String {
     e.message().to_string()
+}
+
+/// Waits until `fence` reaches `value`, without spinning: the queue sets an
+/// event when it does. The timeout keeps the device-removal check - a removed
+/// device never signals - so the wait reports it instead of hanging the run.
+#[cfg(test)]
+fn wait(fence: &ID3D12Fence, dev: &ID3D12Device, value: u64) -> Result<(), String> {
+    // SAFETY: the event is ours, and the fence is done with it before it is
+    // closed (it is leaked if it is not, since the fence may yet signal it).
+    unsafe {
+        let event = CreateEventW(None, false, false, None).map_err(err)?;
+        if let Err(e) = fence.SetEventOnCompletion(value, event) {
+            let _ = CloseHandle(event);
+            return Err(err(e));
+        }
+        // 100 ms: nothing while the GPU runs, and a wedged device is reported
+        // rather than waited for.
+        loop {
+            match WaitForSingleObject(event, 100) {
+                WAIT_OBJECT_0 => break,
+                WAIT_TIMEOUT => {
+                    if let Err(e) = dev.GetDeviceRemovedReason() {
+                        // The fence may still signal it, so it is not closed:
+                        // one handle, on the path that ends the run anyway.
+                        return Err(format!("device removed: {}", err(e)));
+                    }
+                }
+                other => {
+                    let _ = CloseHandle(event);
+                    return Err(format!("wait failed: {}", other.0));
+                }
+            }
+        }
+        let _ = CloseHandle(event);
+        if let Err(e) = dev.GetDeviceRemovedReason() {
+            return Err(format!("device removed: {}", err(e)));
+        }
+        Ok(())
+    }
 }
 
 impl Host {
@@ -855,18 +898,7 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if dev.GetDeviceRemovedReason().is_err() {
-                    return Err(format!(
-                        "device removed: {}",
-                        err(dev.GetDeviceRemovedReason().unwrap_err())
-                    ));
-                }
-                std::thread::yield_now();
-            }
-            if let Err(e) = dev.GetDeviceRemovedReason() {
-                return Err(format!("device removed: {}", err(e)));
-            }
+            wait(&fence, dev, 1)?;
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
             let mut out = Vec::with_capacity((w * h) as usize);
@@ -1345,12 +1377,7 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            wait(&fence, dev, 1)?;
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();
