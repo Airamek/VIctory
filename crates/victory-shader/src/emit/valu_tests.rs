@@ -1549,3 +1549,53 @@ fn v_cmp_f_and_t_64bit_match_rdna2() {
         );
     }
 }
+#[test]
+fn scalar_absdiff_and_pack_match_rdna2() {
+    // s_absdiff_i32 (SOP2 0x2c): returns |s0 - s1| in 32-bit two's complement and sets SCC = (res != 0).
+    let absdiff_val = build_valu_cs(&[sop2(0x2c, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+    let absdiff_scc = build_valu_cs(&[
+        sop2(0x2c, 6, 0, 1),
+        sop2(0x0a, 7, 0x81, 0x80), // s_cselect_b32 s7, 1, 0
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    let absdiff_cases: &[([u32; 4], u32, u32)] = &[
+        ([10, 3, 0, 0], 7, 1),
+        ([3, 10, 0, 0], 7, 1),
+        ([(-5i32) as u32, (-5i32) as u32, 0, 0], 0, 0),
+        ([(-10i32) as u32, 5, 0, 0], 15, 1),
+        // Signed 32-bit difference wraparound: i32::MIN - 0 = i32::MIN -> -i32::MIN wraps to i32::MIN, SCC = 1.
+        ([0x8000_0000, 0, 0, 0], 0x8000_0000, 1),
+    ];
+    let absdiff_in: Vec<[u32; 4]> = absdiff_cases.iter().map(|c| c.0).collect();
+    run_cases(&absdiff_val, &absdiff_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, absdiff_cases[i].1,
+            "{backend}: s_absdiff_i32({:#010x}, {:#010x}) = {got:#010x}",
+            inp[0], inp[1],
+        );
+    });
+    run_cases(&absdiff_scc, &absdiff_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, absdiff_cases[i].2,
+            "{backend}: s_absdiff_i32 SCC({:#010x}, {:#010x}) = {got}",
+            inp[0], inp[1],
+        );
+    });
+
+    // s_pack_ll_b32_b16 (0x32), s_pack_lh_b32_b16 (0x33), s_pack_hh_b32_b16 (0x34).
+    let pack_inputs = [[0x1122_3344, 0x5566_7788, 0, 0], [0xabcd_0001, 0x0002_ef90, 0, 0]];
+    for (op, name, expected) in [
+        (0x32u8, "s_pack_ll_b32_b16", [0x7788_3344u32, 0xef90_0001u32]),
+        (0x33u8, "s_pack_lh_b32_b16", [0x5566_3344u32, 0x0002_0001u32]),
+        (0x34u8, "s_pack_hh_b32_b16", [0x5566_1122u32, 0x0002_abcdu32]),
+    ] {
+        let shader = build_valu_cs(&[sop2(op, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+        run_cases(&shader, &pack_inputs, |backend, i, inp, got| {
+            assert_eq!(
+                got, expected[i],
+                "{backend}: {name}({:#010x}, {:#010x}) = {got:#010x}, want {:#010x}",
+                inp[0], inp[1], expected[i],
+            );
+        });
+    }
+}
