@@ -1,7 +1,7 @@
 use super::*;
 
 /// The snapshots are one for all copies: one test at a time.
-static ONE: Mutex<()> = Mutex::new(());
+pub(super) static ONE: Mutex<()> = Mutex::new(());
 
 /// Parts kept of a copy, against a byte-by-byte model.
 #[test]
@@ -79,7 +79,7 @@ fn copies_back_what_changed_in_declared_ranges() {
         };
         assert_eq!(byte, want, "at {i:#x}");
     }
-    assert!(shadow.before.lock().unwrap().is_empty());
+    assert!(shadow.before.lock().unwrap().0.is_empty());
     assert!(shadow.pending.lock().unwrap().is_empty());
     drop(title);
 }
