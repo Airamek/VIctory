@@ -4438,7 +4438,11 @@ impl<'a> Lower<'a> {
             "v_add_nc_u16",
             "v_sub_nc_u16",
             "v_subrev_nc_u16",
+            "v_add_nc_i16",
+            "v_sub_nc_i16",
             "v_mul_lo_u16",
+            "v_mad_u16",
+            "v_mad_i16",
             "v_lshlrev_b16",
             "v_lshrrev_b16",
             "v_ashrrev_i16",
@@ -4595,8 +4599,12 @@ impl<'a> Lower<'a> {
             let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
             return self.write_half(inst, r, guard);
         }
-        // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        // 16-bit integers: computed on the selected halves, the low 16 bits kept.
+        let clamp_ok = matches!(
+            name,
+            "v_add_nc_i16" | "v_sub_nc_i16" | "v_mad_i16" | "v_mad_u16"
+        );
+        if (v.clamp && !clamp_ok) || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
@@ -4625,16 +4633,51 @@ impl<'a> Lower<'a> {
                     let t = l.s.m.bin(c, Bin::Shl, x, k16);
                     l.s.m.bin(c, Bin::AShr, t, k16)
                 };
-                if name.ends_with("_i16") {
+                let signed = name.ends_with("_i16");
+                if signed {
                     a = sext(self, a);
                     b = sext(self, b);
                 }
+                let clamp16 = |l: &mut Self, x: V| {
+                    if !v.clamp {
+                        return x;
+                    }
+                    if signed {
+                        let lo = l.s.m.i32(i32::from(i16::MIN) as u32);
+                        let hi = l.s.m.i32(i32::from(i16::MAX) as u32);
+                        let below = l.s.m.cmp(c, pred::SLT, x, lo);
+                        let x = l.s.m.select(c, below, lo, x);
+                        let above = l.s.m.cmp(c, pred::SGT, x, hi);
+                        l.s.m.select(c, above, hi, x)
+                    } else {
+                        let hi = l.s.m.i32(u32::from(u16::MAX));
+                        let above = l.s.m.cmp(c, pred::IUGT, x, hi);
+                        l.s.m.select(c, above, hi, x)
+                    }
+                };
                 let k15 = self.s.m.i32(15);
                 match name {
                     "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
                     "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
                     "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
+                    "v_add_nc_i16" => {
+                        let r = self.s.m.bin(c, Bin::Add, a, b);
+                        clamp16(self, r)
+                    }
+                    "v_sub_nc_i16" => {
+                        let r = self.s.m.bin(c, Bin::Sub, a, b);
+                        clamp16(self, r)
+                    }
                     "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
+                    "v_mad_u16" | "v_mad_i16" => {
+                        let mut d = self.half_src(inst, 2)?;
+                        if signed {
+                            d = sext(self, d);
+                        }
+                        let m = self.s.m.bin(c, Bin::Mul, a, b);
+                        let r = self.s.m.bin(c, Bin::Add, m, d);
+                        clamp16(self, r)
+                    }
                     "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
                         // src0 is the shift (4 bits), src1 the value.
                         let sh = self.s.m.bin(c, Bin::And, a, k15);
