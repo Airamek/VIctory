@@ -607,12 +607,10 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        if typeless {
-            if let Some(format) = format {
-                *format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
-                    crate::resource::concrete_srv_format(own) as i32,
-                );
-            }
+        if typeless && let Some(format) = format {
+            *format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
+                crate::resource::concrete_srv_format(own) as i32,
+            );
         }
         return true;
     }
