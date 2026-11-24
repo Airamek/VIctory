@@ -14,7 +14,9 @@
 //! `cargo test -p victory-shader --lib fuzz_tests -- --ignored --nocapture`.
 //! `VICTORY_FUZZ_CASES` sets the inputs per opcode (default 160),
 //! `VICTORY_FUZZ_OPS` limits the run to names containing one of its
-//! comma-separated parts, and `VICTORY_FUZZ_OUT` names a Markdown report.
+//! comma-separated parts, `VICTORY_FUZZ_MODS=1` also tries float VOP3 opcodes
+//! with source and output modifiers (abs, neg, clamp, omod), and
+//! `VICTORY_FUZZ_OUT` names a Markdown report.
 //! Each finding lists its simplest disagreeing inputs first, with the
 //! instruction words and inputs a regression test needs. With fewer than two
 //! devices (CI's runners have WARP only) there is nothing to compare, and the
@@ -148,6 +150,9 @@ fn build(words: &[u32]) -> Result<HostShader, String> {
     for i in 0..4u8 {
         w.push(vop1(0x001, i + 1, u16::from(i)));
     }
+    // v0 = v4: a defined accumulator for the opcodes that read their
+    // destination (v_mac_*, v_fmac_*).
+    w.push(vop1(0x001, 0, vgpr(4)));
     w.extend_from_slice(words);
     w.extend(buffer_store_dword(0, 8));
     w.push(S_ENDPGM);
@@ -346,14 +351,18 @@ fn agree(name: &str, a: u32, b: u32) -> bool {
         let (x, y) = (a >> 16, b >> 16);
         return a & 0xFFFF == b & 0xFFFF && (x == y || (is_f16_nan(x) && is_f16_nan(y)));
     }
-    if name.starts_with("v_pk_") && name.ends_with("_f16") {
+    if (name.starts_with("v_pk_") && name.ends_with("_f16")) || name == "v_cvt_pkrtz_f16_f32" {
         // Two f16 results: each half equal, or NaN in both.
         return [0, 16].iter().all(|s| {
             let (x, y) = (a >> s & 0xFFFF, b >> s & 0xFFFF);
             x == y || (is_f16_nan(x) && is_f16_nan(y))
         });
     }
-    let half = name.contains("16") && name.contains("_f");
+    // The result's type: a conversion's comes first (v_cvt_<to>_<from>).
+    let half = match name.strip_prefix("v_cvt_") {
+        Some(rest) => rest.starts_with("f16"),
+        None => name.contains("16") && name.contains("_f"),
+    };
     let float = name.contains("_f") || name.contains("frexp") || name.contains("ldexp");
     if float && !half && is_f32_nan(a) && is_f32_nan(b) {
         return true;
@@ -377,8 +386,30 @@ fn agree(name: &str, a: u32, b: u32) -> bool {
 struct Finding {
     op: u16,
     name: &'static str,
+    variant: &'static str,
+    words: Vec<u32>,
     cases: usize,
     mismatches: Vec<([u32; 4], Vec<u32>)>,
+}
+
+/// VOP3 source and output modifiers: (label, abs bits, neg bits, clamp,
+/// omod). Tried on float VOP3 opcodes with `VICTORY_FUZZ_MODS=1`.
+const MODS: &[(&str, u32, u32, bool, u32)] = &[
+    ("abs src0, neg src1", 0b001, 0b010, false, 0),
+    ("neg src0 and src2", 0, 0b101, false, 0),
+    ("abs src1 and src2", 0b110, 0, false, 0),
+    ("clamp", 0, 0, true, 0),
+    ("omod *2", 0, 0, false, 1),
+    ("omod *4", 0, 0, false, 2),
+    ("omod /2, clamp", 0, 0, true, 3),
+];
+
+/// `words` (one VOP3 instruction) with these modifiers.
+fn with_mods(words: &[u32], abs: u32, neg: u32, clamp: bool, omod: u32) -> Vec<u32> {
+    let mut w = words.to_vec();
+    w[0] |= abs << 8 | u32::from(clamp) << 15;
+    w[1] |= omod << 27 | neg << 29;
+    w
 }
 
 #[test]
@@ -388,6 +419,7 @@ fn valu_hardware_and_warp_agree() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(160usize);
+    let mods = std::env::var("VICTORY_FUZZ_MODS").is_ok_and(|v| v == "1");
     let only: Vec<String> = std::env::var("VICTORY_FUZZ_OPS")
         .map(|v| v.split(',').map(str::to_string).collect())
         .unwrap_or_default();
@@ -406,8 +438,18 @@ fn valu_hardware_and_warp_agree() {
     // Every lowered opcode with its inputs.
     let mut refused = Vec::new();
     let mut work = Vec::new();
+    let mut variants: Vec<(u16, &'static str, &'static str, Vec<u32>)> = Vec::new();
     for &(op, name) in &ops {
-        match build(&body(op)) {
+        variants.push((op, name, "", body(op)));
+        let float = name.contains("_f32") || name.contains("_f16");
+        if mods && float && (0x100..PACKED).contains(&op) {
+            for &(label, abs, neg, clamp, omod) in MODS {
+                variants.push((op, name, label, with_mods(&body(op), abs, neg, clamp, omod)));
+            }
+        }
+    }
+    for (op, name, variant, words) in variants {
+        match build(&words) {
             Ok(shader) => {
                 let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ u64::from(op));
                 let inputs: Vec<[u32; 4]> = (0..cases)
@@ -420,9 +462,9 @@ fn valu_hardware_and_warp_agree() {
                         ]
                     })
                     .collect();
-                work.push((op, name, shader, inputs));
+                work.push((op, name, variant, words, shader, inputs));
             }
-            Err(e) => refused.push((name, e)),
+            Err(e) => refused.push((name, format!("{variant}: {e}"))),
         }
     }
 
@@ -443,7 +485,7 @@ fn valu_hardware_and_warp_agree() {
         };
         let mut host = Some(h);
         let mut column = Vec::new();
-        for (_, name, shader, inputs) in &work {
+        for (_, name, _, _, shader, inputs) in &work {
             let run = (|| -> Result<Vec<u32>, String> {
                 let host = host.as_ref().ok_or("no device")?;
                 let (root, pso) = host.compute_pipeline(shader)?;
@@ -496,7 +538,7 @@ fn valu_hardware_and_warp_agree() {
 
     let mut findings = Vec::new();
     let mut tested = 0;
-    for (i, (op, name, _, inputs)) in work.iter().enumerate() {
+    for (i, (op, name, variant, words, _, inputs)) in work.iter().enumerate() {
         let cols: Vec<&Vec<u32>> = results.iter().filter_map(|c| c[i].as_ref()).collect();
         if cols.len() != results.len() {
             continue;
@@ -513,13 +555,15 @@ fn valu_hardware_and_warp_agree() {
             // Simplest inputs first: fewest non-zero dwords, then smallest.
             mismatches.sort_by_key(|(i, _)| (i.iter().filter(|&&x| x != 0).count(), *i));
             eprintln!(
-                "{name} ({}): {} of {cases} differ",
+                "{name} {variant} ({}): {} of {cases} differ",
                 encoding(*op),
                 mismatches.len()
             );
             findings.push(Finding {
                 op: *op,
                 name,
+                variant,
+                words: words.clone(),
                 cases,
                 mismatches,
             });
@@ -539,8 +583,13 @@ fn valu_hardware_and_warp_agree() {
     for f in &findings {
         let _ = writeln!(
             md,
-            "## `{}` ({}): {} of {} differ\n\n| v1 | v2 | v3 | {} |\n|---|---|---|{}",
+            "## `{}`{} ({}): {} of {} differ\n\n| v1 | v2 | v3 | v4 | {} |\n|---|---|---|---|{}",
             f.name,
+            if f.variant.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", f.variant)
+            },
             encoding(f.op),
             f.mismatches.len(),
             f.cases,
@@ -551,17 +600,18 @@ fn valu_hardware_and_warp_agree() {
             let outs: Vec<String> = outs.iter().map(|x| format!("`{x:#010x}`")).collect();
             let _ = writeln!(
                 md,
-                "| `{:#010x}` | `{:#010x}` | `{:#010x}` | {} |",
+                "| `{:#010x}` | `{:#010x}` | `{:#010x}` | `{:#010x}` | {} |",
                 i[0],
                 i[1],
                 i[2],
+                i[3],
                 outs.join(" | ")
             );
         }
         // A regression test needs only these: the instruction, and the
         // first (simplest) input in v1..v4 (see `build`).
         if let Some((i, _)) = f.mismatches.first() {
-            let words: Vec<String> = body(f.op).iter().map(|w| format!("{w:#010x}")).collect();
+            let words: Vec<String> = f.words.iter().map(|w| format!("{w:#010x}")).collect();
             let _ = writeln!(
                 md,
                 "\nRepro: `build(&[{}])` with v1..v4 = `[{:#010x}, {:#010x}, {:#010x}, {:#010x}]`.",
