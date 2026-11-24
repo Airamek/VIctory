@@ -1,6 +1,6 @@
 //! Cross-device differential fuzzing of single VALU instructions.
 //!
-//! Every VOP3-encoded GFX10 opcode the translator lowers runs as a one-thread
+//! Every VOP3- and VOP3P-encoded GFX10 opcode the translator lowers runs as a one-thread
 //! compute shader on every hardware adapter and on WARP, on the same inputs:
 //! special floats (signed zeros, denormals, infinities, quiet and signalling
 //! NaNs), integer edges, f16 edges in either half, and pseudo-random dwords.
@@ -60,10 +60,24 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
-/// The instruction words of `op` reading v1, v2, v3 (VOPC: v1, v2) and
-/// leaving its result in v0.
+/// Opcodes at and above this are VOP3P (packed), less it.
+const PACKED: u16 = 0x1000;
+
+/// VOP3P `op vdst, src0, src1, src2`, each half from its own half
+/// (op_sel 0, op_sel_hi 1), no modifiers.
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x33 << 26 | (op as u32 & 0x7F) << 16 | 1 << 14 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18 | 3 << 27,
+    ]
+}
+
+/// The instruction words of `op` (VOP3, or VOP3P from [`PACKED`]) reading
+/// v1, v2, v3 (VOPC: v1, v2) and leaving its result in v0.
 fn body(op: u16) -> Vec<u32> {
-    if op < 0x100 {
+    if op >= PACKED {
+        vop3p(op - PACKED, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec()
+    } else if op < 0x100 {
         // A compare writes s[20:21]; v_cndmask_b32 v0, 0, 1, s[20:21].
         let mut w = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
         w.extend(vop3(0x101, 0, 0x80, 0x81, 20));
@@ -73,9 +87,9 @@ fn body(op: u16) -> Vec<u32> {
     }
 }
 
-/// The machine name of `op` in VOP3 encoding, if GFX10 has one.
+/// The machine name of `op` (see [`body`]), if GFX10 has one.
 fn name_of(op: u16) -> Option<&'static str> {
-    let words = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3));
+    let words = body(op);
     let code: Vec<u8> = [words[0], words[1], S_ENDPGM]
         .iter()
         .flat_map(|w| w.to_le_bytes())
@@ -85,6 +99,14 @@ fn name_of(op: u16) -> Option<&'static str> {
     (!name.is_empty()).then_some(name)
 }
 
+/// How a report names `op`'s encoding.
+fn encoding(op: u16) -> String {
+    if op >= PACKED {
+        format!("VOP3P {:#04x}", op - PACKED)
+    } else {
+        format!("VOP3 {op:#05x}")
+    }
+}
 /// Whether the fuzzer leaves `name` out: lane, EXEC and interpolation
 /// instructions, and ones with no single-dword result to compare.
 fn skipped(name: &str) -> bool {
@@ -315,6 +337,18 @@ fn agree(name: &str, a: u32, b: u32) -> bool {
     if a == b {
         return true;
     }
+    if name == "v_fma_mixhi_f16" {
+        // The f16 result is the high half; the low half is kept.
+        let (x, y) = (a >> 16, b >> 16);
+        return a & 0xFFFF == b & 0xFFFF && (x == y || (is_f16_nan(x) && is_f16_nan(y)));
+    }
+    if name.starts_with("v_pk_") && name.ends_with("_f16") {
+        // Two f16 results: each half equal, or NaN in both.
+        return [0, 16].iter().all(|s| {
+            let (x, y) = (a >> s & 0xFFFF, b >> s & 0xFFFF);
+            x == y || (is_f16_nan(x) && is_f16_nan(y))
+        });
+    }
     let half = name.contains("16") && name.contains("_f");
     let float = name.contains("_f") || name.contains("frexp") || name.contains("ldexp");
     if float && !half && is_f32_nan(a) && is_f32_nan(b) {
@@ -358,6 +392,7 @@ fn valu_hardware_and_warp_agree() {
         .unwrap_or_else(|e| e.into_inner());
 
     let mut ops: Vec<(u16, &'static str)> = (0u16..0x400)
+        .chain(PACKED..PACKED + 0x80)
         .filter_map(|op| name_of(op).map(|n| (op, n)))
         .filter(|(_, n)| n.starts_with("v_") && !skipped(n))
         .filter(|(_, n)| only.is_empty() || only.iter().any(|o| n.contains(o.as_str())))
@@ -463,7 +498,11 @@ fn valu_hardware_and_warp_agree() {
             .map(|(j, inp)| (*inp, cols.iter().map(|c| c[j]).collect()))
             .collect();
         if !mismatches.is_empty() {
-            eprintln!("{name} ({op:#05x}): {} of {cases} differ", mismatches.len());
+            eprintln!(
+                "{name} ({}): {} of {cases} differ",
+                encoding(*op),
+                mismatches.len()
+            );
             findings.push(Finding {
                 op: *op,
                 name,
@@ -486,9 +525,9 @@ fn valu_hardware_and_warp_agree() {
     for f in &findings {
         let _ = writeln!(
             md,
-            "## `{}` (VOP3 {:#05x}): {} of {} differ\n\n| v1 | v2 | v3 | {} |\n|---|---|---|{}",
+            "## `{}` ({}): {} of {} differ\n\n| v1 | v2 | v3 | {} |\n|---|---|---|{}",
             f.name,
-            f.op,
+            encoding(f.op),
             f.mismatches.len(),
             f.cases,
             labels.join(" | "),
