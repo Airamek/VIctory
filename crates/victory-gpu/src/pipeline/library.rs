@@ -25,7 +25,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -65,6 +65,23 @@ const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
+/// Loads of one pipeline name must not overlap; different names may. Stores
+/// stay serialised by the library mutex.
+const NAME_LOCKS: usize = 64;
+static LOCKS: [Mutex<()>; NAME_LOCKS] = [const { Mutex::new(()) }; NAME_LOCKS];
+
+fn lock_name(name: &str) -> MutexGuard<'static, ()> {
+    let mut h = 0usize;
+    for b in name.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(b as usize);
+    }
+    LOCKS[h % NAME_LOCKS].lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The library's interface, kept alive beside `LIBRARY`, so loads do not
+/// need the mutex over the bookkeeping.
+static LOADS: OnceLock<Option<ID3D12PipelineLibrary1>> = OnceLock::new();
+
 fn library() -> Option<&'static Mutex<Library>> {
     static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
     LIBRARY
@@ -83,6 +100,7 @@ fn library() -> Option<&'static Mutex<Library>> {
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
+            let _ = LOADS.set(library.as_ref().map(|l| l.library.clone()));
             library.map(Mutex::new)
         })
         .as_ref()
@@ -201,15 +219,19 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
-    if let Ok(pso) = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr())) {
-        LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(pso);
+    if let Some(loads) = LOADS.get().and_then(Option::as_ref) {
+        let _name = lock_name(name);
+        if let Ok(pso) = load(loads, PCWSTR(wide.as_ptr())) {
+            LOADED.fetch_add(1, Ordering::Relaxed);
+            return Ok(pso);
+        }
     }
-    // Compiled outside the lock: compiles take up to seconds.
+    // Compiled outside the locks: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), false)));
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
+    let _name = lock_name(name);
     let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.

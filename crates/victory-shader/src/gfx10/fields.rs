@@ -188,7 +188,7 @@ impl Instruction {
     /// Decodes the operand fields. `wave64` sizes lane masks.
     pub fn fields(&self, wave64: bool) -> Fields {
         let name = self.name().unwrap_or("");
-        let w = |i: usize| self.words.get(i).copied().unwrap_or(0);
+        let w = |i: usize| self.words().get(i).copied().unwrap_or(0);
         let (w0, w1) = (w(0), w(1));
         let bit = |word: u32, n: u32| word >> n & 1 != 0;
         let cache = |glc, slc, dlc| Cache { glc, slc, dlc };
@@ -431,7 +431,7 @@ impl Instruction {
         if matches!(name, "v_nop" | "v_pipeflush" | "v_clrexcp") {
             return Valu::default();
         }
-        let w = |i: usize| self.words.get(i).copied().unwrap_or(0);
+        let w = |i: usize| self.words().get(i).copied().unwrap_or(0);
         let w0 = w(0);
         let (dst_n, src_n) = valu_dwords(name);
         let compare = match self.encoding {
@@ -725,7 +725,6 @@ fn salu_dwords(name: &str) -> (u8, u8, u8) {
 
 /// (vdst, [src0, src1, src2]) dwords of a VALU opcode.
 fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
-    let parts: Vec<&str> = name.split('_').collect();
     match name {
         "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => (2, [1, 2, 2]),
         "v_ldexp_f64" | "v_trig_preop_f64" | "v_cmp_class_f64" | "v_cmpx_class_f64" => {
@@ -735,12 +734,24 @@ fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
         "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" => (2, [2, 1, 2]),
         "v_mqsad_u32_u8" => (4, [2, 1, 4]),
         "v_frexp_exp_i32_f64" => (1, [2; 3]),
-        _ if parts.len() == 4 && parts[1] == "cvt" => {
-            (type_dwords(parts[2]), [type_dwords(parts[3]); 3])
-        }
         _ => {
-            let n = type_dwords(parts.last().copied().unwrap_or(""));
-            (n, [n; 3])
+            let mut parts = name.split('_');
+            // `v_cvt_<dst type>_<src type>`, and nothing past it.
+            match (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) {
+                (Some(_), Some("cvt"), Some(dst), Some(src), None) => {
+                    (type_dwords(dst), [type_dwords(src); 3])
+                }
+                _ => {
+                    let n = type_dwords(name.rsplit('_').next().unwrap_or(""));
+                    (n, [n; 3])
+                }
+            }
         }
     }
 }
