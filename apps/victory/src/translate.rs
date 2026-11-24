@@ -336,6 +336,25 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
+    // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates
+    // those containers alone (prefixes of the 16-digit `hash=` a runtime
+    // log names the shader by).
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VICTORY_TRANSLATE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if !only.is_empty()
+        && !only.iter().any(|o| {
+            blake3::hash(&bytes).to_hex()[..16].starts_with(o.as_str())
+        })
+    {
+        return;
+    }
     t.containers += 1;
     name_shader(&bytes, path, source);
     let Ok(container) = Container::parse(&bytes) else {
