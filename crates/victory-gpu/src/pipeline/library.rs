@@ -250,7 +250,10 @@ thread_local! {
 }
 
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and `SAVE_EVERY` has passed (or `now`). A periodic save is
+/// crash insurance only: it never waits for the library lock (serializing
+/// a big library holds it for seconds, stalling every pipeline a worker
+/// loads or stores); the end-of-run save still waits.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -262,8 +265,13 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let mut l = if now {
+        library.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        let Ok(l) = library.try_lock() else { return };
+        l
+    };
     let (blob, prebuilt) = {
-        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
             return;
         }
