@@ -3029,7 +3029,13 @@ impl<'a> Lower<'a> {
                     5 => 7,
                     _ => return Err("an image dimension (cube or MSAA)"),
                 };
-                ((kind | u, 0x409), Some(kind))
+                // Declared 2D for a 1D (array), as `image` reads them.
+                let host_kind = match kind {
+                    1 => 2,
+                    6 => 7,
+                    k => k,
+                };
+                ((host_kind | u, 0x409), Some(kind))
             }
             Fields::Buffer { idxen, format, .. } => {
                 let stride = used.map_or(0, |u| u.stride);
@@ -3069,7 +3075,8 @@ impl<'a> Lower<'a> {
                 let (height, depth) = match kind {
                     1 => (one, one),
                     2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
+                    // the 2D array's layers (third place)
+                    6 => (one, field(self, 2)),
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };
@@ -5802,6 +5809,24 @@ impl<'a> Lower<'a> {
             5 => (7, 3),
             _ => return Err("an image dimension (cube loads or MSAA)"),
         };
+        // 1D and 1D arrays are read as 2D ones one texel high, as the host
+        // makes their textures and views (a title's 1D texture is also
+        // sampled with 2D instructions): the addresses are read as 1D and
+        // get y = 0 (`flat_to_2d`), the slice moving to the third place.
+        let flat = kind == 1 || kind == 6;
+        let host_kind = match kind {
+            1 => 2,
+            6 => 7,
+            k => k,
+        };
+        let flat_to_2d = |cs: &mut [V], zero: V| {
+            if kind == 6 {
+                cs[2] = cs[1];
+            }
+            if flat {
+                cs[1] = zero;
+            }
+        };
         // Address VGPRs in order.
         let mut regs = Vec::new();
         for a in addr {
@@ -5834,7 +5859,7 @@ impl<'a> Lower<'a> {
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let props = (host_kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // DXIL's atomic operations on a 32-bit integer texture UAV; the
             // old value returns with glc. Sub is the add of the negation.
@@ -5868,6 +5893,7 @@ impl<'a> Lower<'a> {
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 *slot = addr_val(self, k)?;
             }
+            flat_to_2d(&mut cs, self.s.m.i32(0));
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
@@ -5881,7 +5907,7 @@ impl<'a> Lower<'a> {
                 Some(v) if cache.glc => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            let h = self.handle(site, src, false, (host_kind | 0x1000, 0x105))?;
             let at = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             let mut args = vec![h];
@@ -5924,6 +5950,7 @@ impl<'a> Lower<'a> {
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 *slot = addr_val(self, k)?;
             }
+            flat_to_2d(&mut cs, self.s.m.i32(0));
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
@@ -6002,10 +6029,12 @@ impl<'a> Lower<'a> {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                // A 1D array's layers, read from the 2D array's third place.
+                let from = if kind == 6 && ch == 1 { 2 } else { ch };
                 let x = if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
-                    self.s.m.extract(c, d, ch)
+                    self.s.m.extract(c, d, from)
                 };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
@@ -6074,6 +6103,7 @@ impl<'a> Lower<'a> {
                     *slot = self.s.m.bin(c, Bin::SDiv, *slot, n);
                 }
             }
+            flat_to_2d(&mut cs, self.s.m.f32(0));
             if op == 81 {
                 // The clamped then the unclamped level of detail.
                 let Operand::Vector { reg, .. } = *data else {
@@ -6102,7 +6132,8 @@ impl<'a> Lower<'a> {
             };
             let zero = self.s.m.i32(0);
             let mut os = vec![iu; 3];
-            for o in os.iter_mut().take(offsets) {
+            // A 1D sample's y offset (its texture is 2D on the host) is 0.
+            for o in os.iter_mut().take(offsets + usize::from(flat)) {
                 *o = zero;
             }
             let mut args = vec![h, sh];
@@ -6154,6 +6185,11 @@ impl<'a> Lower<'a> {
                         g[k] = to_float(self, x);
                         let y = addr_val(self, first + spatial + k)?;
                         g[3 + k] = to_float(self, y);
+                    }
+                    if flat {
+                        // No change along the host texture's one-texel y.
+                        let z = self.s.m.f32(0);
+                        (g[1], g[4]) = (z, z);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -6242,6 +6278,7 @@ impl<'a> Lower<'a> {
             } else {
                 self.s.m.i32(0)
             };
+            flat_to_2d(&mut cs, self.s.m.i32(0));
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
