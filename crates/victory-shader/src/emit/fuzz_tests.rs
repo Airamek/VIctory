@@ -15,6 +15,10 @@
 //! `VICTORY_FUZZ_CASES` sets the inputs per opcode (default 160),
 //! `VICTORY_FUZZ_OPS` limits the run to names containing one of its
 //! comma-separated parts, and `VICTORY_FUZZ_OUT` names a Markdown report.
+//! Each finding lists its simplest disagreeing inputs first, with the
+//! instruction words and inputs a regression test needs. With fewer than two
+//! devices (CI's runners have WARP only) there is nothing to compare, and the
+//! test returns.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -481,7 +485,14 @@ fn valu_hardware_and_warp_agree() {
         results.push(column);
         labels.push(label.clone());
     }
-    assert!(labels.len() >= 2, "need two devices to compare");
+    if labels.len() < 2 {
+        // CI's runners have WARP only: nothing to compare it with.
+        eprintln!(
+            "fewer than two SM 6.6 devices ({}); nothing to compare",
+            labels.join(", ")
+        );
+        return;
+    }
 
     let mut findings = Vec::new();
     let mut tested = 0;
@@ -498,6 +509,9 @@ fn valu_hardware_and_warp_agree() {
             .map(|(j, inp)| (*inp, cols.iter().map(|c| c[j]).collect()))
             .collect();
         if !mismatches.is_empty() {
+            let mut mismatches = mismatches;
+            // Simplest inputs first: fewest non-zero dwords, then smallest.
+            mismatches.sort_by_key(|(i, _)| (i.iter().filter(|&&x| x != 0).count(), *i));
             eprintln!(
                 "{name} ({}): {} of {cases} differ",
                 encoding(*op),
@@ -542,6 +556,20 @@ fn valu_hardware_and_warp_agree() {
                 i[1],
                 i[2],
                 outs.join(" | ")
+            );
+        }
+        // A regression test needs only these: the instruction, and the
+        // first (simplest) input in v1..v4 (see `build`).
+        if let Some((i, _)) = f.mismatches.first() {
+            let words: Vec<String> = body(f.op).iter().map(|w| format!("{w:#010x}")).collect();
+            let _ = writeln!(
+                md,
+                "\nRepro: `build(&[{}])` with v1..v4 = `[{:#010x}, {:#010x}, {:#010x}, {:#010x}]`.",
+                words.join(", "),
+                i[0],
+                i[1],
+                i[2],
+                i[3]
             );
         }
         md.push('\n');
