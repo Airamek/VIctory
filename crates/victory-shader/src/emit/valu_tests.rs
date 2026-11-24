@@ -937,3 +937,83 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn vop3_16bit_int_add_sub_mad_and_triads_match_rdna2() {
+    let vop3_mod = |op: u16, vdst: u8, s0: u16, s1: u16, s2: u16, opsel: u8, clamp: bool| -> [u32; 2] {
+        let [mut w0, w1] = vop3(op, vdst, s0, s1, s2);
+        w0 |= u32::from(opsel & 0xF) << 11;
+        if clamp {
+            w0 |= 1 << 15;
+        }
+        [w0, w1]
+    };
+
+    // v_add_nc_i16 (0x30d) & v_sub_nc_i16 (0x30e): wrap vs clamp + untouched high-half preservation.
+    for (op, name, is_sub) in [
+        (0x30du16, "v_add_nc_i16", false),
+        (0x30eu16, "v_sub_nc_i16", true),
+    ] {
+        for clamp in [false, true] {
+            let mut body = vec![vop1(0x001, 0, vgpr(4))]; // seed v0 = s3 (high half preserved)
+            body.extend_from_slice(&vop3_mod(op, 0, vgpr(1), vgpr(2), 0, 0, clamp));
+            let shader = build_valu_cs(&body);
+            let cases = [
+                [0x0000_7fff, 0x0000_0001, 0, 0xbeef_0000], // +32767 +/- 1
+                [0x0000_8000, 0x0000_0001, 0, 0xbeef_0000], // -32768 +/- 1
+                [0x0000_8000, 0x0000_8000, 0, 0xbeef_0000], // -32768 +/- -32768
+                [0x0000_0010, 0x0000_0025, 0, 0xbeef_0000], // 16 +/- 37
+            ];
+            run_cases(&shader, &cases, |backend, i, inp, got| {
+                let a = inp[0] as i16 as i32;
+                let b = inp[1] as i16 as i32;
+                let exact = if is_sub { a - b } else { a + b };
+                let lo = if clamp {
+                    exact.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as u16
+                } else {
+                    exact as u16
+                };
+                let want = (inp[3] & 0xffff_0000) | u32::from(lo);
+                assert_eq!(got, want, "{backend}: {name}(clamp={clamp})[{i}]");
+            });
+        }
+    }
+
+    // v_mad_i16 (0x35e) and v_mad_u16 (0x340): wrap vs clamp + op_sel writing high half.
+    for (op, name, signed) in [(0x35eu16, "v_mad_i16", true), (0x340u16, "v_mad_u16", false)] {
+        for clamp in [false, true] {
+            // op_sel = [1, 0, 0, 1]: read hi(v1), lo(v2), lo(v3), write hi(v0) preserving lo(v0).
+            let mut body = vec![vop1(0x001, 0, vgpr(4))];
+            body.extend_from_slice(&vop3_mod(op, 0, vgpr(1), vgpr(2), vgpr(3), 0b1001, clamp));
+            let shader = build_valu_cs(&body);
+            let cases = [
+                [0x0100_0000, 0x0000_0100, 0x0000_0005, 0x0000_cafe], // 256 * 256 + 5 = 65541
+                [0x8000_0000, 0x0000_8000, 0x0000_7fff, 0x0000_cafe], // (-32768)*(-32768)+32767 / 32768*32768+32767
+                [0x8000_0000, 0x0000_0002, 0x0000_ffff, 0x0000_cafe], // (-32768)*2 + (-1)
+                [0xffff_0000, 0x0000_ffff, 0x0000_ffff, 0x0000_cafe], // max unsigned / (-1)*(-1)+(-1)
+            ];
+            run_cases(&shader, &cases, |backend, i, inp, got| {
+                let a = (inp[0] >> 16) as u16;
+                let b = inp[1] as u16;
+                let d = inp[2] as u16;
+                let hi = if signed {
+                    let exact = i32::from(a as i16) * i32::from(b as i16) + i32::from(d as i16);
+                    if clamp {
+                        exact.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as u16
+                    } else {
+                        exact as u16
+                    }
+                } else {
+                    let exact = u32::from(a) * u32::from(b) + u32::from(d);
+                    if clamp {
+                        exact.min(u32::from(u16::MAX)) as u16
+                    } else {
+                        exact as u16
+                    }
+                };
+                let want = (u32::from(hi) << 16) | (inp[3] & 0xffff);
+                assert_eq!(got, want, "{backend}: {name}(clamp={clamp})[{i}]");
+            });
+        }
+    }
+}
