@@ -49,6 +49,28 @@ const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     ]
 }
 
+/// VOP2 `op v0, v1, v2`.
+const fn vop2_dot(op: u32) -> u32 {
+    op << 25 | 2 << 9 | vgpr(1) as u32
+}
+
+/// VOP3P `op v0, v1, v2, v3` with low and high selection and negation masks.
+const fn vop3p_dot(op: u32, sel: [u32; 2], neg: [u32; 2], clamp: bool) -> [u32; 2] {
+    [
+        0x33 << 26
+            | op << 16
+            | (clamp as u32) << 15
+            | (sel[1] & 4) << 12
+            | sel[0] << 11
+            | neg[1] << 8,
+        neg[0] << 29
+            | (sel[1] & 3) << 27
+            | (vgpr(3) as u32) << 18
+            | (vgpr(2) as u32) << 9
+            | vgpr(1) as u32,
+    ]
+}
+
 /// MUBUF `buffer_store_dword vdata, off, s[srsrc:srsrc+3], 0 offset:byte_off`.
 const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     [
@@ -210,6 +232,100 @@ fn run_cases(
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+fn build_dot_cs(body: &[u32]) -> HostShader {
+    let shader = build_valu_cs(body);
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let sfi0 = container.part(crate::FourCC::SFI0).unwrap().data;
+    let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+    const INT64: u64 = 0x8000;
+    const NATIVE_16BIT_OPS: u64 = 0x40000;
+    assert_eq!(
+        features & (INT64 | NATIVE_16BIT_OPS),
+        0,
+        "SFI0 {features:#x}"
+    );
+    shader
+}
+
+#[test]
+fn v_dot4c_i32_i8_reads_old_destination_and_wraps() {
+    let shader = build_dot_cs(&[vop1(1, 0, vgpr(3)), vop2_dot(0x00d), vop2_dot(0x00d)]);
+    let cases = [
+        [0xFC03_FE01, 0xF807_06FB, 10, 0],
+        [0xFC03_FE01, 0xF807_06FB, i32::MAX as u32, 0],
+        [0x8080_8080, 0x7F7F_7F7F, 11, 0],
+    ];
+    let expected = [82, 0x8000_0047, -130_037i32 as u32];
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        assert_eq!(got, expected[i], "{backend} case {i}");
+    });
+}
+
+#[test]
+fn vop3p_integer_dots_clamp_or_wrap_the_full_sum() {
+    let cases = [
+        [0xFC03_FE01, 0xF807_06FB, 10, 0],
+        [0x8080_8080, 0x8080_8080, i32::MAX as u32, 0],
+        [0x8080_8080, 0x7F7F_7F7F, i32::MIN as u32, 0],
+        [0x8000_8000, 0x8000_8000, 0, 0], // signed dot is +2^31 before the add
+        [0x8000_8000, 0x8000_8000, u32::MAX, 0],
+        [0x8000_8000, 0x8000_8000, i32::MIN as u32, 0],
+        [0x8000_8000, 0x8000_8000, i32::MAX as u32, 0],
+        [0x7FFF_7FFF, 0x8000_7FFF, i32::MAX as u32, 0], // opposite-signed products
+        [u32::MAX, u32::MAX, 0, 0], // unsigned 16-bit products carry before the add
+        [u32::MAX, u32::MAX, u32::MAX, 0],
+        [0x0001_0001, 0x0001_0001, u32::MAX, 0], // accumulator-only carry for dot2
+    ];
+    for (op, width, signed) in [
+        (0x014, 16, true),
+        (0x015, 16, false),
+        (0x016, 8, true),
+        (0x017, 8, false),
+        (0x019, 4, false),
+    ] {
+        for clamp in [false, true] {
+            let shader = build_dot_cs(&vop3p_dot(op, [0, 7], [0, 0], clamp));
+            run_cases(&shader, &cases, |backend, i, [a, b, acc, _], got| {
+                let extend = |x: u32, bits| {
+                    let shift = 32 - bits;
+                    if signed {
+                        i64::from(((x << shift) as i32) >> shift)
+                    } else {
+                        i64::from((x << shift) >> shift)
+                    }
+                };
+                let mut expected = extend(acc, 32);
+                for shift in (0..32).step_by(width) {
+                    expected += extend(a >> shift, width) * extend(b >> shift, width);
+                }
+                if clamp {
+                    expected = if signed {
+                        expected.clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                    } else {
+                        expected.clamp(0, i64::from(u32::MAX))
+                    };
+                }
+                assert_eq!(
+                    got, expected as u32,
+                    "{backend} op={op:#x} clamp={clamp} case {i}"
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn vop3p_integer_dot2_selects_each_source_half() {
+    let input = [0xFFFD_0002, 0x0005_0004, 7, 0];
+    // First product uses S0.hi and S1.lo, second uses S0.lo and S1.lo.
+    for (op, expected) in [(0x014, 3), (0x015, 262_147)] {
+        let shader = build_dot_cs(&vop3p_dot(op, [1, 4], [0, 0], false));
+        run_cases(&shader, &[input], |backend, _, _, got| {
+            assert_eq!(got, expected, "{backend} op={op:#x}");
+        });
+    }
 }
 
 fn is_f16_nan(bits: u16) -> bool {
