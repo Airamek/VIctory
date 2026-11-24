@@ -127,6 +127,7 @@ struct OpDecl {
     name: String,
     attr: Attr,
     ret: Ty,
+    opcode: u32,
     args: Vec<Ty>,
     f: V,
     code: V,
@@ -217,6 +218,7 @@ impl Shader {
             d.name == name
                 && d.attr == attr
                 && d.ret == ret
+                && d.opcode == opcode
                 && d.args.len() == args.len()
                 && d.args
                     .iter()
@@ -245,6 +247,7 @@ impl Shader {
                     name: name.into(),
                     attr,
                     ret,
+                    opcode,
                     args: types,
                     f,
                     code,
