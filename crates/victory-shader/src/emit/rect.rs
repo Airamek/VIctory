@@ -120,7 +120,7 @@ mod tests {
         } else {
             (
                 vec![element("POSITION", 0, 0, 0, 4), element("TEXCOORD", 0, 0, 1, 2)],
-                vec![element("SV_Position", 3, 0, 0, 4), element("TEXCOORD", 0, 0, 1, 2)],
+                vec![element("SV_Position", 3, 4, 0, 4), element("TEXCOORD", 0, 2, 1, 2)],
             )
         };
         let load = |s: &mut Shader, id: u32, col: u8| {
