@@ -399,9 +399,9 @@ mod tests {
     #[test]
     fn constant_right_shifts_bound_relative_register_reads() {
         for (shift, expected) in [
-            (30, vec![8, 9, 10, 11]),
-            (31, vec![8, 9]),
-            (0, (8..16).collect()),
+            (30, vec![8, 9, 10, 11, 4]),
+            (31, vec![8, 9, 4]),
+            (0, (8..16).chain([4]).collect()),
         ] {
             let p = build_words(&[
                 vop2(0x16, 1, 128 + shift, 0), // v_lshrrev_b32 v1, shift, v0
@@ -437,7 +437,7 @@ mod tests {
         ]);
         assert_eq!(
             vgprs(&p.blocks[0].insts[4].reads),
-            (8..16).collect::<Vec<u8>>()
+            (8..16).chain([4]).collect::<Vec<u8>>()
         );
     }
 
