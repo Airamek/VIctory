@@ -13,7 +13,7 @@ use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Dpp, Fields, NULL, Operand, Valu};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
@@ -3737,6 +3737,11 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_dot2_i32_i16" => self.dot_int(inst, v, 16, true, guard),
+            "v_dot2_u32_u16" => self.dot_int(inst, v, 16, false, guard),
+            "v_dot4c_i32_i8" | "v_dot4_i32_i8" => self.dot_int(inst, v, 8, true, guard),
+            "v_dot4_u32_u8" => self.dot_int(inst, v, 8, false, guard),
+            "v_dot8_u32_u4" => self.dot_int(inst, v, 4, false, guard),
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -4779,6 +4784,92 @@ impl<'a> Lower<'a> {
         };
         let m16 = k(self, 0xFFFF);
         Ok(self.s.m.bin(c, Bin::And, r, m16))
+    }
+
+    fn dot_int(
+        &mut self,
+        inst: &Inst,
+        v: &Valu,
+        width: u8,
+        signed: bool,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let c = self.cur;
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a dot product destination");
+        };
+        let dst = Reg::V(reg);
+        let acc = if v.src.len() == 2 {
+            self.i32_of(inst.read(dst).ok_or("a dot product accumulator")?)?
+        } else {
+            self.src(inst, 2)?
+        };
+        let (a, b) = (self.src(inst, 0)?, self.src(inst, 1)?);
+        let zero = self.s.m.i32(0);
+        let mut dot = zero;
+        let mut dot_carry = None;
+        for lane in 0..32 / width {
+            let (x, y) = match width {
+                16 => {
+                    let sel = if lane == 0 { v.opsel } else { v.opsel_hi };
+                    (
+                        self.select_bits(a, 4 + (sel & 1), signed),
+                        self.select_bits(b, 4 + (sel >> 1 & 1), signed),
+                    )
+                }
+                8 => (
+                    self.select_bits(a, lane, signed),
+                    self.select_bits(b, lane, signed),
+                ),
+                _ => {
+                    let offset = self.s.m.i32(u32::from(lane * width));
+                    let bits = self.s.m.i32(u32::from(width));
+                    (
+                        self.bfe(a, offset, bits, signed),
+                        self.bfe(b, offset, bits, signed),
+                    )
+                }
+            };
+            let product = self.s.m.bin(c, Bin::Mul, x, y);
+            if v.clamp && !signed && width == 16 && lane == 1 {
+                let (sum, carry) = self.add_sub_carry(c, true, dot, product, None);
+                dot = sum;
+                dot_carry = Some(carry);
+            } else {
+                dot = self.s.m.bin(c, Bin::Add, dot, product);
+            }
+        }
+        let result = if !v.clamp {
+            self.s.m.bin(c, Bin::Add, dot, acc)
+        } else if signed {
+            let sum = self.s.m.bin(c, Bin::Add, dot, acc);
+            let min = self.s.m.i32(i32::MIN as u32);
+            let max = self.s.m.i32(i32::MAX as u32);
+            // Two signed 16-bit products can sum to +2^31, the only dot
+            // sum outside i32. For that width 0x80000000 means positive.
+            let dot_neg = if width == 16 {
+                self.s.m.cmp(c, pred::IUGT, dot, min)
+            } else {
+                self.s.m.cmp(c, pred::SLT, dot, zero)
+            };
+            let acc_neg = self.s.m.cmp(c, pred::SLT, acc, zero);
+            let sum_neg = self.s.m.cmp(c, pred::SLT, sum, zero);
+            let same_sign = self.s.m.cmp(c, pred::EQ, dot_neg, acc_neg);
+            let sign_changed = self.s.m.cmp(c, pred::NE, acc_neg, sum_neg);
+            let overflow = self.s.m.bin(c, Bin::And, same_sign, sign_changed);
+            let limit = self.s.m.select(c, acc_neg, min, max);
+            self.s.m.select(c, overflow, limit, sum)
+        } else {
+            let (sum, carry) = self.add_sub_carry(c, true, dot, acc, None);
+            let overflow = match dot_carry {
+                Some(high) => self.s.m.bin(c, Bin::Or, high, carry),
+                None => carry,
+            };
+            let max = self.s.m.i32(u32::MAX);
+            self.s.m.select(c, overflow, max, sum)
+        };
+        self.write(inst, dst, result, guard);
+        Ok(())
     }
 
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
