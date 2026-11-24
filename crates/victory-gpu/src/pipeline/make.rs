@@ -14,6 +14,10 @@
 //! Pipelines a draw waits for go ahead of those started early (at the
 //! title's creation, because an earlier run drew them).
 //!
+//! Driver compiles past 256 KiB of containers run one at a time: several at
+//! once exhaust the commit charge and contend inside the driver (each takes
+//! seconds), stalling every worker behind them.
+//!
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
@@ -71,12 +75,15 @@ impl Pending {
     fn make(&self) {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
+            // Huge pipelines compile one at a time (see `HugeGuard`).
+            let _huge = HugeGuard::take_if(self.is_huge());
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
             let (user, kernel) = super::thread_cpu_since(cpu);
             tracing::debug!(
                 shaders = ?self.shaders,
+                bytes = self.bytes(),
                 ms = started.elapsed().as_millis() as u64,
                 user_ms = user,
                 kernel_ms = kernel,
@@ -87,6 +94,67 @@ impl Pending {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+
+    fn is_huge(&self) -> bool {
+        huge(self.shaders.iter().map(|s| s.bytes()).sum())
+    }
+
+    /// The pipeline's containers in bytes (what the driver compiles).
+    fn bytes(&self) -> usize {
+        self.shaders.iter().map(|s| s.bytes()).sum()
+    }
+}
+
+/// Driver compiles past [`HUGE_BYTES`] of containers run one at a time:
+/// several at once exhaust the commit charge and contend inside the driver
+/// (each takes seconds), stalling every worker behind them. The 256 KiB
+/// threshold is xcl's default huge-PSO size.
+const HUGE_BYTES: usize = 256 * 1024;
+
+/// Whether a byte count is a huge driver compile ([`HUGE_BYTES`]).
+fn huge(bytes: usize) -> bool {
+    bytes >= HUGE_BYTES
+}
+
+/// At most one huge driver compile at a time (the others wait here).
+static HUGE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+/// The huge-compile slot, held while a huge pipeline is made.
+struct HugeGuard {
+    held: bool,
+}
+
+impl HugeGuard {
+    /// Takes the slot for a huge pipeline now (waiting for it first);
+    /// nothing for an ordinary one.
+    fn take_if(huge: bool) -> Self {
+        if !huge {
+            return HugeGuard { held: false };
+        }
+        let (lock, gate) = &HUGE;
+        let mut busy = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waited_ms = 0;
+        while *busy {
+            let started = Instant::now();
+            busy = gate.wait(busy).unwrap_or_else(|e| e.into_inner());
+            waited_ms += started.elapsed().as_millis() as u64;
+        }
+        *busy = true;
+        if waited_ms > 0 {
+            tracing::info!(waited_ms, "huge pipeline waited for the compile slot");
+        }
+        HugeGuard { held: true }
+    }
+}
+
+impl Drop for HugeGuard {
+    fn drop(&mut self) {
+        if self.held {
+            let (lock, gate) = &HUGE;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            gate.notify_one();
+        }
     }
 }
 
@@ -368,5 +436,31 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// Huge driver compiles wait for the slot; ordinary ones never do.
+    #[test]
+    fn huge_compiles_wait_for_the_slot() {
+        assert!(!huge(0));
+        assert!(!huge(HUGE_BYTES - 1));
+        assert!(huge(HUGE_BYTES));
+        let _first = HugeGuard::take_if(true);
+        let waited = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe = waited.clone();
+        let other = std::thread::spawn(move || {
+            let started = Instant::now();
+            let _second = HugeGuard::take_if(true);
+            probe.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        drop(_first);
+        other.join().unwrap();
+        assert!(
+            waited.load(Ordering::Relaxed) >= 100,
+            "second huge compile did not wait"
+        );
+        let started = Instant::now();
+        let _plain = HugeGuard::take_if(false);
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 }

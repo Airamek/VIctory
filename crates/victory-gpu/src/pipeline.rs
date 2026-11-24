@@ -95,6 +95,12 @@ impl Shader {
             translated: OnceLock::new(),
         }
     }
+
+    /// The container's bytes (a pipeline's driver-compile cost scales with
+    /// the total over its stages).
+    pub(crate) fn bytes(&self) -> usize {
+        self.container.len()
+    }
 }
 
 /// A translated shader and the console resources its code reads.
