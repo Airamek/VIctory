@@ -66,6 +66,10 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// The render target views and the depth view the host list has, once
+    /// it has any ([`State::set_targets`]): per view the host texture (0:
+    /// a null view) and what its descriptor says.
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -188,6 +192,10 @@ static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
+
+/// What a render target or depth view of the host is made from: the host
+/// texture, and [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
 
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
@@ -343,6 +351,8 @@ impl State {
     pub(crate) fn host_state_lost(&mut self) {
         // No title heaps (0) differ from what the host list has, too.
         (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        // A fresh host list has none of the views the old one was given.
+        self.host_targets = None;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -413,7 +423,12 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once, unless it has
+    /// the same ones already: the title sets the same targets again and
+    /// again, each time a host view per target and a call of the driver.
+    /// Always cached (no knob): handles compare by the views themselves
+    /// (resource, host texture, description), which a title writing other
+    /// views behind the same handle cannot fool.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         self.flush_indirect(list);
         self.fixed.targets = Some((handles.to_vec(), depth));
@@ -421,7 +436,8 @@ impl State {
             return;
         };
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut views = Vec::with_capacity(handles.len());
+        let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -454,7 +470,8 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            keys.push((texture.as_raw() as usize, record.key()));
+            views.push((texture, record.desc()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -472,8 +489,21 @@ impl State {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            Some(host.dsv(&texture, record.depth_desc().as_ref()))
+            Some((texture, record))
         });
+        let now = (
+            keys,
+            dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())),
+        );
+        if self.host_targets.as_ref() == Some(&now) {
+            return;
+        }
+        self.host_targets = Some(now);
+        let rtvs: Vec<_> = views
+            .iter()
+            .map(|(texture, desc)| host.rtv(texture, desc.as_ref()))
+            .collect();
+        let dsv = dsv.map(|(texture, record)| host.dsv(&texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
