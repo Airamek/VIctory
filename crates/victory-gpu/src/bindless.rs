@@ -556,6 +556,77 @@ void main(uint3 id : SV_DispatchThreadID) {
         rounds(src, dst, tex, write);
     }
 
+    /// Structured buffers of 16-byte multiples reach the shader as raw views
+    /// of their bytes (AMD reads element 0 for every element of a raw view
+    /// through a structured buffer, so translated shaders read them raw):
+    /// a 16-byte structured view read as dwords must round-trip its bytes,
+    /// without crashing, and a 60-byte one (the world case) likewise.
+    #[test]
+    fn heap_views_structured_16_read_correct_elements() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (src, dst) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
+        let tex = resource(3, 4, 1, 28, LINEAR);
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |i: u64| title_heap.start + 32 * i;
+        // Structured view of 16 elements of 16 bytes: unknown format, buffer
+        // dimension, default mapping, first 0, count 16, stride 16, no flags.
+        // The host makes it raw; the (raw) shader below reads its dwords.
+        let srv: [u32; 10] = [0, 1, 0x1688, 0, 0, 0, 16, 16, 0, 0];
+        let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_srv(null, src, &srv, slot(0));
+        crate::descriptor::create_uav(null, dst, null, &uav, slot(1));
+        crate::descriptor::create_srv(null, tex, std::ptr::null(), slot(2));
+        let heap_host = title_heap.host().expect("a host view heap");
+        let (root, pso) = compile();
+        let list = host.new_list().unwrap();
+        let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        let (tex_bytes, tex_desc) = crate::resource::texture_memory(tex).unwrap();
+        let size = crate::resource::texture_layout(&tex_desc).unwrap().planes[0].layout.size as usize;
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(4, 1, 1);
+        }
+        list.defer_heap(&heap_host.viewed);
+        list.close();
+        // The title writes after recording, before submitting: distinct
+        // dwords per 16-byte element (element 1's dwords differ from
+        // element 0's, catching an element-0 repeat).
+        // SAFETY: inside the title buffer and texture.
+        unsafe {
+            let words = std::slice::from_raw_parts_mut(src_bytes.cast::<u32>(), 64);
+            for (i, w) in words.iter_mut().enumerate() {
+                let lane = (i / 4) as u32;
+                *w = 0x2000 + lane * 4 + (i % 4) as u32;
+            }
+            std::ptr::write_bytes(tex_bytes.cast_mut(), 0x20, size);
+        }
+        host.execute(&[&list]);
+        host.drain();
+        let words = out.read_host(dst_bytes as u64, 64);
+        for (i, &v) in words.iter().enumerate() {
+            let lane = (i / 4) as u32;
+            assert_eq!(v, 0x2000 + lane * 4 + (i % 4) as u32 + 0x20, "dword {i}");
+        }
+    }
+
     const PAGE_BYTES: usize = crate::watch::PAGE;
 
     /// Three rounds of: record a dispatch reading slots 0 and 2 and writing
