@@ -2292,14 +2292,19 @@ const PARALLEL_ENTRIES: usize = 16;
 
 /// Threads for a data-parallel batch of copies: half the logical
 /// processors, as the pipeline workers, so the title's threads still have
-/// cores (one thread per host copy at most).
+/// cores (one thread per host copy at most). A compile storm is running
+/// the workers on the other cores, so the batch stays mostly out of
+/// their way.
 fn copy_threads(entries: usize) -> usize {
     if entries < PARALLEL_ENTRIES {
         return 1;
     }
-    std::thread::available_parallelism()
-        .map_or(2, |n| (n.get() / 2).clamp(2, 8))
-        .min(entries)
+    let mut threads = std::thread::available_parallelism()
+        .map_or(2, |n| (n.get() / 2).clamp(2, 8));
+    if crate::pipeline::pipelines_waiting() > 0 {
+        threads = threads.min(2);
+    }
+    threads.min(entries)
 }
 
 impl Batch {

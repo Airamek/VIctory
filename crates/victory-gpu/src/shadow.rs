@@ -87,14 +87,21 @@ fn snapshots_mut() -> std::sync::RwLockWriteGuard<'static, Snapshots> {
 
 /// Threads filling one snapshot keep: big keeps split by bytes (a 1 MB
 /// keep is already worth a second thread); half the logical processors,
-/// as the pipeline workers, so the title's threads still have cores.
+/// as the pipeline workers, so the title's threads still have cores. A
+/// compile storm is running the workers on the other cores, so the fill
+/// stays mostly out of their way (diag9: snapshots fell to ~2 GB/s
+/// filling against six busy compile workers).
 fn snapshot_threads(total: usize) -> usize {
     const PARALLEL_SNAPSHOT_BYTES: usize = 1 << 20;
     if total < PARALLEL_SNAPSHOT_BYTES {
         return 1;
     }
-    std::thread::available_parallelism()
-        .map_or(2, |n| (n.get() / 2).clamp(2, 8))
+    let mut threads = std::thread::available_parallelism()
+        .map_or(2, |n| (n.get() / 2).clamp(2, 8));
+    if crate::pipeline::pipelines_waiting() > 0 {
+        threads = threads.min(2);
+    }
+    threads
 }
 
 /// Gives up the snapshots of `parts`.

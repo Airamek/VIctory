@@ -586,6 +586,14 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// Pipelines queued and not made yet: a compile storm is running the
+/// pipeline workers on the other cores, so data-parallel copies stay
+/// mostly out of their way.
+#[cfg(windows)]
+pub(crate) fn pipelines_waiting() -> u64 {
+    make::waiting()
+}
+
 /// The pre-build: a title pipeline made ahead of a run into the pipeline
 /// library (`use_pipeline_cache`), by the code a run makes it with, so the
 /// run finds it there under the same name.

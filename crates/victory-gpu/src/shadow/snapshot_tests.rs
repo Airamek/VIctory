@@ -73,7 +73,66 @@ fn big_snapshot_fills_in_parallel() {
     assert_eq!(all_kept(), (0, 0));
 }
 
-/// Two overlapping declared ranges and one apart: the bytes the GPU
+/// Throughput of the snapshot fill patterns on this machine (serial
+/// extend vs reserve + parallel raw fill), to tell a slow mechanism from
+/// a heavy scene. Run with
+/// `cargo test --release -p victory-gpu -- --ignored --nocapture snapshot_fill_throughput`.
+#[test]
+#[ignore = "benchmark"]
+fn snapshot_fill_throughput() {
+    const N: usize = 512 << 20;
+    const CHUNK: usize = 4 << 20;
+    let src = vec![0x5Au8; N];
+    let gbs = |n: usize, t: std::time::Instant| n as f64 / t.elapsed().as_secs_f64() / 1e9;
+    // The old path: extend per gap under the lock.
+    let mut dst = Vec::new();
+    let t = std::time::Instant::now();
+    for c in src.chunks(CHUNK) {
+        dst.extend_from_slice(c);
+    }
+    println!("serial extend: {:.1} GB/s", gbs(N, t));
+    std::hint::black_box(&dst);
+    // The new path: reserve once, fill disjoint slots on threads (the
+    // same pattern production uses, lint allowances and all).
+    let mut dst: Vec<u8> = Vec::with_capacity(N);
+    // SAFETY: every byte is filled below before any read.
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        dst.set_len(N)
+    };
+    let base = dst.as_ptr() as usize;
+    let t = std::time::Instant::now();
+    let threads = snapshot_threads(N);
+    println!("threads: {threads}");
+    std::thread::scope(|s| {
+        let quota = N.div_ceil(threads);
+        let mut handles = Vec::new();
+        for i in 1..threads {
+            let (from, n) = (i * quota, quota.min(N.saturating_sub(i * quota)));
+            if n == 0 {
+                continue;
+            }
+            let src = &src;
+            handles.push(s.spawn(move || {
+                // SAFETY: disjoint slice of the reservation.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr().add(from), (base + from) as *mut u8, n);
+                }
+            }));
+        }
+        let n = quota.min(N);
+        // SAFETY: the first chunk of the reservation, filled here while
+        // workers fill the rest.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), base as *mut u8, n);
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+    println!("parallel fill: {:.1} GB/s", gbs(N, t));
+    assert!(dst.iter().all(|&b| b == 0x5Au8));
+}
 /// changed go back, the title's own concurrent writes stay, and what
 /// changed outside every declared range does not go back.
 #[test]
