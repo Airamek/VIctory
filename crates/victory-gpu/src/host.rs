@@ -1511,6 +1511,10 @@ struct Deferred {
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes, mark and memory flags): declaring
+    /// them again would change nothing.
+    gpu_written: std::collections::HashSet<(usize, usize, usize, bool, bool)>,
     /// Dynamic descriptor ranges leased by this recording, retired with it
     /// if the list resets before its submission finishes.
     dynamic: Vec<DynamicLease>,
@@ -3728,6 +3732,7 @@ impl HostList {
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
         deferred.filled.clear();
+        deferred.gpu_written.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -3774,6 +3779,9 @@ impl HostList {
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run
     /// (`marked`: the pages they mark).
+    /// Declared once until the list next writes title memory: the dispatches
+    /// of a frame declare the same ranges thousands of times, each a step of
+    /// its own.
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -3782,9 +3790,23 @@ impl HostList {
         marked: bool,
     ) {
         let memory = self.memory_writer.load(Ordering::Relaxed);
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        let mut deferred = self.deferred();
+        let key = (
+            std::sync::Arc::as_ptr(shadow) as usize,
+            address,
+            len,
+            marked,
+            memory,
+        );
+        if deferred.gpu_written.insert(key) {
+            deferred.copies.push(Step::GpuWrite(
+                shadow.clone(),
+                address,
+                len,
+                marked,
+                memory,
+            ));
+        }
     }
 
     /// Shaders of the list take views from the heap itself
@@ -4019,6 +4041,7 @@ impl HostList {
             .push(Step::Run(Box::new(work), writes, reads));
         self.deferred().refreshed.clear();
         self.deferred().filled.clear();
+        self.deferred().gpu_written.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory: it
