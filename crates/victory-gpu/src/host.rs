@@ -2277,11 +2277,6 @@ impl Host {
         for (i, list) in runs.iter().enumerate() {
             let id: *const HostList = *list;
             let repeated = runs[..i].iter().any(|&l| std::ptr::eq(l, id));
-            if since_cut.contains(&id) {
-                cuts.push(lists.len());
-                since_cut.clear();
-            }
-            since_cut.push(id);
             // A repeat's steps would rewrite the list's own memory (upload
             // memory, scratch, budget word) before its earlier run has read
             // it: they write into memory of the submission instead, which
@@ -2294,6 +2289,18 @@ impl Host {
                 .take()
                 .filter(|r| !r.is_empty())
                 .and_then(|r| list.repeat(self, r));
+            // A repeat that wrote the list's own memory starts a new
+            // `ExecuteCommandLists` call (as above, the queue runs them in
+            // order): its prelude must not share the call with the earlier
+            // run's lists. A repeat that wrote nothing runs anywhere in
+            // queue order, so it shares the call: fewer calls, fewer fence
+            // signals, same order, same waits (`last` is stored per list,
+            // completion per submission, `firsts` per run — none per group).
+            if needs_cut(since_cut.contains(&id), repeat.is_some()) {
+                cuts.push(lists.len());
+                since_cut.clear();
+            }
+            since_cut.push(id);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed =
@@ -6539,6 +6546,17 @@ fn parse_draws(text: &str) -> u64 {
     }
 }
 
+/// Whether the repeat of a list already run since the last cut needs its
+/// own `ExecuteCommandLists` call: only a repeat that wrote the list's own
+/// memory (its prelude copies it back on the GPU) must not share the call
+/// with the earlier run's lists. A repeat that wrote nothing runs anywhere
+/// in queue order, so it shares the call: fewer calls, fewer fence
+/// signals, same order, same waits. Pure (unit-tested): the loop keeps
+/// `firsts`/`cuts` consistent around it.
+fn needs_cut(since_cut_contains: bool, redirected: bool) -> bool {
+    since_cut_contains && redirected
+}
+
 /// Which run indices each cuts group holds: run `i` is in the group whose
 /// `cuts` window contains `firsts[i]` (diagnostics, timing). Alone mode does
 /// not use this (each run is its own group).
@@ -7026,6 +7044,18 @@ mod batch {   // `mod tests` is already taken at the top of this file
         assert_eq!(wait_for(&mut settled, Some(7)), Some(7));
         assert_eq!(settled, 7);
         assert_eq!(wait_for(&mut settled, None), None);
+    }
+
+    /// Only a repeat that wrote the list's own memory splits the call: a
+    /// first run never splits, and a clean repeat (or one from before the
+    /// last cut) shares it. Needs no GPU: the policy is decided on
+    /// addresses alone.
+    #[test]
+    fn only_a_redirecting_repeat_splits_the_call() {
+        assert!(!needs_cut(false, false), "a first run never splits");
+        assert!(!needs_cut(false, true), "from before the last cut: no split");
+        assert!(!needs_cut(true, false), "a clean repeat shares the call");
+        assert!(needs_cut(true, true), "a redirecting repeat splits it");
     }
 
     /// Ranges of one copy stay disjoint: what a range overlaps, or lies
