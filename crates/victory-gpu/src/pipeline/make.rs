@@ -40,6 +40,8 @@ pub(crate) struct Pending {
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// Its worker was lost to it: it will not be made.
+    lost: AtomicBool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     pub(crate) key: String,
@@ -68,29 +70,29 @@ impl Pending {
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made: OnceLock::new(),
+            lost: AtomicBool::new(false),
             used: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
-            let (started, cpu) = (Instant::now(), super::thread_cpu());
-            // Huge pipelines compile one at a time (see `HugeGuard`).
-            let _huge = HugeGuard::take_if(self.is_huge());
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-            #[cfg(feature = "diagnostics")]
-            log_built(&self.key);
-            let (user, kernel) = super::thread_cpu_since(cpu);
-            tracing::debug!(
-                shaders = ?self.shaders,
-                bytes = self.bytes(),
-                ms = started.elapsed().as_millis() as u64,
-                user_ms = user,
-                kernel_ms = kernel,
-                "pipeline made"
-            );
-            made
-        });
+        // Not `get_or_init`: a worker lost in it would leave it locked.
+        let (started, cpu) = (Instant::now(), super::thread_cpu());
+        // Huge pipelines compile one at a time (see `HugeGuard`).
+        let _huge = HugeGuard::take_if(self.is_huge());
+        let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+        #[cfg(feature = "diagnostics")]
+        log_built(&self.key);
+        let (user, kernel) = super::thread_cpu_since(cpu);
+        tracing::debug!(
+            shaders = ?self.shaders,
+            bytes = self.bytes(),
+            ms = started.elapsed().as_millis() as u64,
+            user_ms = user,
+            kernel_ms = kernel,
+            "pipeline made"
+        );
+        let _ = self.made.set(made);
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -252,7 +254,13 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, true);
-        wait(p, crate::frame::current());
+        if p.lost.load(Ordering::Relaxed) {
+            return None;
+        }
+        // With a world's worth queued there is no use in waiting.
+        if waiting() < 64 {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -317,17 +325,7 @@ fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        (0..n)
-            .filter(|i| {
-                let spawned = std::thread::Builder::new()
-                    .name(format!("victory-pipelines-{i}"))
-                    .spawn(work);
-                if let Err(e) = &spawned {
-                    tracing::warn!(error = %e, "no pipeline worker");
-                }
-                spawned.is_ok()
-            })
-            .count()
+        (0..n).filter(|i| worker(*i)).count()
     });
     if workers == 0 {
         // No worker: made here instead.
@@ -342,15 +340,53 @@ fn queue(p: Arc<Pending>, now: bool) {
     work.notify_one();
 }
 
+/// What the workers (by thread) are making.
+static AT_WORK: Mutex<Vec<(u32, Arc<Pending>)>> = Mutex::new(Vec::new());
+
+/// Starts worker `i`; true if it runs.
+fn worker(i: usize) -> bool {
+    let spawned = std::thread::Builder::new()
+        .name(format!("victory-pipelines-{i}"))
+        .spawn(work);
+    if let Err(e) = &spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+    }
+    spawned.is_ok()
+}
+
+/// A worker is lost to a compile that crashed or never ends: another takes
+/// its place (its pipeline stays unmade). With all of them lost, the rest of
+/// a world's pipelines waited forever.
+#[allow(dead_code)] // No caller yet: the library.rs half is excluded.
+pub(super) fn worker_lost(id: u32) {
+    static LOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+    let mut lost = false;
+    AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| {
+        if w.0 == id {
+            w.1.lost.store(true, Ordering::Relaxed);
+            lost = true;
+        }
+        w.0 != id
+    });
+    if lost {
+        // A lost worker never comes back from its compile (it sleeps in the
+        // crash handler or stays stopped), so it never reaches its own
+        // count below: it is accounted for here instead.
+        WAITING.fetch_sub(1, Ordering::Relaxed);
+        worker(LOST.fetch_add(1, Ordering::Relaxed));
+    }
+}
+
 /// A worker: makes queued pipelines, those draws wait for first, and saves
 /// the cache when idle (first uses of pipelines made before).
 fn work() {
     // Below the title's own threads (loading, recording).
-    // SAFETY: a plain call on our own thread.
-    unsafe {
+    // SAFETY: plain calls on our own thread.
+    let id = unsafe {
         use windows::Win32::System::Threading::*;
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
+        GetCurrentThreadId()
+    };
     let (lock, work) = &QUEUES;
     loop {
         let p = {
@@ -373,7 +409,9 @@ fn work() {
         if p.taken.swap(true, Ordering::Relaxed) {
             continue; // its other queue entry
         }
+        AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((id, p.clone()));
         p.make();
+        AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.0 != id);
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
         } else {
