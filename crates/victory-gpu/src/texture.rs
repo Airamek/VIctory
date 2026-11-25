@@ -1085,7 +1085,7 @@ pub(crate) const COMMIT_PAGE: usize = 64 << 10;
 /// committed stays committed for the submission, while an unmapped page is
 /// asked again (and never remembered), since the title may map it.
 pub(crate) fn committed_cached(
-    known: &mut std::collections::HashSet<usize>,
+    known: &mut crate::fx::Set<usize>,
     at: *const u8,
     len: usize,
 ) -> bool {
@@ -1096,7 +1096,7 @@ pub(crate) fn committed_cached(
 fn committed_inner(
     at: *const u8,
     len: usize,
-    mut known: Option<&mut std::collections::HashSet<usize>>,
+    mut known: Option<&mut crate::fx::Set<usize>>,
 ) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
@@ -1412,7 +1412,7 @@ mod tests {
             assert!(!made.is_null());
         }
         let at = base.cast::<u8>();
-        let mut known = std::collections::HashSet::new();
+        let mut known = crate::fx::Set::default();
         // Our committed blocks answer the same through the cache.
         assert!(committed_cached(&mut known, at, 2 * BLOCK));
         assert!(!known.is_empty(), "committed pages are remembered");

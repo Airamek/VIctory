@@ -43,12 +43,12 @@ pub(crate) struct Shadow {
     tracked: Option<crate::watch::Tracked>,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<std::collections::HashSet<(usize, usize)>>,
+    pending: Mutex<crate::fx::Set<(usize, usize)>>,
     /// The copy's bytes before the submission ran, where its shaders write:
     /// what the GPU wrote differs. Parts of the copy that do not overlap, in
     /// order, with where each starts in [`SNAPSHOTS`], and the 64 KiB pieces
     /// (by title address) already compared.
-    before: Mutex<(Vec<Part>, std::collections::HashSet<usize>)>,
+    before: Mutex<(Vec<Part>, crate::fx::Set<usize>)>,
     /// Its first bit in the buffer views' written-pages bitmap, one per
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
