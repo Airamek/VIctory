@@ -2066,6 +2066,7 @@ impl Host {
         if let Some(up) = upload_list {
             let mut copy_batch = Batch {
                 host: Some(self),
+                submission_gen: crate::shadow::generation(),
                 ..Batch::default()
             };
             up.run_deferred(&mut copy_batch);
@@ -3695,21 +3696,60 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Records a `Copy`/`Fill` step, merging it into the previous step when
+    /// the two copy one contiguous run: a step right after one of the same
+    /// kind whose destination and source both continue where the last left
+    /// off copies their concatenation. Fewer, larger ranges: lists record
+    /// their upload and title copies in small adjacent pieces, and each
+    /// step costs two conflict lookups at submission. The merged step
+    /// copies the same bytes in the same order; its settle covers the union
+    /// of the two ranges, which waits for every submission either range
+    /// would wait for (a conflict with either half conflicts with the
+    /// union), so no wait is lost and none is reordered. Zero-length steps
+    /// copy nothing and are dropped. Lengths that would overflow are kept
+    /// as separate steps.
+    fn push_copy(steps: &mut Vec<Step>, dst: usize, src: usize, len: usize, copy: bool) {
+        // Nothing to copy.
+        if len == 0 {
+            return;
+        }
+        match steps.last_mut() {
+            Some(Step::Copy(ldst, lsrc, llen))
+                if copy
+                    && ldst.checked_add(*llen) == Some(dst)
+                    && lsrc.checked_add(*llen) == Some(src)
+                    && llen.checked_add(len).is_some() =>
+            {
+                *llen += len;
+            }
+            Some(Step::Fill(ldst, lsrc, llen))
+                if !copy
+                    && ldst.checked_add(*llen) == Some(dst)
+                    && lsrc.checked_add(*llen) == Some(src)
+                    && llen.checked_add(len).is_some() =>
+            {
+                *llen += len;
+            }
+            _ => steps.push(if copy {
+                Step::Copy(dst, src, len)
+            } else {
+                Step::Fill(dst, src, len)
+            }),
+        }
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
-        deferred
-            .copies
-            .push(Step::Copy(dst as usize, src as usize, len));
+        Self::push_copy(&mut deferred.copies, dst as usize, src as usize, len, true);
         deferred.refreshed.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        let mut deferred = self.deferred();
+        Self::push_copy(&mut deferred.copies, dst as usize, src as usize, len, false);
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -4081,6 +4121,9 @@ impl HostList {
             );
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
+                    if len == 0 {
+                        continue;
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -4089,10 +4132,19 @@ impl HostList {
                     batch.settle(src, len, false);
                     batch.settle(dst, len, true);
                     batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    copy_mapped_cached(
+                        dst as *mut u8,
+                        src as *const u8,
+                        len,
+                        true,
+                        Some(&mut batch.committed),
+                    );
                     len
                 }
                 &Step::Fill(dst, src, len) => {
+                    if len == 0 {
+                        continue;
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -4391,6 +4443,14 @@ struct Batch<'a> {
     submission_gen: u64,
     /// Heap-hull ranges queued so far in the submission (see `HullCache`).
     hull: HullCache,
+    /// 64 KiB title-memory pages found committed this submission, so that
+    /// `copy_mapped`'s fallback asks the kernel once per page (see
+    /// `crate::texture::committed_cached`): the submission's copies over
+    /// the same title memory re-ask the same pages. A page committed stays
+    /// committed for the submission (title writes meanwhile are for later
+    /// submissions); unmapped pages are never remembered (the title may map
+    /// them), so this is never cleared mid-submission.
+    committed: std::collections::HashSet<usize>,
 }
 
 /// Entries that pay back data-parallel copies: at least this many ranges
@@ -4579,6 +4639,22 @@ impl Batch<'_> {
 /// its copy has failed (asked before each, the world's 80 copies per frame
 /// cost 60 ms).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_cached(dst, src, len, title_dst, None);
+}
+
+/// Like [`copy_mapped`], but a title destination's committed question goes
+/// through the submission's 64 KiB page cache (`known`, see
+/// `crate::texture::committed_cached`) when one is passed, so the
+/// submission's copies over the same title memory ask the kernel once per
+/// page. Same bytes either way: the cache only remembers answers `committed`
+/// would give.
+pub(crate) fn copy_mapped_cached(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+    known: Option<&mut std::collections::HashSet<usize>>,
+) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -4605,7 +4681,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // The copy stopped at an unmapped page. One of a title destination ends
     // it: the retries below write the destination themselves (zeros for
     // what cannot be read), and would fault there.
-    if title_dst && !crate::texture::committed(dst, len) {
+    if title_dst
+        && !match known {
+            Some(known) => crate::texture::committed_cached(known, dst, len),
+            None => crate::texture::committed(dst, len),
+        }
+    {
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -6022,7 +6103,52 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
-    use super::{Batch, HullCache};
+    use super::{Batch, HostList, HullCache, Step};
+
+    /// Adjacent `Copy`/`Fill` steps over one contiguous run merge, and
+    /// zero-length steps are dropped: fewer steps (each costs two conflict
+    /// lookups at submission), the same bytes in the same order. Needs no
+    /// GPU: the merge is decided on addresses alone.
+    #[test]
+    fn adjacent_copy_steps_merge_into_one_contiguous_run() {
+        let mut steps: Vec<Step> = Vec::new();
+        HostList::push_copy(&mut steps, 0x1000, 0x2000, 0, true);
+        assert!(steps.is_empty(), "a zero-length copy records nothing");
+        HostList::push_copy(&mut steps, 0x1000, 0x2000, 64, true);
+        HostList::push_copy(&mut steps, 0x1040, 0x2040, 32, true);
+        assert!(
+            matches!(steps.as_slice(), [Step::Copy(0x1000, 0x2000, 96)]),
+            "a contiguous copy continues the run"
+        );
+        // A fill is another kind: no merge across kinds.
+        HostList::push_copy(&mut steps, 0x1060, 0x2060, 16, false);
+        assert_eq!(steps.len(), 2, "a fill starts its own run");
+        HostList::push_copy(&mut steps, 0x1070, 0x2070, 16, false);
+        assert!(
+            matches!(
+                steps.as_slice(),
+                [
+                    Step::Copy(0x1000, 0x2000, 96),
+                    Step::Fill(0x1060, 0x2060, 32)
+                ]
+            ),
+            "a contiguous fill continues its own run"
+        );
+        // The destination continues but the source does not: another range.
+        HostList::push_copy(&mut steps, 0x1080, 0x3000, 16, false);
+        assert_eq!(steps.len(), 3, "a new source starts a new step");
+        // Lengths that would overflow stay separate (and never wrap).
+        HostList::push_copy(&mut steps, usize::MAX - 4, 0x4000, 8, true);
+        HostList::push_copy(&mut steps, 0, 0x4008, 8, true);
+        assert_eq!(steps.len(), 5, "overflow never merges");
+        assert!(
+            matches!(
+                steps.as_slice(),
+                [_, _, _, Step::Copy(_, _, 8), Step::Copy(0, 0x4008, 8)]
+            ),
+            "both overflowing steps survive unmerged"
+        );
+    }
 
     /// The hull cache needs no GPU: a repeat (same copy, covered range,
     /// generation and dirtiness) hits; anything else misses.

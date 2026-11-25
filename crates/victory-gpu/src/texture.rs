@@ -821,6 +821,34 @@ fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64)
 /// Whether `[at, at + len)` is committed, readable memory (streamed textures
 /// may be unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    committed_inner(at, len, None)
+}
+
+/// The granularity of [`committed_cached`]'s `known` set: `VirtualQuery`
+/// regions are kept as the 64 KiB pages they cover, the page size the
+/// fallback copier works in.
+pub(crate) const COMMIT_PAGE: usize = 64 << 10;
+
+/// Whether `[at, at + len)` is committed, readable memory, asking the kernel
+/// only for 64 KiB pages not already in `known` (found committed by an
+/// earlier call this submission) and remembering the fully covered pages of
+/// every committed region asked about. Same answer as [`committed`]: a page
+/// committed stays committed for the submission, while an unmapped page is
+/// asked again (and never remembered), since the title may map it.
+pub(crate) fn committed_cached(
+    known: &mut std::collections::HashSet<usize>,
+    at: *const u8,
+    len: usize,
+) -> bool {
+    committed_inner(at, len, Some(known))
+}
+
+/// The committed question, shared by [`committed`] and [`committed_cached`].
+fn committed_inner(
+    at: *const u8,
+    len: usize,
+    mut known: Option<&mut std::collections::HashSet<usize>>,
+) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
@@ -829,6 +857,17 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         return false;
     };
     while p < end {
+        if known
+            .as_ref()
+            .is_some_and(|k| k.contains(&(p & !(COMMIT_PAGE - 1))))
+        {
+            // Asked and committed earlier this submission: the rest of the
+            // page reads the same.
+            p = (p & !(COMMIT_PAGE - 1))
+                .saturating_add(COMMIT_PAGE)
+                .min(end);
+            continue;
+        }
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
@@ -841,6 +880,22 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
         if next <= p {
             return false;
+        }
+        if let Some(known) = known.as_deref_mut() {
+            // Remember the region's whole 64 KiB pages, so the submission's
+            // other copies over the same title memory skip asking for them.
+            // Only pages the region covers fully: a page sticking out may
+            // belong to an unmapped neighbor.
+            let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+            let mut page = (info.BaseAddress as usize).div_ceil(COMMIT_PAGE) * COMMIT_PAGE;
+            while page
+                .checked_add(COMMIT_PAGE)
+                .is_some_and(|after| after <= region_end)
+            {
+                known.insert(page);
+                page += COMMIT_PAGE;
+                // No wraparound: `after <= region_end <= usize::MAX`.
+            }
         }
         p = next;
     }
@@ -948,5 +1003,44 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn committed_cached_matches_committed_and_remembers_committed_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: reserving three 64 KiB blocks for the test, freed below.
+        let base =
+            unsafe { VirtualAlloc(std::ptr::null(), 3 * BLOCK, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        // SAFETY: committing the first two of our reserved blocks.
+        for n in 0..2 {
+            // SAFETY: inside our reservation, freed below.
+            let at = unsafe { base.cast::<u8>().add(n * BLOCK) };
+            // SAFETY: committing one of our reserved blocks, freed below.
+            let made = unsafe { VirtualAlloc(at.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE) };
+            assert!(!made.is_null());
+        }
+        let at = base.cast::<u8>();
+        let mut known = std::collections::HashSet::new();
+        // Our committed blocks answer the same through the cache.
+        assert!(committed_cached(&mut known, at, 2 * BLOCK));
+        assert!(!known.is_empty(), "committed pages are remembered");
+        assert!(known.contains(&(at as usize & !(COMMIT_PAGE - 1))));
+        // The reserved hole is never remembered, and still fails both ways.
+        assert!(!committed_cached(&mut known, at, 3 * BLOCK));
+        assert!(!committed(at, 3 * BLOCK));
+        let hole = (at as usize + 2 * BLOCK) & !(COMMIT_PAGE - 1);
+        assert!(!known.contains(&hole), "unmapped pages are asked again");
+        // A repeat over remembered pages (even unaligned) answers the same.
+        assert!(committed_cached(&mut known, at, 2 * BLOCK));
+        // SAFETY: inside our first committed block, freed below.
+        let probe = unsafe { at.add(1) };
+        assert!(committed_cached(&mut known, probe, BLOCK - 1));
+        assert!(!committed_cached(&mut known, usize::MAX as *const u8, 16));
+        // SAFETY: freeing the reservation above.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 }
