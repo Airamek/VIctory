@@ -1100,7 +1100,7 @@ impl Shader {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::super::bitcode::Term;
     use super::*;
@@ -1108,6 +1108,7 @@ mod tests {
     /// A program that sets a bit through the write marks' UAV, or (`heap`)
     /// through a UAV indexed from the heap: a vertex (`pixel` false, no
     /// thread-group size), pixel or compute program.
+    #[cfg(windows)]
     fn marked(pixel: bool, threads: Option<[u32; 3]>, heap: bool) -> Vec<u8> {
         let mut s = Shader::new(pixel);
         s.threads = threads;
@@ -1131,6 +1132,7 @@ mod tests {
     /// 5,046 programs of the title's list); pixel and compute programs need
     /// not, nor a vertex program whose UAVs all come from the heap (the
     /// validator counts declared ranges only: 26 mesh and vertex programs).
+    #[cfg(windows)]
     #[test]
     fn uavs_outside_pixel_and_compute_programs_are_declared() {
         let mut validator = super::super::validator::Validator::load(
@@ -1149,5 +1151,52 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
             }
         }
+    }
+
+    #[test]
+    fn op_caches_declarations_and_handles_sampler_choices() {
+        let mut s = Shader::new(false);
+        let b = s.entry;
+        let x = s.m.f32(1.0f32.to_bits());
+        let y = s.m.f32(2.0f32.to_bits());
+        let r0 = s.op(b, "binary.f32", Attr::ReadNone, s.t.f32, 35, &[x, y]);
+        let r1 = s.op(b, "binary.f32", Attr::ReadNone, s.t.f32, 35, &[r0, y]);
+        assert!(s.op_decls.iter().any(|d| d.name == "binary.f32"));
+
+        // With a sampler choice active, op clones args and emits a select.
+        let s0 = s.sampler_handle(b, 0);
+        let s1 = s.sampler_handle(b, 1);
+        s.samplers = 2;
+        let cond = s.m.bool(true);
+        s.sampler_choices.push((s0, s1, cond));
+        let chosen = s.op(b, "custom.sampler", Attr::ReadNone, s.t.f32, 99, &[s0, r1]);
+        assert_ne!(chosen, r1);
+        s.m.terminate(b, Term::Ret);
+        let bytes = s.finish();
+        assert!(bytes.starts_with(b"DXBC"));
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_op_calls() {
+        let run = || {
+            let mut s = Shader::new(false);
+            let b = s.entry;
+            let mut acc = s.m.f32(1.0f32.to_bits());
+            let k = s.m.f32(2.0f32.to_bits());
+            for i in 0..4096u32 {
+                let c = s.m.f32(((i & 15) as f32 * 0.25_f32 + 1.0).to_bits());
+                let _ = s.m.i32(i & 31);
+                acc = s.op(b, "tertiary.f32", Attr::ReadNone, s.t.f32, 46, &[acc, k, c]);
+            }
+            s.m.terminate(b, Term::Ret);
+            std::hint::black_box(acc)
+        };
+        let _ = run();
+        let t = std::time::Instant::now();
+        for _ in 0..50 {
+            run();
+        }
+        eprintln!("shader::op 4096x: {:.1} us/run", t.elapsed().as_secs_f64() * 1e6 / 50.0);
     }
 }
