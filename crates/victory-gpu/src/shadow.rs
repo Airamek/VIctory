@@ -180,7 +180,10 @@ fn kept<'a>(
 // whose disjoint ranges different submission threads refresh and compare
 // (one thread per host copy in a parallel batch, one range at a time per
 // copy), whose snapshot slots different threads fill (disjoint bytes of one
-// reservation), and title memory is read through the kernel.
+// reservation), and which the thread finishing an earlier submission writes
+// only in ranges that one's shaders wrote (which the submitting thread
+// leaves alone until it has finished); title memory is read through the
+// kernel.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
@@ -378,6 +381,21 @@ impl Shadow {
         let parts = &mut before.0;
         let gaps = uncovered(parts, from, to);
         if gaps.is_empty() {
+            // Refresh the covered slots from the copy: an earlier submission
+            // may have copied back since they were kept (submissions overlap;
+            // `settle` keeps overlapping writers out, so no in-flight
+            // submission still reads them), and the next compare must see
+            // the copy as it is now, not as it was then.
+            let mut snapshots = snapshots_mut();
+            for p in parts.iter() {
+                let (s, e) = (p.from.max(from), p.to.min(to));
+                if s < e {
+                    // SAFETY: inside the mapping and the snapshots block.
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(s), e - s) };
+                    snapshots.bytes[p.at + (s - p.from)..p.at + (e - p.from)]
+                        .copy_from_slice(host);
+                }
+            }
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -562,7 +580,7 @@ impl Shadow {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter()) {
                         if *h != *o && *t != *h {
                             *t = *h;
                             changed = true;
@@ -574,6 +592,11 @@ impl Shadow {
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
                     }
+                    // Keep the snapshot current for this range in case another
+                    // disjoint in-flight submission keeps `snapshot` alive.
+                    // (Parts are immutable once written: disjoint submissions
+                    // use different slots, and overlapping ones are settled
+                    // first, so no update is needed.)
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
@@ -587,8 +610,10 @@ impl Shadow {
                 t.taken(&whole);
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshots with the last range.
+        // Every submitted step that declared the range is done with it
+        // (submissions in flight do not declare overlapping ranges of a
+        // copy: a later one finishes the earlier first), and the snapshot
+        // with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.remove(&(address, address + len));
         if pending.is_empty() {
@@ -706,6 +731,7 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+
     /// [`Shadow::update`] of `[from, to)` where a list submitted earlier
     /// declared that shaders write. A submission waits for the one before it,
     /// so none of this submission's shaders has run yet: the pages the title
@@ -741,6 +767,32 @@ impl Shadow {
             }
         }
         copied
+    }
+
+    /// Whether the title may have written a page of `[from, to)` (title
+    /// addresses) since the copy last took it (always, for memory that is
+    /// not tracked).
+    pub(crate) fn stale(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return false;
+        }
+        self.tracked
+            .as_ref()
+            .is_none_or(|t| t.any_changed(from, to))
+    }
+
+    /// Once a submission's ranges of the copy have all gone back: the next
+    /// submission compares its pieces afresh (several may be in flight
+    /// while the snapshot lives).
+    pub(crate) fn submission_done(&self) {
+        self.before
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .clear();
+
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -1271,6 +1323,7 @@ mod tests {
         unregister(p, p as u64);
     }
 
+
     #[test]
     fn buffer_states_follow_submission_order_and_combine_reads() {
         use std::sync::atomic::Ordering;
@@ -1376,4 +1429,42 @@ mod tests {
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
     }
+
+    /// Submissions in flight on one copy: a range declared again while an
+    /// earlier submission's snapshot lives starts from the copy as it is
+    /// now, so what went back meanwhile is not taken for the GPU's again.
+    #[test]
+    fn snapshot_stays_fresh_across_disjoint_in_flight_submissions() {
+        let _one = snapshot_tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, 256);
+        let Some(copy) = find(p as u64, 256) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, 256);
+        // SAFETY: our pool.
+        let title = || unsafe { (p as *const u8).read_volatile() };
+        // S1 declares range A, S2 the disjoint range B while S1 is in flight.
+        copy.writing(p, 64, false);
+        copy.writing(p + 128, 64, false);
+        // S1's shaders write byte 0 of A; it goes back while S2 runs.
+        copy.write_host(p as u64, &[0x11]);
+        copy.copy_back(p, 64);
+        copy.submission_done();
+        assert_eq!(title(), 0x11);
+        // S3 declares A again while S2 keeps the snapshot; the title then
+        // writes byte 0 while S3 runs (S3's shaders leave it alone).
+        copy.writing(p, 64, false);
+        // SAFETY: our pool.
+        unsafe { (p as *mut u8).write_volatile(0x22) };
+        copy.copy_back(p, 64);
+        copy.submission_done();
+        assert_eq!(title(), 0x22, "the title's byte, not S1's again");
+        // S2 finishes last and releases the snapshot.
+        copy.copy_back(p + 128, 64);
+        assert!(copy.before.lock().unwrap().0.is_empty());
+        unregister(p, p as u64);
+    }
+
 }
