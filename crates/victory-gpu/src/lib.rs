@@ -34,6 +34,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod fx;
 mod hold;
 #[cfg(windows)]
 mod host;

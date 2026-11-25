@@ -1511,9 +1511,9 @@ struct Deferred {
     dynamic: Vec<DynamicLease>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fx::Set<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fx::Set<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -4385,7 +4385,7 @@ fn run_one_back(
 /// unchanged.
 #[derive(Default)]
 struct HullCache {
-    queued: std::collections::HashMap<usize, (usize, usize, u64, bool)>,
+    queued: crate::fx::Map<usize, (usize, usize, u64, bool)>,
 }
 
 impl HullCache {
@@ -4422,10 +4422,10 @@ impl HullCache {
 struct Batch<'a> {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Where each copy's refresh is in `refreshes`, by copy.
-    pending: std::collections::HashMap<usize, usize>,
+    pending: crate::fx::Map<usize, usize>,
     /// The range of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    current: crate::fx::Map<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// The host, whose earlier submissions may still be in flight.
     host: Option<&'a Host>,
     /// For a repeat of a list in the submission: what its steps write into
@@ -4436,7 +4436,7 @@ struct Batch<'a> {
     reads: Vec<(usize, usize)>,
     shaders: Vec<(usize, usize, usize)>,
     /// Page tables (by view heap key) the submission's shaders read.
-    tables: std::collections::HashSet<usize>,
+    tables: crate::fx::Set<usize>,
     /// The copies' generation when the submission's preparation started
     /// (`crate::shadow::generation`): hull ranges queued under it stay
     /// queued only while it holds.
@@ -4450,7 +4450,7 @@ struct Batch<'a> {
     /// committed for the submission (title writes meanwhile are for later
     /// submissions); unmapped pages are never remembered (the title may map
     /// them), so this is never cleared mid-submission.
-    committed: std::collections::HashSet<usize>,
+    committed: crate::fx::Set<usize>,
 }
 
 /// Entries that pay back data-parallel copies: at least this many ranges
@@ -4653,7 +4653,7 @@ pub(crate) fn copy_mapped_cached(
     src: *const u8,
     len: usize,
     title_dst: bool,
-    known: Option<&mut std::collections::HashSet<usize>>,
+    known: Option<&mut crate::fx::Set<usize>>,
 ) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
