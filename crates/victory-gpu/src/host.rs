@@ -355,6 +355,24 @@ fn create() -> windows::core::Result<Host> {
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
+        // Self-identifying diagnostics: one line proving from the log alone
+        // which gates were active (a run with VICTORY_COPY_QUEUE=1 left no
+        // marker). Diagnostics only; no behavior change.
+        #[cfg(feature = "diagnostics")]
+        tracing::info!(
+            "host diagnostics self-id v1: VICTORY_COPY_QUEUE={} VICTORY_GPU_TIMING={} profile={} WARP={} GBV={} DRED={} DEBUG={}",
+            crate::switch::on("VICTORY_COPY_QUEUE"),
+            crate::switch::on("VICTORY_GPU_TIMING"),
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            crate::switch::on("VICTORY_D3D12_WARP"),
+            crate::switch::on("VICTORY_D3D12_GBV"),
+            crate::switch::on("VICTORY_D3D12_DRED"),
+            crate::switch::on("VICTORY_D3D12_DEBUG"),
+        );
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
