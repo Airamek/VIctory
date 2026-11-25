@@ -1810,6 +1810,7 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch {
             host: Some(self),
+            submission_gen: crate::shadow::generation(),
             ..Batch::default()
         };
         // A list named again in this submission: its earlier prelude is
@@ -3687,9 +3688,9 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| {
+                    crate::bindless::refresh(viewed, |s, a, l, bit| {
                         batch.settle_refresh(s, a, l);
-                        batch.add(s, a, l);
+                        batch.add_cached(s, a, l, bit);
                         batch.reads.push((a, a + l));
                     });
                     continue;
@@ -3707,9 +3708,9 @@ impl HostList {
                                 host.settle_table(heap);
                             }
                         },
-                        |s, a, l| {
+                        |s, a, l, bit| {
                             batch.settle_refresh(s, a, l);
-                            batch.add(s, a, l);
+                            batch.add_cached(s, a, l, bit);
                             batch
                                 .shaders
                                 .push((std::sync::Arc::as_ptr(s) as usize, a, a + l));
@@ -3826,6 +3827,55 @@ fn run_one_back(
 /// title memory asks for every copy whole. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
+///
+/// Heap-hull ranges queued so far in the submission (the `hull` field of
+/// [`Batch`]): per host copy (by copy address, which names no other while
+/// held) the hull range queued, the copies' generation then, and whether
+/// its change-tracker bit read dirty. A heap-hull or page-table walk asking
+/// for a copy's range already queued at the same generation with the same
+/// dirtiness asks `Batch::add` for nothing new: every list of a world
+/// submission using title memory asks for every copy whole (~9,000 hull
+/// ranges, ~4,700 table entries), and the merge in `add` is redone per list
+/// without this. Cleared by `Batch::title_written` with `current`: what a
+/// step writing title memory changes is new work. The settle before each
+/// range (`settle_refresh`, the table settle) still runs per range: this
+/// skips only the redundant queueing, never a wait, so the GPU order is
+/// unchanged.
+#[derive(Default)]
+struct HullCache {
+    queued: std::collections::HashMap<usize, (usize, usize, u64, bool)>,
+}
+
+impl HullCache {
+    /// Whether the copy's `[address, address + len)` was already queued at
+    /// `generation` with dirtiness `dirty` (its range covered by what was queued).
+    fn hit(&self, key: usize, address: usize, len: usize, generation: u64, dirty: bool) -> bool {
+        self.queued.get(&key).is_some_and(|&(from, to, g, d)| {
+            g == generation && d == dirty && from <= address && address + len <= to
+        })
+    }
+
+    /// Remembers the copy's queued `[address, address + len)` at `generation` with
+    /// dirtiness `dirty` (unions with what was queued at the same
+    /// generation and dirtiness, else replaces it).
+    fn note(&mut self, key: usize, address: usize, len: usize, generation: u64, dirty: bool) {
+        let end = address + len;
+        match self.queued.get_mut(&key) {
+            Some(entry) if entry.2 == generation && entry.3 == dirty => {
+                entry.0 = entry.0.min(address);
+                entry.1 = entry.1.max(end);
+            }
+            _ => {
+                self.queued.insert(key, (address, end, generation, dirty));
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.queued.clear();
+    }
+}
+
 #[derive(Default)]
 struct Batch<'a> {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -3845,6 +3895,12 @@ struct Batch<'a> {
     shaders: Vec<(usize, usize, usize)>,
     /// Page tables (by view heap key) the submission's shaders read.
     tables: std::collections::HashSet<usize>,
+    /// The copies' generation when the submission's preparation started
+    /// (`crate::shadow::generation`): hull ranges queued under it stay
+    /// queued only while it holds.
+    submission_gen: u64,
+    /// Heap-hull ranges queued so far in the submission (see `HullCache`).
+    hull: HullCache,
 }
 
 /// Entries that pay back data-parallel copies: at least this many ranges
@@ -3923,11 +3979,43 @@ impl Batch<'_> {
         }
     }
 
+    /// Like [`Batch::add`], for a heap hull or page-table range whose
+    /// change-tracker bit is `bit`: queues it once per submission for the
+    /// copies' generation and dirtiness. A repeat (another list reaching the
+    /// same copy's range, same generation, same dirtiness) is already
+    /// covered by `pending`/`current`, so queuing it again only redoes the
+    /// merge. The caller still settles each range first: this skips no wait.
+    fn add_cached(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+        bit: Option<u32>,
+    ) {
+        // Nothing to copy (matches `add`, which also passes clean copies by).
+        if shadow.clean() {
+            return;
+        }
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let now = crate::shadow::generation();
+        debug_assert!(
+            now >= self.submission_gen,
+            "copies' generation only advances past the submission's start"
+        );
+        let dirty = !crate::watch::clean_bit(bit);
+        if self.hull.hit(key, address, len, now, dirty) {
+            return;
+        }
+        self.add(shadow, address, len);
+        self.hull.note(key, address, len, now, dirty);
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
         self.current.clear();
+        self.hull.clear();
     }
 
     /// Does the refreshes; returns the bytes copied. Serial: the takes
@@ -5436,7 +5524,67 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, HullCache};
+
+    /// The hull cache needs no GPU: a repeat (same copy, covered range,
+    /// generation and dirtiness) hits; anything else misses.
+    #[test]
+    fn hull_cache_hits_only_covered_repeats_at_the_same_generation() {
+        let mut hull = HullCache::default();
+        assert!(!hull.hit(7, 100, 50, 3, true), "nothing queued yet");
+        hull.note(7, 100, 50, 3, true);
+        assert!(hull.hit(7, 100, 50, 3, true), "the same range repeats");
+        assert!(hull.hit(7, 110, 20, 3, true), "a covered subrange repeats");
+        assert!(!hull.hit(7, 90, 20, 3, true), "reaching past what was queued");
+        assert!(!hull.hit(7, 100, 60, 3, true), "reaching past what was queued");
+        assert!(!hull.hit(7, 100, 50, 4, true), "a new copies' generation");
+        assert!(!hull.hit(7, 100, 50, 3, false), "dirtiness changed");
+        assert!(!hull.hit(9, 100, 50, 3, true), "another copy");
+        // A wider range at the same generation and dirtiness unions.
+        hull.note(7, 90, 80, 3, true);
+        assert!(hull.hit(7, 90, 80, 3, true), "the union stays queued");
+        // A new generation replaces the entry rather than unioning with it.
+        hull.note(7, 1000, 8, 4, true);
+        assert!(hull.hit(7, 1000, 8, 4, true));
+        assert!(!hull.hit(7, 100, 50, 3, true), "the old generation is gone");
+        hull.clear();
+        assert!(!hull.hit(7, 1000, 8, 4, true), "a title write clears it");
+    }
+
+    /// Queued hull ranges survive `flush`, and go with `title_written`:
+    /// two heap-hull walks asking for a copy whole queue it once, and a
+    /// repeat after a title write queues what changed. Needs a host GPU;
+    /// passes by without one, like the batch test above.
+    #[test]
+    fn cached_hull_ranges_queue_once_until_a_title_write() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch {
+            submission_gen: crate::shadow::generation(),
+            ..Batch::default()
+        };
+        // Two lists' heap-hull walks ask for the copy whole.
+        batch.add_cached(&copy, p, len, copy.dirty_bit());
+        batch.add_cached(&copy, p, len, copy.dirty_bit());
+        assert_eq!(batch.flush(), len, "queued once, copied whole at first");
+        // The same submission asks again: already queued, nothing new.
+        batch.add_cached(&copy, p, len, copy.dirty_bit());
+        assert_eq!(batch.flush(), 0, "the repeat finds it already queued");
+        // SAFETY: our pool, guarded since the copy took it.
+        unsafe { ((p + 8) as *mut u8).write_volatile(1) };
+        batch.title_written();
+        batch.add_cached(&copy, p, len, copy.dirty_bit());
+        assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
     /// for it whole copies the one page the title wrote, once, and again

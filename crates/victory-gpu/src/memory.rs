@@ -412,15 +412,15 @@ fn layout(key: usize) -> Arc<Layout> {
 
 /// At submission, for a list using title memory with view heap `key`
 /// bound: the heap's page table names every host copy there is, each
-/// brought up to date (`add` takes a copy's range, once per submission
-/// until a step writes title memory). A table out of date is rewritten
+/// brought up to date (`add` takes a copy's range and its change-tracker
+/// bit, once per submission until a step writes title memory). A table out of date is rewritten
 /// once `settle` has finished the submissions in flight that read it
 /// (outside our locks: finishing one runs its lists' work, which takes
 /// them); one that went out of date only since is rewritten next time.
 pub(crate) fn prepare(
     key: usize,
     settle: impl FnOnce(),
-    mut add: impl FnMut(&Arc<Shadow>, usize, usize),
+    mut add: impl FnMut(&Arc<Shadow>, usize, usize, Option<u32>),
 ) {
     let stale = with_heap(key, |heap| {
         let host = std::ptr::from_ref(heap) as usize;
@@ -446,11 +446,13 @@ pub(crate) fn prepare(
     .flatten();
     // Copies the title has not written since they took it are passed by
     // without touching them (the table names every copy, ~4,700 in the world).
+    // Each range's change-tracker bit goes with it, so the submission's
+    // batch can tell a repeat (same generation, same dirtiness) from new work.
     for l in layout.iter() {
         for (c, bit) in l.copies.iter().zip(&l.bits) {
             if !crate::watch::clean_bit(*bit) {
                 let (start, len) = c.range();
-                add(c, start as usize, len as usize);
+                add(c, start as usize, len as usize, *bit);
             }
         }
     }
