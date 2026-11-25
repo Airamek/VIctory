@@ -986,8 +986,12 @@ struct Pending {
     /// The ranges its shaders write (host copy, address, bytes), each once,
     /// and the runs that declared each.
     back: Vec<Back>,
-    /// Its bottom-of-pipe writes, in list order: address, what, bytes.
-    writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Its bottom-of-pipe writes, per run in list order: address, what,
+    /// bytes. Query results go back before the writes of their own run.
+    writes: Vec<Vec<(usize, crate::queue::Written, usize)>>,
+    /// Per run, the query results it resolved into read-back buffers, in
+    /// list order: the buffer, then each (destination, offset, bytes).
+    resolves: Vec<Vec<(ID3D12Resource, Vec<Target>)>>,
     /// The preludes of lists it names more than once, past their first:
     /// each recording has its own, back to the spares once it has run.
     preludes: Vec<Prelude>,
@@ -1015,7 +1019,7 @@ impl Pending {
         let mut back: Vec<Back> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> =
             std::collections::HashMap::new();
-        let (mut writes, mut touches) = (Vec::new(), Touches::default());
+        let (mut pending_writes, mut pending_resolves, mut touches) = (Vec::new(), Vec::new(), Touches::default());
         let (mut missed, mut after) = (Vec::with_capacity(runs.len()), Vec::new());
         // One list's lock at a time: a submission may name a list twice.
         for (run, list) in runs.iter().enumerate() {
@@ -1056,15 +1060,19 @@ impl Pending {
                     .staging
                     .insert(std::sync::Arc::as_ptr(staging) as usize);
             }
+            let mut writes = Vec::new();
             for &(at, what, bytes) in &deferred.writes {
                 writes.push((at, what, bytes));
                 touches.labels.push((at, at + bytes));
             }
+            pending_writes.push(writes);
+            pending_resolves.push(deferred.resolves.clone());
         }
         let pending = Pending {
             lists: runs.iter().map(|&l| ListRef(l)).collect(),
             back,
-            writes,
+            writes: pending_writes,
+            resolves: pending_resolves,
             preludes: Vec::new(),
             submitted: std::time::Instant::now(),
             missed,
@@ -1748,8 +1756,45 @@ impl Host {
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
-        for &(at, what, bytes) in &p.writes {
-            what.write(at as *mut u8, bytes);
+        for (writes, resolves) in p.writes.iter().zip(p.resolves.iter()) {
+            // Query results first: a bottom-of-pipe write may name the same
+            // memory (a buffer the title both resolves into and advances).
+            for (readback, targets) in resolves {
+                let mut data = std::ptr::null_mut();
+                let end = targets
+                    .iter()
+                    .map(|&(_, offset, bytes)| offset + bytes as u64)
+                    .max()
+                    .unwrap_or(0);
+                let range = D3D12_RANGE {
+                    Begin: 0,
+                    End: end as usize,
+                };
+                // SAFETY: a read-back buffer the finished list resolved
+                // into; `end` is inside it (the resolve checked the
+                // title's own buffer, and the buffer was made that size).
+                if unsafe { readback.Map(0, Some(&range), Some(&mut data)) }.is_err() {
+                    continue;
+                }
+                for &(at, offset, bytes) in targets {
+                    // SAFETY: reading a u64 at a checked offset of the
+                    // mapped buffer, and writing into title memory.
+                    unsafe {
+                        let value =
+                            std::ptr::read_unaligned(data.add(offset as usize).cast::<u64>());
+                        if bytes == 4 {
+                            (at as *mut u32).write_unaligned(value as u32);
+                        } else {
+                            (at as *mut u64).write_unaligned(value);
+                        }
+                    }
+                }
+                // SAFETY: the same buffer, unmapped once.
+                unsafe { readback.Unmap(0, None) };
+            }
+            for &(at, what, bytes) in writes {
+                what.write(at as *mut u8, bytes);
+            }
         }
         drop(p.repeats);
         for prelude in p.preludes {
