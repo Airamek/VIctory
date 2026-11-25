@@ -5,8 +5,8 @@
 //!    a hash of all that its host description holds (the translated
 //!    shaders' code, which changes when a translation does, our root
 //!    signature, the graphics state). The library is saved under the cache
-//!    folder; the host refuses a library of another adapter or driver, and
-//!    an entry whose description differs, so neither is ever used.
+//!    folder for its adapter; the host refuses a library of another driver
+//!    and an entry whose description differs, so neither is ever used.
 //! 2. The title pipelines a run drew or dispatched with (made in time or
 //!    not) are listed by a key known when the title creates them (their
 //!    shader containers and graphics state); the next run hands those to
@@ -30,16 +30,19 @@
 //! must still be right when the bytes are written.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Keeps the pipeline library in an adapter subdirectory of `dir` and the
+/// shared early list in `dir`. A compatible legacy library can be read from
+/// `dir` when no adapter library exists.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
@@ -117,17 +120,76 @@ const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
+fn device_adapter(device: &ID3D12Device) -> Option<DXGI_ADAPTER_DESC1> {
+    // SAFETY: these calls query the live device and DXGI adapter metadata.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()?;
+        adapter.GetDesc1().ok()
+    }
+}
+
+fn adapter_cache_dir(root: &Path, adapter: &DXGI_ADAPTER_DESC1) -> PathBuf {
+    // The LUID identifies the current DXGI adapter, but is not a disk key.
+    let kind = if adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+        "software"
+    } else {
+        "hardware"
+    };
+    root.join("adapters").join(format!(
+        "{kind}-{:04x}-{:04x}-{:08x}-{:02x}",
+        adapter.VendorId, adapter.DeviceId, adapter.SubSysId, adapter.Revision
+    ))
+}
+
+fn cache_dir(root: &Path) -> Option<PathBuf> {
+    static ADAPTER: OnceLock<DXGI_ADAPTER_DESC1> = OnceLock::new();
+    let adapter = match ADAPTER.get() {
+        Some(adapter) => adapter,
+        None => {
+            let adapter = device_adapter(&crate::host::host()?.device)?;
+            ADAPTER.get_or_init(|| adapter)
+        }
+    };
+    Some(adapter_cache_dir(root, adapter))
+}
+
+fn read_cache(root: &Path, adapter: Option<&Path>) -> (Vec<u8>, Option<Vec<u8>>) {
+    let read = |dir: &Path| {
+        std::fs::read(dir.join(LIBRARY_FILE))
+            .map(|blob| (blob, std::fs::read(dir.join(PREBUILT_FILE)).ok()))
+    };
+    // A compatible legacy library can be reused when there is no adapter
+    // library yet. The legacy files are never overwritten by the new layout.
+    match adapter.map(read) {
+        Some(Ok(cache)) => cache,
+        Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => Default::default(),
+        _ => read(root).unwrap_or_default(),
+    }
+}
+
+fn write_cache(dir: &Path, blob: &[u8], prebuilt: Option<&str>) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_atomically(&dir.join(LIBRARY_FILE), blob)?;
+    if let Some(list) = prebuilt {
+        write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes())?;
+    }
+    Ok(())
+}
+
 fn library() -> Option<&'static Mutex<Library>> {
     static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
+            let (blob, prebuilt) = DIR
+                .get()
+                .map(|d| read_cache(d, cache_dir(d).as_deref()))
+                .unwrap_or_default();
             let tag = tag(&blob);
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
-            if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
+            if let (Some(l), Some(list)) = (library.as_mut(), prebuilt)
                 && !l._blob.is_empty()
             {
                 l.prebuilt = listed(&list, &tag);
@@ -291,30 +353,52 @@ thread_local! {
 
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`). A periodic save is
-/// crash insurance only: it never waits for the library lock (serializing
-/// a big library holds it for seconds, stalling every pipeline a worker
-/// loads or stores); the end-of-run save still waits.
+/// crash insurance only: it never waits for the save lock (serializing
+/// a big library holds it for seconds, stalling the end-of-run save);
+/// the end-of-run save still waits.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
-    }
-    let mut l = if now {
-        library.lock().unwrap_or_else(|e| e.into_inner())
+    let Some(dir) = DIR.get() else { return };
+    // Serialize complete saves so shutdown and periodic saves cannot publish
+    // a newer library and then replace it with an older snapshot.
+    let mut last = if now {
+        LAST.lock().unwrap_or_else(|e| e.into_inner())
     } else {
-        let Ok(l) = library.try_lock() else { return };
-        l
+        match LAST.try_lock() {
+            Ok(last) => last,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        }
     };
-    let (blob, prebuilt) = {
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+
+    if USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let used = used().as_ref().map(Used::list).unwrap_or_default();
+        let written = std::fs::create_dir_all(dir)
+            .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        if let Err(e) = written {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, "early pipeline list not saved");
+        }
+    }
+
+    let Some(library) = library() else { return };
+    let (adapter, blob, prebuilt, added, prebuilt_changed) = {
+        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+        if l.added == 0 && !l.prebuilt_changed {
             return;
         }
+        let Some(adapter) = cache_dir(dir) else {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!("host pipeline library not saved: adapter unavailable")
+            });
+            return;
+        };
         // SAFETY: a buffer of the size the library asks for.
         let bytes = unsafe {
             let mut bytes = vec![0u8; l.library.GetSerializedSize()];
@@ -322,12 +406,12 @@ pub(crate) fn save(now: bool) {
         };
         match bytes {
             Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
+                let added = std::mem::take(&mut l.added);
+                let prebuilt_changed = std::mem::take(&mut l.prebuilt_changed);
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
                 let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
+                (adapter, bytes, prebuilt, added, prebuilt_changed)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
@@ -335,20 +419,17 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
-        .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
-            None => Ok(()),
-        });
+    let written = write_cache(&adapter, &blob, prebuilt.as_deref());
+    if written.is_err() {
+        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+        l.added += added;
+        l.prebuilt_changed |= prebuilt_changed;
+    }
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
         Ok(()) => tracing::info!(
             bytes = blob.len(),
-            early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -452,6 +533,130 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_caches_keep_their_own_library_and_prebuilt_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nvidia = adapter_cache_dir(
+            root,
+            &DXGI_ADAPTER_DESC1 {
+                VendorId: 0x10de,
+                DeviceId: 0x2c18,
+                ..Default::default()
+            },
+        );
+        let intel = adapter_cache_dir(
+            root,
+            &DXGI_ADAPTER_DESC1 {
+                VendorId: 0x8086,
+                DeviceId: 0x7d67,
+                ..Default::default()
+            },
+        );
+        let arc = adapter_cache_dir(
+            root,
+            &DXGI_ADAPTER_DESC1 {
+                VendorId: 0x8086,
+                DeviceId: 0x56a0,
+                ..Default::default()
+            },
+        );
+        let warp = adapter_cache_dir(
+            root,
+            &DXGI_ADAPTER_DESC1 {
+                VendorId: 0x1414,
+                DeviceId: 0x008c,
+                Flags: DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32,
+                ..Default::default()
+            },
+        );
+        write_cache(root, b"old library", Some("old list")).unwrap();
+        let legacy = (b"old library".to_vec(), Some(b"old list".to_vec()));
+        assert_eq!(read_cache(root, Some(&nvidia)), legacy);
+
+        write_cache(&nvidia, b"nvidia library", Some("nvidia list")).unwrap();
+        write_cache(&intel, b"intel library", None).unwrap();
+        write_cache(&arc, b"arc library", Some("arc list")).unwrap();
+        write_cache(&warp, b"warp library", Some("warp list")).unwrap();
+        assert_eq!(
+            read_cache(root, Some(&nvidia)),
+            (b"nvidia library".to_vec(), Some(b"nvidia list".to_vec()))
+        );
+        assert_eq!(
+            read_cache(root, Some(&intel)),
+            (b"intel library".to_vec(), None)
+        );
+        assert_eq!(
+            read_cache(root, Some(&arc)),
+            (b"arc library".to_vec(), Some(b"arc list".to_vec()))
+        );
+        assert_eq!(
+            read_cache(root, Some(&warp)),
+            (b"warp library".to_vec(), Some(b"warp list".to_vec()))
+        );
+        assert_eq!(read_cache(root, None), legacy);
+    }
+
+    #[test]
+    fn warp_device_uses_its_dxgi_adapter() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+
+        // SAFETY: the factory and adapter stay live while creating the device.
+        let (adapter, device) = unsafe {
+            let Ok(factory): windows::core::Result<IDXGIFactory4> =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter1>() else {
+                return;
+            };
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                return;
+            }
+            (adapter, device.unwrap())
+        };
+
+        let actual = device_adapter(&device).expect("WARP device adapter metadata");
+        // SAFETY: query the live adapter used to create the device.
+        let expected = unsafe { adapter.GetDesc1() }.unwrap();
+        assert_eq!(actual.AdapterLuid, expected.AdapterLuid);
+        assert_ne!(actual.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+    }
+
+    #[test]
+    #[ignore = "creates devices on every DXGI adapter, including physical GPUs"]
+    fn each_d3d12_device_uses_its_own_dxgi_adapter() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+
+        // SAFETY: the factory, adapters and devices stay live for all queries.
+        unsafe {
+            let Ok(factory): windows::core::Result<IDXGIFactory4> =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            let hardware = (0..).map_while(|i| factory.EnumAdapters1(i).ok());
+            for adapter in hardware.chain(factory.EnumWarpAdapter::<IDXGIAdapter1>()) {
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                    continue;
+                }
+                let expected = adapter.GetDesc1().unwrap();
+                let actual = device_adapter(&device.unwrap()).expect("device adapter metadata");
+                assert_eq!(actual.AdapterLuid, expected.AdapterLuid);
+                let path = adapter_cache_dir(Path::new("cache"), &actual);
+                eprintln!(
+                    "{}: {}",
+                    String::from_utf16_lossy(&actual.Description).trim_end_matches('\0'),
+                    path.display()
+                );
+                assert_eq!(path, adapter_cache_dir(Path::new("cache"), &expected));
+            }
+        }
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
