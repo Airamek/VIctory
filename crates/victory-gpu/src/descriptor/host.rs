@@ -688,21 +688,21 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far, once per 64 Ki slots (the title walks
-            // its slots in order, which logged every one of them).
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if past_heap_step(
-                HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed),
-                index,
-            ) {
+            // Diagnostic (NVIDIA heap cap): the title asks for more slots
+            // than a host heap holds, and it walks them in increasing
+            // order, so a line per new high-water mark is one line per
+            // slot - a quarter of a million in the world, ~8 000 of them a
+            // second, on the thread recording the frame. Once is enough to
+            // say it.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
                 tracing::warn!(
                     index,
                     count = self.count,
                     for_draw,
-                    "title slot past the host heap"
+                    "title slot past the host heap: slots above the host heap's count are not mirrored"
                 );
-            }
+            });
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
@@ -1758,36 +1758,9 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
-/// Whether a title slot `index` past the host heap, after `highest` was
-/// the highest such slot so far, is logged: the first one, then one per
-/// new step of 64 Ki slots.
-fn past_heap_step(highest: u32, index: u32) -> bool {
-    highest < index && (highest == 0 || highest >> 16 != index >> 16)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Slots past a capped heap are logged once per 64 Ki step, not each.
-    #[test]
-    fn slots_past_the_heap_log_once_per_step() {
-        let mut highest = 0;
-        let mut logged = 0;
-        for index in 934_464..1_245_184 {
-            if past_heap_step(highest, index) {
-                logged += 1;
-            }
-            highest = highest.max(index);
-        }
-        // 934,464 (first), then each 64 Ki boundary up to 1,245,183.
-        assert_eq!(logged, 1 + (1_245_183u32 >> 16) - (934_464u32 >> 16));
-        assert!(
-            !past_heap_step(1_000_000, 999_999),
-            "lower than the highest"
-        );
-        assert!(!past_heap_step(1_000_000, 1_000_000), "the same slot");
-    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.
