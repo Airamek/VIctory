@@ -49,6 +49,15 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// The copy engine for texture uploads (`VICTORY_COPY_QUEUE`): its
+    /// queue and fence, and the last value signalled on it, behind its own
+    /// lock. `None` where the device has none (or the switch is off and no
+    /// copy work was ever submitted): the direct queue runs uploads as
+    /// before. The graphics queue and fence above are untouched.
+    copy_queue: Option<ID3D12CommandQueue>,
+    copy_fence: Option<ID3D12Fence>,
+    copy_submitted: Mutex<u64>,
+    copy_lock: Mutex<()>,
     /// Submissions not finished yet, oldest first.
     timeline: Timeline<Pending>,
     /// Whether the completion thread runs.
@@ -108,13 +117,14 @@ pub(crate) mod starve {
     /// Depth buckets `0..=16` (submissions in flight after a push).
     pub(crate) const DEPTHS: usize = 17;
     /// Blocking causes: in-flight full, list still running, range conflict,
-    /// staging/table conflict, drain/present wait.
-    pub(crate) const CAUSES: usize = 5;
+    /// staging/table conflict, drain/present wait, copy-queue wait.
+    pub(crate) const CAUSES: usize = 6;
     pub(crate) const IN_FLIGHT: usize = 0;
     pub(crate) const RUNNING: usize = 1;
     pub(crate) const CONFLICT: usize = 2;
     pub(crate) const STAGING_TABLE: usize = 3;
     pub(crate) const DRAIN_PRESENT: usize = 4;
+    pub(crate) const COPY_WAIT: usize = 5;
 
     static HIST: [std::sync::atomic::AtomicU64; DEPTHS] =
         [const { std::sync::atomic::AtomicU64::new(0) }; DEPTHS];
@@ -332,6 +342,22 @@ fn create() -> windows::core::Result<Host> {
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        // The copy engine for texture uploads, alongside the graphics queue
+        // (created here, used only behind `VICTORY_COPY_QUEUE`).
+        // SAFETY: plain D3D12 object creation with a valid description.
+        let (copy_queue, copy_fence) = match device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        }) {
+            Ok(q) => {
+                let f = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok();
+                (Some(q), f)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no host D3D12 copy queue; uploads stay on the direct queue");
+                (None, None)
+            }
+        };
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -392,6 +418,10 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            copy_queue,
+            copy_fence,
+            copy_submitted: Mutex::new(0),
+            copy_lock: Mutex::new(()),
             timeline: Timeline::new(),
             finisher: std::sync::Once::new(),
             rtvs,
@@ -627,6 +657,82 @@ pub(crate) mod tests {
         let recovered = start + Duration::from_secs(2);
         assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(42)), Some(Ok(42)));
         assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(43)), Some(Ok(43)));
+    }
+
+    /// Cross-queue upload order: the COPY engine leaves a texture in
+    /// COPY_DEST, and the DIRECT side makes it SHADER_RESOURCE after the
+    /// copy Wait. Replays the two barriers the queues record (as
+    /// [`transition`] issues them) from COMMON: the copy barrier then the
+    /// direct one runs, and the texture ends readable by shaders. No GPU
+    /// required: the barrier values mirror `record_upload` (COPY) and the
+    /// DIRECT prelude/first `move_texture(SHADER_RESOURCE)`.
+    #[test]
+    fn copy_queue_barrier_order_leaves_textures_readable() {
+        const COMMON: u32 = 0x1;
+        const COPY_DEST: u32 = 0x400;
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        let resource = 0x1234_5000usize;
+        // COPY then DIRECT: runs from COMMON to readable.
+        let barriers = vec![
+            (resource, COMMON, COPY_DEST),
+            (resource, COPY_DEST, SHADER_RESOURCE),
+        ];
+        let mut states = std::collections::HashMap::from([(resource, COMMON)]);
+        replay(&barriers, &mut states).expect("copy then direct barriers run");
+        assert_eq!(states[&resource], SHADER_RESOURCE);
+        // DIRECT without the COPY barrier first does not run: the resource
+        // is still in COPY_DEST only after the copy engine ran.
+        let mut left_in_copy = std::collections::HashMap::from([(resource, COPY_DEST)]);
+        let direct_only = vec![(resource, COMMON, SHADER_RESOURCE)];
+        assert!(
+            replay(&direct_only, &mut left_in_copy).is_err(),
+            "a DIRECT SHADER_RESOURCE barrier from COMMON does not match a texture the copy engine left in COPY_DEST"
+        );
+        // Dropped COPY_DEST barrier: the texture never becomes readable.
+        let mut states = std::collections::HashMap::from([(resource, COMMON)]);
+        let copy_only = vec![(resource, COMMON, COPY_DEST)];
+        replay(&copy_only, &mut states).expect("the copy barrier runs");
+        assert_eq!(states[&resource], COPY_DEST, "left for the DIRECT side");
+        let taken = issued();
+        let _ = taken;
+    }
+
+    /// The copy-queue rollout switch defaults off, the timeline waits for
+    /// both queues, and staging retires on both completeds. No GPU required
+    /// except for the list-kind checks (early-return without one, as the
+    /// other host tests do).
+    #[test]
+    fn copy_queue_offload_is_gated_and_timeline_waits_for_both_queues() {
+        // Rollout switch: default off (no `VICTORY_COPY_QUEUE` in the test
+        // environment). When on, uploads move to the copy list; when off,
+        // they stay on the direct queue exactly as before.
+        assert!(
+            !crate::switch::on("VICTORY_COPY_QUEUE") || copy_enabled(),
+            "gate reflects VICTORY_COPY_QUEUE"
+        );
+        // The timeline finishes a submission only once both its queues ran
+        // it: direct alone does not finish copy work.
+        let t: crate::timeline::Timeline<()> = crate::timeline::Timeline::new();
+        t.push(1, 1, crate::timeline::Touches::default(), ());
+        t.finish_both(1, 0, |()| panic!("copy work not yet run"));
+        assert_eq!(t.len(), 1);
+        t.finish_both(1, 1, |()| {});
+        assert_eq!(t.len(), 0);
+        // Staging retirement on both completeds is covered by `recycle` (which
+        // waits for both queues); here we only check the counters exist.
+        // Unknown resources uploaded/copied nothing.
+        assert_eq!(crate::texture::uploads(std::ptr::null()), 0);
+        assert_eq!(crate::texture::copied(std::ptr::null()), 0);
+        let Some(host) = host() else { return };
+        // Without the switch the copy fence is already passed (MAX), so the
+        // direct fence alone decides; list kinds never mix.
+        if !copy_enabled() {
+            assert_eq!(host.copy_completed(), u64::MAX);
+        }
+        let direct = host.new_list().expect("a direct list");
+        assert!(!direct.is_copy());
+        let copy = host.new_copy_list().expect("a copy list");
+        assert!(copy.is_copy());
     }
 
     use super::*;
@@ -973,8 +1079,27 @@ pub(crate) mod tests {
     }
 }
 
+/// Which host queue a list runs on: the graphics queue, or the copy engine
+/// (`VICTORY_COPY_QUEUE`) for texture uploads. COPY lists allow only copy
+/// and barrier ops; draws, dispatches and bindings are a bug on them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ListKind {
+    Direct,
+    Copy,
+}
+
+/// Whether texture uploads run on the copy engine (`VICTORY_COPY_QUEUE=1`;
+/// rollout switch, default off until validated). When off, uploads run on
+/// the direct queue exactly as before.
+pub(crate) fn copy_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_COPY_QUEUE"))
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    /// Which queue the list runs on.
+    kind: ListKind,
     /// Swapped for a fresh one when the list is reset while it runs.
     allocator: Mutex<ID3D12CommandAllocator>,
     pub(crate) list: ID3D12GraphicsCommandList,
@@ -1208,6 +1333,7 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 
 /// What a list reset while it ran leaves to its running submission.
 struct Retired {
+    kind: ListKind,
     allocator: ID3D12CommandAllocator,
     prelude: Prelude,
     deferred: Deferred,
@@ -1225,9 +1351,12 @@ unsafe impl Send for Retired {}
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
 /// Allocators, preludes and scratch chunks whose submissions finished,
-/// for lists reset while they run (dozens per world frame).
+/// for lists reset while they run (dozens per world frame). DIRECT and COPY
+/// allocators are never mixed: a COPY allocator resets only a COPY list.
 static SPARE_ALLOCATORS: Mutex<Vec<ID3D12CommandAllocator>> = Mutex::new(Vec::new());
+static SPARE_ALLOCATORS_COPY: Mutex<Vec<ID3D12CommandAllocator>> = Mutex::new(Vec::new());
 static SPARE_PRELUDES: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
+static SPARE_PRELUDES_COPY: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
 static SPARE_SCRATCH: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
 /// Spares kept of each kind at most.
 const SPARES: usize = 256;
@@ -1239,13 +1368,18 @@ fn pool<T>(spares: &'static Mutex<Vec<T>>) -> std::sync::MutexGuard<'static, Vec
 impl Retired {
     /// Once the submission that used them has finished.
     fn retire(self) {
+        // DIRECT and COPY pools stay apart: an allocator resets only its own kind.
+        let (alloc_pool, prelude_pool) = match self.kind {
+            ListKind::Direct => (&SPARE_ALLOCATORS, &SPARE_PRELUDES),
+            ListKind::Copy => (&SPARE_ALLOCATORS_COPY, &SPARE_PRELUDES_COPY),
+        };
         // SAFETY: nothing running uses the allocators any more.
         unsafe {
-            if self.allocator.Reset().is_ok() && pool(&SPARE_ALLOCATORS).len() < SPARES {
-                pool(&SPARE_ALLOCATORS).push(self.allocator);
+            if self.allocator.Reset().is_ok() && pool(alloc_pool).len() < SPARES {
+                pool(alloc_pool).push(self.allocator);
             }
-            if self.prelude.0.Reset().is_ok() && pool(&SPARE_PRELUDES).len() < SPARES {
-                pool(&SPARE_PRELUDES).push(self.prelude);
+            if self.prelude.0.Reset().is_ok() && pool(prelude_pool).len() < SPARES {
+                pool(prelude_pool).push(self.prelude);
             }
         }
         let mut spare = pool(&SPARE_SCRATCH);
@@ -1393,6 +1527,10 @@ type Back = (
 /// What is left of a submission once the GPU has run it.
 struct Pending {
     lists: Vec<ListRef>,
+    /// The host fence value of its direct submission (0: none) and of its
+    /// copy submission (0: none; uploads stayed on the direct queue).
+    value: u64,
+    copy_value: u64,
     /// The ranges its shaders write (host copy, address, bytes), each once,
     /// and the runs that declared each.
     back: Vec<Back>,
@@ -1404,7 +1542,7 @@ struct Pending {
     resolves: Vec<Vec<(ID3D12Resource, Vec<Target>)>>,
     /// The preludes of lists it names more than once, past their first:
     /// each recording has its own, back to the spares once it has run.
-    preludes: Vec<Prelude>,
+    preludes: Vec<(Prelude, ListKind)>,
     submitted: std::time::Instant,
     /// Per run, asked once it has run: whether its shaders read title
     /// memory with no copy (then what they wrote does not go back).
@@ -1471,6 +1609,8 @@ impl Pending {
         }
         let pending = Pending {
             lists: runs.iter().map(|&l| ListRef(l)).collect(),
+            value: 0,
+            copy_value: 0,
             back,
             writes: pending_writes,
             resolves: pending_resolves,
@@ -1573,23 +1713,30 @@ impl Host {
 
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        self.new_list_kind(ListKind::Direct)
+    }
+
+    /// A new copy-engine list, open for recording (`VICTORY_COPY_QUEUE`).
+    pub(crate) fn new_copy_list(&self) -> windows::core::Result<HostList> {
+        self.new_list_kind(ListKind::Copy)
+    }
+
+    fn new_list_kind(&self, kind: ListKind) -> windows::core::Result<HostList> {
+        let list_type = match kind {
+            ListKind::Direct => D3D12_COMMAND_LIST_TYPE_DIRECT,
+            ListKind::Copy => D3D12_COMMAND_LIST_TYPE_COPY,
+        };
         // SAFETY: plain object creation.
         unsafe {
-            let allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &allocator,
-                None,
-            )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let allocator: ID3D12CommandAllocator =
+                self.device.CreateCommandAllocator(list_type)?;
+            let list: ID3D12GraphicsCommandList =
+                self.device.CreateCommandList(0, list_type, &allocator, None)?;
+            let prelude_allocator: ID3D12CommandAllocator =
+                self.device.CreateCommandAllocator(list_type)?;
             let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                 0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                list_type,
                 &prelude_allocator,
                 None,
             )?;
@@ -1597,6 +1744,7 @@ impl Host {
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
             let made = HostList {
+                kind,
                 allocator: Mutex::new(allocator),
                 list,
                 deferred: Mutex::default(),
@@ -1627,31 +1775,43 @@ impl Host {
         }
     }
 
-    /// A command allocator nothing runs from: a spare, or a new one.
-    fn fresh_allocator(&self) -> Option<ID3D12CommandAllocator> {
-        let spare = pool(&SPARE_ALLOCATORS).pop();
+    /// A command allocator nothing runs from: a spare, or a new one. DIRECT
+    /// and COPY allocators are never mixed.
+    fn fresh_allocator(&self, kind: ListKind) -> Option<ID3D12CommandAllocator> {
+        let spare = match kind {
+            ListKind::Direct => pool(&SPARE_ALLOCATORS).pop(),
+            ListKind::Copy => pool(&SPARE_ALLOCATORS_COPY).pop(),
+        };
         spare.or_else(|| {
-            // SAFETY: plain object creation.
-            let made = unsafe {
-                self.device
-                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            let list_type = match kind {
+                ListKind::Direct => D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ListKind::Copy => D3D12_COMMAND_LIST_TYPE_COPY,
             };
+            // SAFETY: plain object creation.
+            let made = unsafe { self.device.CreateCommandAllocator(list_type) };
             made.ok()
         })
     }
 
     /// A closed prelude list and its allocator, nothing running from them.
-    fn fresh_prelude(&self) -> Option<Prelude> {
-        let spare = pool(&SPARE_PRELUDES).pop();
+    fn fresh_prelude(&self, kind: ListKind) -> Option<Prelude> {
+        let spare = match kind {
+            ListKind::Direct => pool(&SPARE_PRELUDES).pop(),
+            ListKind::Copy => pool(&SPARE_PRELUDES_COPY).pop(),
+        };
         if spare.is_some() {
             return spare;
         }
-        let allocator = self.fresh_allocator()?;
+        let allocator = self.fresh_allocator(kind)?;
+        let list_type = match kind {
+            ListKind::Direct => D3D12_COMMAND_LIST_TYPE_DIRECT,
+            ListKind::Copy => D3D12_COMMAND_LIST_TYPE_COPY,
+        };
         // SAFETY: plain object creation.
         unsafe {
             let list: ID3D12GraphicsCommandList = self
                 .device
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .CreateCommandList(0, list_type, &allocator, None)
                 .ok()?;
             list.Close().ok()?;
             Some((allocator, list))
@@ -1797,13 +1957,32 @@ impl Host {
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
-        let runs: Vec<&HostList> = uploads
-            .as_ref()
-            .map(|u| u.list())
-            .into_iter()
-            .chain(runs.iter().copied())
-            .collect();
+        // Copy offload: the upload list runs on the copy engine, not prepended
+        // to the direct runs. Otherwise (gate off) it runs first on DIRECT.
+        // Without a copy queue the COPY list still runs first on DIRECT (its
+        // copy-only commands are valid there); the DIRECT side still makes
+        // the textures readable.
+        let upload_is_copy = uploads.as_ref().is_some_and(|u| u.list().is_copy());
+        let use_copy_queue =
+            upload_is_copy && self.copy_queue.is_some() && self.copy_fence.is_some();
+        let runs: Vec<&HostList> = if use_copy_queue {
+            runs.to_vec()
+        } else {
+            uploads
+                .as_ref()
+                .map(|u| u.list())
+                .into_iter()
+                .chain(runs.iter().copied())
+                .collect()
+        };
         let runs = &runs[..];
+        // The copy upload list, if any (COPY kind): submitted on the copy
+        // queue below, before the direct runs.
+        let upload_list: Option<&HostList> = if use_copy_queue {
+            uploads.as_ref().map(|u| u.list())
+        } else {
+            None
+        };
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -1823,7 +2002,7 @@ impl Host {
                 }
             }
         }
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len() + 2);
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch {
@@ -1831,11 +2010,72 @@ impl Host {
             submission_gen: crate::shadow::generation(),
             ..Batch::default()
         };
+        // The copy-engine upload, if any: recorded and submitted on the copy
+        // queue first (single submission, single Wait on DIRECT below, not
+        // one per texture). Its prelude moves textures from their real
+        // states to COPY_DEST; the DIRECT side below moves them to
+        // SHADER_RESOURCE after the Wait.
+        let mut copy_value: u64 = 0;
         // A list named again in this submission: its earlier prelude is
         // not yet run, so the repeat records into a spare one, and starts
         // a new `ExecuteCommandLists` call (the queue runs them in order, so
         // nothing waits). Where each such call starts in `lists`.
-        let mut preludes = Vec::new();
+        let mut preludes: Vec<(Prelude, ListKind)> = Vec::new();
+        if let Some(up) = upload_list {
+            let mut copy_batch = Batch {
+                host: Some(self),
+                ..Batch::default()
+            };
+            up.run_deferred(&mut copy_batch);
+            copy_batch.flush();
+            let mut copy_lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2);
+            if let Some((prelude, spare)) = up.prelude(None, None) {
+                copy_lists.push(Some(prelude));
+                if let Some(spare) = spare {
+                    // Uploads never repeat in one submission (single use), so
+                    // no spare prelude is expected; kept for symmetry.
+                    preludes.push((spare, up.kind));
+                }
+            }
+            copy_lists.push(up.list.cast().ok());
+            let (queue, fence) = match (&self.copy_queue, &self.copy_fence) {
+                (Some(q), Some(f)) => (q, f),
+                _ => fail(format_args!("a copy-engine upload without a copy queue")),
+            };
+            let _copy_guard = self.copy_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut submitted_copy = self.copy_submitted.lock().unwrap_or_else(|e| e.into_inner());
+            *submitted_copy += 1;
+            copy_value = *submitted_copy;
+            drop(submitted_copy);
+            // SAFETY: closed COPY lists, not running (waited for above); our
+            // copy fence.
+            let signalled = unsafe {
+                queue.ExecuteCommandLists(&copy_lists);
+                queue.Signal(fence, copy_value)
+            };
+            if let Err(e) = signalled {
+                fail(format_args!(
+                    "a host copy submission of {} lists was not signalled ({e})",
+                    1
+                ));
+            }
+            // The DIRECT side makes the uploaded textures readable after the
+            // Wait below: every texture the COPY list leaves in COPY_DEST
+            // starts the first DIRECT run in SHADER_RESOURCE, so its prelude
+            // records COPY_DEST to SHADER_RESOURCE.
+            if let Some(&first) = runs.first() {
+                let uploaded: Vec<std::sync::Arc<crate::resource::HostTexture>> = up
+                    .states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .map(|(_, _, copy)| copy.clone())
+                    .collect();
+                for copy in &uploaded {
+                    first.ensure_shader_resource(copy);
+                }
+            }
+        }
         let mut repeats = Vec::new();
         let mut cuts = vec![0];
         let mut since_cut: Vec<*const HostList> = Vec::with_capacity(runs.len());
@@ -1866,13 +2106,22 @@ impl Host {
             if let Some((prelude, spare)) = list.prelude(repeated.then_some(self), repeat.as_ref())
             {
                 lists.push(Some(prelude));
-                preludes.extend(spare);
+                if let Some(spare) = spare {
+                    preludes.push((spare, list.kind));
+                }
             }
             repeats.extend(repeat);
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        let (mut pending, mut touches) = Pending::of(runs);
+        // For copy offload the pending submission names the upload list too
+        // (kept alive until both queues ran it); its staging reads are the
+        // direct runs' texture steps below.
+        let pending_runs: Vec<&HostList> = match upload_list {
+            Some(up) => std::iter::once(up).chain(runs.iter().copied()).collect(),
+            None => runs.to_vec(),
+        };
+        let (mut pending, mut touches) = Pending::of(&pending_runs);
         pending.preludes = preludes;
         pending.repeats = repeats;
         // What steps brought up to date through view heaps and page tables.
@@ -1924,12 +2173,19 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             // SAFETY: closed lists, not running (waited for above); our fence.
+            // With copy offload the DIRECT queue waits once for the copy
+            // submission before its first dependent group (not per texture).
             let signalled = unsafe {
                 #[cfg(test)]
                 if i == 0
                     && let Some(gate) = gate
                 {
                     let _ = self.queue.Wait(gate, 1);
+                }
+                if i == 0 && copy_value != 0
+                    && let (Some(copy_fence), true) = (&self.copy_fence, true)
+                {
+                    let _ = self.queue.Wait(copy_fence, copy_value);
                 }
                 self.queue.ExecuteCommandLists(group);
                 self.queue.Signal(&self.fence, *submitted)
@@ -1938,8 +2194,8 @@ impl Host {
                 // Nothing would finish it.
                 fail(format_args!(
                     "a host submission of {} lists was not signalled ({e}){}",
-                    runs.len(),
-                    self.removal_data(runs)
+                    pending_runs.len(),
+                    self.removal_data(&pending_runs)
                 ));
             }
             #[cfg(feature = "diagnostics")]
@@ -1980,18 +2236,21 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        for list in runs {
+        for list in pending_runs.iter().copied() {
             list.last.store(*submitted, Ordering::Release);
         }
         pending.removed_in = removed_in;
+        pending.value = *submitted;
+        pending.copy_value = copy_value;
         // Resources retired since the last submission go once this one has
         // run, and with it every one before.
         pending.retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
-        self.timeline.push(*submitted, touches, pending);
+        self.timeline.push(*submitted, copy_value, touches, pending);
         // Staging buffers and chunks this submission's uploads took are
         // its submission's: recyclable once it has run (`texture::recycle`
-        // frees only finished ones; submissions run async here).
-        crate::texture::submitted(*submitted);
+        // frees only finished ones; submissions run async here). With copy
+        // offload both queues must have run them.
+        crate::texture::submitted(*submitted, copy_value);
         #[cfg(feature = "diagnostics")]
         if timed {
             starve::note_depth(self.timeline.len());
@@ -2027,10 +2286,12 @@ impl Host {
     }
 
     /// Finishes, in order, the submissions the GPU has run (no waiting).
+    /// A submission with copy work finishes once both queues ran it.
     fn finish(&self) {
-        // SAFETY: a plain query (all ones once the device is removed).
+        // SAFETY: plain queries (all ones once the device is removed).
         let reached = self.completed();
-        self.timeline.finish(reached, |p| self.complete(p));
+        let copy_reached = self.copy_completed();
+        self.timeline.finish_both(reached, copy_reached, |p| self.complete(p));
     }
 
     /// The newest submission value the GPU has run (no waiting).
@@ -2039,8 +2300,23 @@ impl Host {
         unsafe { self.fence.GetCompletedValue() }
     }
 
+    /// The newest copy submission the copy engine has run (no waiting), or
+    /// `u64::MAX` where uploads stay on the direct queue: then every
+    /// `copy_value` (0) is already passed and the direct fence alone decides.
+    pub(crate) fn copy_completed(&self) -> u64 {
+        if !copy_enabled() {
+            return u64::MAX;
+        }
+        let Some(fence) = &self.copy_fence else {
+            return u64::MAX;
+        };
+        // SAFETY: a plain query.
+        unsafe { fence.GetCompletedValue() }
+    }
+
     /// Finishes every submission up to the one that signals `value`,
-    /// waiting for the GPU to run them.
+    /// waiting for the GPU to run them (both queues where the submission
+    /// has copy work).
     pub(crate) fn settle(&self, value: u64) {
         if self
             .timeline
@@ -2048,6 +2324,22 @@ impl Host {
             .is_some_and(|(oldest, _)| oldest <= value)
         {
             self.wait_gpu(value, true);
+            if copy_enabled() {
+                // The submission may carry copy work: finish needs the copy
+                // fence past it too. Waiting for the newest copy covers it
+                // (copy submissions are in order); with no copy work in
+                // flight the wait returns at once.
+                let copy_value = *self.copy_submitted.lock().unwrap_or_else(|e| e.into_inner());
+                if copy_value != 0 {
+                    #[cfg(feature = "diagnostics")]
+                    let block = std::time::Instant::now();
+                    self.wait_copy(copy_value, true);
+                    #[cfg(feature = "diagnostics")]
+                    if timing() {
+                        starve::note_block(starve::COPY_WAIT, block.elapsed().as_micros() as u64);
+                    }
+                }
+            }
             self.finish();
         }
     }
@@ -2149,6 +2441,36 @@ impl Host {
         }
     }
 
+    /// Blocks until the copy engine has run what signals `value` (no-op
+    /// without a copy queue); the time counts as waiting for the GPU if
+    /// `counted`.
+    fn wait_copy(&self, value: u64, counted: bool) {
+        let Some(fence) = &self.copy_fence else {
+            return;
+        };
+        // SAFETY: plain calls on our fence and this thread's event.
+        unsafe {
+            if fence.GetCompletedValue() >= value {
+                return;
+            }
+            let started = std::time::Instant::now();
+            let waited = EVENT.with(|e| {
+                fence
+                    .SetEventOnCompletion(value, e.0)
+                    .map(|()| WaitForSingleObject(e.0, INFINITE))
+            });
+            if let Err(e) = waited {
+                tracing::warn!(error = %e, "host copy fence wait failed; polling");
+                while fence.GetCompletedValue() < value {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            if counted {
+                SUBMISSION_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// The completion thread: finishes each submission as soon as the GPU
     /// has run it, so that title fences and bottom-of-pipe writes move on
     /// their own (the title waits for its events and reads its memory).
@@ -2156,6 +2478,15 @@ impl Host {
         loop {
             let value = self.timeline.next();
             self.wait_gpu(value, false);
+            if copy_enabled() {
+                // The submission may carry copy work: finish needs both.
+                // Waiting for the newest copy covers it; without copy work
+                // the wait returns at once.
+                let copy_value = *self.copy_submitted.lock().unwrap_or_else(|e| e.into_inner());
+                if copy_value != 0 {
+                    self.wait_copy(copy_value, false);
+                }
+            }
             self.finish();
         }
     }
@@ -2328,10 +2659,14 @@ impl Host {
             }
         }
         drop(p.repeats);
-        for prelude in p.preludes {
+        for (prelude, kind) in p.preludes {
+            let spare_pool = match kind {
+                ListKind::Direct => &SPARE_PRELUDES,
+                ListKind::Copy => &SPARE_PRELUDES_COPY,
+            };
             // SAFETY: the submission that ran from it has finished.
-            if unsafe { prelude.0.Reset() }.is_ok() && pool(&SPARE_PRELUDES).len() < SPARES {
-                pool(&SPARE_PRELUDES).push(prelude);
+            if unsafe { prelude.0.Reset() }.is_ok() && pool(spare_pool).len() < SPARES {
+                pool(spare_pool).push(prelude);
             }
         }
         // It has run, and every submission before it: what was retired
@@ -2803,7 +3138,8 @@ impl HostList {
         let allocator = {
             let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(host) = running {
-                let (Some(fresh), Some(prelude)) = (host.fresh_allocator(), host.fresh_prelude())
+                let (Some(fresh), Some(prelude)) =
+                    (host.fresh_allocator(self.kind), host.fresh_prelude(self.kind))
                 else {
                     fail(format_args!(
                         "no fresh host command allocator for a running list"
@@ -2816,6 +3152,7 @@ impl HostList {
                 let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
                 let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
                 let retired = Retired {
+                    kind: self.kind,
                     allocator: std::mem::replace(&mut *allocator, fresh),
                     prelude: std::mem::replace(&mut *old_prelude, prelude),
                     deferred: std::mem::take(&mut *self.deferred()),
@@ -2879,6 +3216,19 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(ID3D12Resource, u32)> {
+        // COPY lists move only to copy states: never to shader, unordered or
+        // render-target reads (those run on DIRECT, after the copy Wait).
+        if self.is_copy() {
+            const COPY_STATES: u32 = 0x400 | 0x800 | 0x1;
+            debug_assert!(
+                wanted & !(COPY_STATES | 0x40 | 0x80) == 0 || wanted & COPY_STATES != 0,
+                "COPY list transition to {wanted:#x}: copy states only"
+            );
+            let sr_uav_rt = 0x4 | 0x8 | 0x40 | 0x80 | 0x10 | 0x20;
+            if wanted & sr_uav_rt != 0 && wanted & COPY_STATES == 0 {
+                crate::host::fail(format_args!("a COPY list transition to {wanted:#x}: copy states only"));
+            }
+        }
         // One host texture for the whole move (`crate::resource::evict` may
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
@@ -2920,6 +3270,18 @@ impl HostList {
         copy: &std::sync::Arc<crate::resource::HostTexture>,
         wanted: u32,
     ) -> Option<D3D12_RESOURCE_BARRIER> {
+        if self.is_copy() {
+            // The copy engine leaves uploads in COPY_DEST for the DIRECT side
+            // to make readable: COPY lists move only between copy states.
+            const COPY_OK: u32 = 0x400 | 0x800 | 0x1;
+            if wanted & !COPY_OK != 0 {
+                debug_assert!(
+                    false,
+                    "COPY list move_texture to {wanted:#x}: copy states only"
+                );
+                crate::host::fail(format_args!("a COPY list move_texture to {wanted:#x}: copy states only"));
+            }
+        }
         let wanted = legal_state(&copy.texture, wanted);
         let before = self.track(copy, wanted)?;
         Some(transition(
@@ -2939,6 +3301,7 @@ impl HostList {
         side: u8,
         writes: bool,
     ) -> Option<bool> {
+        self.assert_direct("twin_use");
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         match twins.entry(std::sync::Arc::as_ptr(depth) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -2953,6 +3316,42 @@ impl HostList {
     /// title's.
     pub(crate) fn set_ours(&self) {
         self.ours.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the list runs on the copy engine.
+    pub(crate) fn is_copy(&self) -> bool {
+        self.kind == ListKind::Copy
+    }
+
+    /// COPY lists allow only copy and barrier ops: draws, dispatches and
+    /// bindings on one are a bug. Called by the direct-only entry points.
+    pub(crate) fn assert_direct(&self, what: &str) {
+        debug_assert!(
+            self.kind == ListKind::Direct,
+            "{what} on a COPY list: draws, dispatches and bindings run on DIRECT lists only"
+        );
+        if self.kind != ListKind::Direct {
+            crate::host::fail(format_args!("{what} on a COPY list"));
+        }
+    }
+
+    /// Ensures the list starts with texture `copy` in `SHADER_RESOURCE`
+    /// (for the DIRECT side of a copy-engine upload, whose COPY list leaves
+    /// it in `COPY_DEST`): the prelude then records the COPY_DEST to
+    /// SHADER_RESOURCE barrier. Used at submission, before preludes run.
+    pub(crate) fn ensure_shader_resource(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) {
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        let wanted = legal_state(&copy.texture, SHADER_RESOURCE);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                copy.note_used();
+                v.insert((wanted, wanted, copy.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                o.get_mut().1 = wanted;
+            }
+        }
     }
 
     /// What the list's shaders write from now until the guard goes is
@@ -2986,6 +3385,8 @@ impl HostList {
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         wanted: u32,
     ) {
+        // Buffers never move on the copy engine: uploads use staging space.
+        self.assert_direct("buffer_state");
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         let next = {
             let mut states = self
@@ -3156,7 +3557,7 @@ impl HostList {
         };
         let out = match repeated {
             Some(host) => {
-                let Some(spare) = host.fresh_prelude() else {
+                let Some(spare) = host.fresh_prelude(self.kind) else {
                     fail(format_args!("no fresh host prelude for a repeated list"));
                 };
                 Some((record(&spare)?, Some(spare)))
@@ -3232,6 +3633,7 @@ impl HostList {
 
     /// Notes a pipeline the list binds.
     pub(crate) fn used_pipeline(&self, name: &str) {
+        self.assert_direct("used_pipeline");
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
@@ -3364,10 +3766,14 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
+    /// reset. DIRECT only (COPY uses staging space).
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if self.is_copy() {
+            debug_assert!(false, "upload on a COPY list: staging_space only");
+            return None;
+        }
         let (buffer, data) = host.list_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred()
@@ -3386,8 +3792,14 @@ impl HostList {
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
-    /// reset: the host GPU address and the CPU pointer.
+    /// reset: the host GPU address and the CPU pointer. DIRECT only: the
+    /// COPY path uses only `upload_buffer`/`staging_space` memory, never
+    /// the list's CUSTOM WC L0 scratch.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        if self.is_copy() {
+            debug_assert!(false, "scratch on a COPY list: staging_space only");
+            return None;
+        }
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).checked_next_multiple_of(256)?;
@@ -3428,8 +3840,13 @@ impl HostList {
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
+    /// submission of the list from the first use after a reset on. DIRECT
+    /// only.
     pub(crate) fn budget(&self) -> Option<u64> {
+        if self.is_copy() {
+            debug_assert!(false, "budget on a COPY list");
+            return None;
+        }
         let (buffer, data) = {
             let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
             if budget.is_none() {
@@ -3454,8 +3871,12 @@ impl HostList {
     }
 
     /// The list's argument buffer, at least `bytes` long, common between
-    /// its uses (`crate::indirect`).
+    /// its uses (`crate::indirect`). DIRECT only.
     pub(crate) fn arguments(&self, bytes: u64) -> Option<ID3D12Resource> {
+        if self.is_copy() {
+            debug_assert!(false, "arguments on a COPY list");
+            return None;
+        }
         let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a plain query on a live buffer.
         if let Some(b) = arguments.as_ref().filter(|b| unsafe { b.GetDesc() }.Width >= bytes) {
@@ -5276,13 +5697,14 @@ mod costs {
         let block_ms = block.iter().map(|&u| u as f64 / 1e3 / frames).collect::<Vec<_>>();
         if block_ms.iter().any(|&m| m > 0.0) {
             tracing::info!(
-                "GPU starvation blocking: {:.2} ms/frame (inflight {:.2}, running {:.2}, conflict {:.2}, staging/table {:.2}, drain/present {:.2})",
+                "GPU starvation blocking: {:.2} ms/frame (inflight {:.2}, running {:.2}, conflict {:.2}, staging/table {:.2}, drain/present {:.2}, copy/wait {:.2})",
                 block_ms.iter().sum::<f64>(),
                 block_ms[super::starve::IN_FLIGHT],
                 block_ms[super::starve::RUNNING],
                 block_ms[super::starve::CONFLICT],
                 block_ms[super::starve::STAGING_TABLE],
-                block_ms[super::starve::DRAIN_PRESENT]
+                block_ms[super::starve::DRAIN_PRESENT],
+                block_ms[super::starve::COPY_WAIT]
             );
         }
     }

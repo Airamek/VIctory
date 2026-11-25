@@ -200,14 +200,27 @@ pub(crate) fn uploads(
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
-    let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
+    static COPY_LIST: Mutex<Holder> = Mutex::new(Holder(None));
+    // The copy engine path has its own list (COPY kind) behind its own lock;
+    // the direct path keeps its list. The kind never changes for a holder.
+    let use_copy = crate::host::copy_enabled();
+    let mut guard = if use_copy {
+        COPY_LIST.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        LIST.lock().unwrap_or_else(|e| e.into_inner())
+    };
     crate::texture::recycle();
     match &guard.0 {
         // Closed by the last submission, which has run.
         Some(list) => list.reset(),
         // Made open.
         None => {
-            let list = crate::host::host()?.new_list().ok()?;
+            let host = crate::host::host()?;
+            let list = if use_copy {
+                host.new_copy_list().ok()?
+            } else {
+                host.new_list().ok()?
+            };
             list.set_ours();
             guard.0 = Some(list);
         }

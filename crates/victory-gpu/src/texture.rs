@@ -99,9 +99,10 @@ struct Buffers {
     /// (bytes, buffer, mapping), oldest first.
     free: std::collections::VecDeque<(u64, ID3D12Resource, usize)>,
     free_bytes: u64,
-    /// Taken by the submission being prepared: with the submission value
-    /// reading them (`submitted` stamps it; 0 until then).
-    used: Vec<(u64, u64, ID3D12Resource, usize)>,
+    /// Taken by the submission being prepared: with the submission values
+    /// reading them (`submitted` stamps them; 0 until then). The direct value
+    /// and the copy value (0: no copy work): free once both queues ran them.
+    used: Vec<(u64, u64, u64, ID3D12Resource, usize)>,
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
@@ -119,31 +120,36 @@ const KEPT_BYTES: u64 = 64 << 20;
 /// Called before a submission's uploads: the buffers of the submissions
 /// that have run are free again (the oldest dropped past `KEPT_BYTES`).
 /// Submissions run async, so only buffers no submission in flight reads
-/// are freed; the rest stay taken until their submission runs.
+/// are freed; the rest stay taken until their submission runs. With copy
+/// offload, a submission is finished once both queues ran it: buffers are
+/// free once the direct value passed `completed` and the copy value passed
+/// `copy_completed` (with no copy work, the copy check always passes).
 pub(crate) fn recycle() {
-    let reached = crate::host::host().map_or(u64::MAX, |h| h.completed());
+    let (reached, copy_reached) = crate::host::host()
+        .map_or((u64::MAX, u64::MAX), |h| (h.completed(), h.copy_completed()));
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some(&(value, ..)) = c.marks.front() {
-            if value > reached {
+        while let Some(&(value, copy, ..)) = c.marks.front() {
+            if value > reached || copy > copy_reached {
                 break;
             }
             c.marks.pop_front();
         }
         if c.marks.is_empty() {
             // Nothing in flight reads the chunks: rewind (the submission
-            // being prepared carves afresh after this).
+            // being prepared carves afresh after this). Needs both queues
+            // done (both completeds past every mark, checked above).
             (c.current, c.used) = (0, 0);
             c.all.truncate(CHUNKS_KEPT);
         }
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
-    let mut kept: Vec<(u64, u64, ID3D12Resource, usize)> = Vec::with_capacity(b.used.len());
+    let mut kept: Vec<(u64, u64, u64, ID3D12Resource, usize)> = Vec::with_capacity(b.used.len());
     for e in b.used.drain(..) {
-        if e.0 != 0 && e.0 <= reached {
-            b.free_bytes += e.1;
-            b.free.push_back((e.1, e.2, e.3));
+        if e.0 != 0 && e.0 <= reached && e.1 <= copy_reached {
+            b.free_bytes += e.2;
+            b.free.push_back((e.2, e.3, e.4));
         } else {
             kept.push(e);
         }
@@ -157,21 +163,22 @@ pub(crate) fn recycle() {
 }
 
 /// Marks the staging buffers and chunks the submission being prepared took
-/// (see [`recycle`]) with `value`, the submission that reads them: once
-/// its submission is made. Every submission calls this, whether or not it
-/// uploads (submissions run in the order they are made).
-pub(crate) fn submitted(value: u64) {
+/// (see [`recycle`]) with `value` (and `copy_value`, 0: no copy work), the
+/// submission that reads them: once its submission is made. Every submission
+/// calls this, whether or not it uploads (submissions run in the order they
+/// are made).
+pub(crate) fn submitted(value: u64, copy_value: u64) {
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
-        if c.marks.back().is_none_or(|&(_, at, took)| at != c.current || took != c.used) {
+        if c.marks.back().is_none_or(|&(_, _, at, took)| at != c.current || took != c.used) {
             let (at, took) = (c.current, c.used);
-            c.marks.push_back((value, at, took));
+            c.marks.push_back((value, copy_value, at, took));
         }
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     for e in b.used.iter_mut() {
         if e.0 == 0 {
-            e.0 = value;
+            (e.0, e.1) = (value, copy_value);
         }
     }
 }
@@ -201,7 +208,7 @@ fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .used
-        .push((0, e.0, e.1, e.2));
+        .push((0, 0, e.0, e.1, e.2));
     Some(made)
 }
 
@@ -216,9 +223,10 @@ struct Chunks {
     /// The chunk being carved and the bytes taken from it.
     current: usize,
     used: u64,
-    /// (submission value, chunk, bytes taken) after each submission's
-    /// carving ([`submitted`]), oldest first: what in flight reads.
-    marks: std::collections::VecDeque<(u64, usize, u64)>,
+    /// (submission value, copy value, chunk, bytes taken) after each
+    /// submission's carving ([`submitted`]), oldest first: what in flight
+    /// reads.
+    marks: std::collections::VecDeque<(u64, u64, usize, u64)>,
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
@@ -427,7 +435,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// into host texture `copy`. Returns the barrier that leaves it readable by
 /// shaders, for the caller to record with the others after every copy: one
 /// barrier per texture between the copies kept the GPU from overlapping
-/// them (new shots copy hundreds of textures, run evict6).
+/// them (new shots copy hundreds of textures, run evict6). On a COPY list
+/// (`VICTORY_COPY_QUEUE`) the texture is left in COPY_DEST for the DIRECT
+/// side to make readable (no SHADER_RESOURCE barrier on the copy engine),
+/// so nothing is returned.
 #[must_use]
 pub(crate) fn record_upload(
     list: &HostList,
@@ -445,6 +456,12 @@ pub(crate) fn record_upload(
     list.keep(buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    if list.is_copy() {
+        // COPY leaves textures in COPY_DEST; the DIRECT prelude (or the
+        // first DIRECT `move_texture(SHADER_RESOURCE)`) records the
+        // COPY_DEST to SHADER_RESOURCE barrier after the copy Wait.
+        return None;
+    }
     list.move_texture(copy, SHADER_RESOURCE)
 }
 
