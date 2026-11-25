@@ -154,6 +154,15 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
+/// Records a title list's pending indirect executions first, so their
+/// hoisted clamp chunk stays in recorded order with this recording.
+#[cfg(windows)]
+fn flush_indirect(this: This) {
+    with_state(this, |list, s| {
+        s.flush_indirect(list);
+    });
+}
+
 pub(crate) extern "system" fn create_allocator(
     _: This,
     kind: u32,
@@ -278,6 +287,8 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
+    flush_indirect(this);
+    #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
     }
@@ -389,6 +400,8 @@ const UAV_BARRIER: Barrier = Barrier {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
+    flush_indirect(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
@@ -463,6 +476,8 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    flush_indirect(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
@@ -474,6 +489,8 @@ extern "system" fn copy_buffer_region(
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    flush_indirect(this);
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -530,6 +547,8 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    flush_indirect(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -652,6 +671,8 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
+    flush_indirect(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -720,6 +741,8 @@ extern "system" fn clear_rtv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    flush_indirect(this);
+    #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
@@ -770,6 +793,8 @@ extern "system" fn clear_dsv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    flush_indirect(this);
+    #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
@@ -802,6 +827,8 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    #[cfg(windows)]
+    flush_indirect(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -852,6 +879,8 @@ fn mark(this: This, heap: This, kind: u32, index: u32, begin: bool) {
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     #[cfg(windows)]
+    flush_indirect(this);
+    #[cfg(windows)]
     if matches!(kind, OCCLUSION | BINARY)
         && let Some(list) = host_list(this)
         && let Some((host, query)) = crate::query::host(heap)
@@ -893,6 +922,8 @@ pub(crate) extern "system" fn resolve_queries(
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
+    #[cfg(windows)]
+    flush_indirect(this);
     // Occlusion results are one 64-bit count each.
     let measured = matches!(kind, OCCLUSION | BINARY)
         && offset
@@ -956,7 +987,10 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
-    with_state(this, |_, state| state.set_pipeline(pipeline));
+    with_state(this, |list, state| {
+        state.flush_indirect(list);
+        state.set_pipeline(pipeline)
+    });
     #[cfg(not(windows))]
     let _ = this;
 }
@@ -1089,7 +1123,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1104,41 +1138,57 @@ mod state {
     }
 
     pub(super) extern "system" fn topology(this: This, topology: u32) {
-        with_state(this, |list, s| s.set_topology(list, topology));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.set_topology(list, topology)
+        });
     }
     pub(super) extern "system" fn viewports(
         this: This,
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        if let Some(list) = host_list(this) {
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
             crate::draw::viewports(list, items(viewports, count));
-        }
+        });
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if let Some(list) = host_list(this) {
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
             crate::draw::scissors(list, items(rects, count));
-        }
+        });
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        if let Some(list) = host_list(this) {
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
             // SAFETY: the title passes four floats or null.
             crate::draw::blend_factor(list, unsafe { factor.as_ref() });
-        }
+        });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        if let Some(list) = host_list(this) {
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
             crate::draw::stencil_ref(list, reference);
-        }
+        });
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
-        with_state(this, |_, s| s.set_heaps(items(heaps, count)));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.set_heaps(items(heaps, count))
+        });
     }
     pub(super) extern "system" fn compute_root_signature(this: This, signature: This) {
-        with_state(this, |_, s| s.set_root_signature(true, signature));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.set_root_signature(true, signature)
+        });
     }
     pub(super) extern "system" fn graphics_root_signature(this: This, signature: This) {
-        with_state(this, |_, s| s.set_root_signature(false, signature));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.set_root_signature(false, signature)
+        });
     }
     /// `ClearUnorderedAccessViewUint(GPU handle, CPU handle, resource,
     /// values, rectangle count, rectangles)`.
@@ -1171,17 +1221,27 @@ mod state {
             return;
         };
         with_state(this, |list, s| {
+            s.flush_indirect(list);
             s.clear_unordered(list, cpu, values, float, rects);
         });
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
-        with_state(this, |_, s| s.set_table(true, slot, handle));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.set_table(true, slot, handle)
+        });
     }
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
-        with_state(this, |_, s| s.set_table(false, slot, handle));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.set_table(false, slot, handle)
+        });
     }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
-        with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.set_constants(true, slot, &[value], offset)
+        });
     }
     pub(super) extern "system" fn graphics_constant(
         this: This,
@@ -1189,7 +1249,10 @@ mod state {
         value: u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.set_constants(false, slot, &[value], offset)
+        });
     }
     pub(super) extern "system" fn compute_constants(
         this: This,
@@ -1198,7 +1261,8 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| {
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
             s.set_constants(true, slot, items(values, count), offset)
         });
     }
@@ -1209,20 +1273,30 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| {
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
             s.set_constants(false, slot, items(values, count), offset)
         });
     }
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(true, slot, address));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.set_view(true, slot, address)
+        });
     }
     pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(false, slot, address));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.set_view(false, slot, address)
+        });
     }
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
-        // SAFETY: the title passes a view or null.
-        with_state(this, |_, s| s.set_index_buffer(unsafe { view.as_ref() }));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            // SAFETY: the title passes a view or null.
+            s.set_index_buffer(unsafe { view.as_ref() })
+        });
     }
     pub(super) extern "system" fn vertex_buffers(
         this: This,
@@ -1230,7 +1304,8 @@ mod state {
         count: u32,
         views: *const VertexView,
     ) {
-        with_state(this, |_, s| {
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
             if views.is_null() {
                 s.clear_vertex_buffers(start, count);
             } else {
@@ -1256,7 +1331,10 @@ mod state {
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.set_targets(list, &handles, depth)
+        });
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -1267,12 +1345,16 @@ mod state {
     ) {
         super::count_draw();
         with_state(this, |list, s| {
+            s.flush_indirect(list);
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.dispatch(list, x, y, z)
+        });
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1282,7 +1364,10 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.dispatch_mesh(list, x)
+        });
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1300,7 +1385,10 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_state(this, |list, s| {
+            s.flush_indirect(list);
+            s.dispatch_mesh(list, x)
+        });
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1312,6 +1400,7 @@ mod state {
     ) {
         super::count_draw();
         with_state(this, |list, s| {
+            s.flush_indirect(list);
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -1422,6 +1511,15 @@ extern "system" fn execute_indirect(
     }
 }
 
+/// Indirect executions dropped at their flush (their clamp chunk could
+/// not run, or their prepare failed), counted with the ones dropped when
+/// recorded.
+pub(crate) fn note_indirect_dropped(n: u64) {
+    if n > 0 {
+        INDIRECT.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Indirect executions dropped since the last call.
 pub(crate) fn take_indirect() -> u64 {
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
@@ -1455,6 +1553,8 @@ extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _referen
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(windows)]
+    flush_indirect(this);
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
@@ -1490,6 +1590,8 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     if address == 0 {
         return;
     }
+    #[cfg(windows)]
+    flush_indirect(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
         list.defer_write(address as *mut u8, what, bytes);

@@ -91,6 +91,10 @@ pub(crate) struct State {
     /// The view-stride table last kept in the host list, so that its draws
     /// keep it once rather than once per stage ([`State::bind`]).
     stride_table: usize,
+    /// Indirect executions waiting for their hoisted clamp chunk
+    /// ([`State::flush_indirect`]): every other host recording flushes
+    /// first, so they run in recorded order, never reordered.
+    pending: Vec<PendingIndirect>,
 }
 
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
@@ -230,6 +234,7 @@ impl State {
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
+        self.flush_indirect(list);
         self.topology = topology;
         let host = match topology {
             RECTANGLES => 4,
@@ -328,6 +333,7 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.flush_indirect(list);
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -919,6 +925,7 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        self.flush_indirect(list);
         let Some(view) = crate::descriptor::view(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
@@ -968,6 +975,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        self.flush_indirect(list);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1073,6 +1081,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        self.flush_indirect(list);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -1433,6 +1442,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        self.flush_indirect(list);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -1537,6 +1547,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        self.flush_indirect(list);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1563,6 +1574,25 @@ impl State {
     }
 }
 
+/// How many indirect executions one hoisted clamp chunk holds at most;
+/// a further execution flushes first (sequential order preserved).
+const MAX_PENDING_INDIRECT: usize = 64;
+
+/// One indirect execution waiting for its hoisted clamp chunk: the clamp
+/// runs with the chunk at the next flush, back to back with the other
+/// pending executions' clamps in recorded order, then the execution runs.
+struct PendingIndirect {
+    kind: u32,
+    stride: u32,
+    max: u32,
+    args: std::sync::Arc<crate::shadow::Shadow>,
+    arguments: u64,
+    counter: Option<(std::sync::Arc<crate::shadow::Shadow>, u64)>,
+    signature: ID3D12CommandSignature,
+    #[cfg(feature = "diagnostics")]
+    pipeline: This,
+}
+
 impl State {
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
@@ -1570,6 +1600,10 @@ impl State {
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
+    ///
+    /// Hoisted: the clamp dispatch runs with the pending executions' clamp
+    /// chunk at the next flush ([`State::flush_indirect`]), back to back in
+    /// recorded order; the execution runs then too. True once queued.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
@@ -1636,39 +1670,134 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        // Alignment checked now, as `bound` did before the hoist.
+        if !args.gpu(arguments).is_multiple_of(4) || !stride.is_multiple_of(4) {
+            why("not bounded (arguments not 4-byte aligned)");
             return false;
+        }
+        if self.pending.len() >= MAX_PENDING_INDIRECT {
+            self.flush_indirect(list);
+        }
+        self.pending.push(PendingIndirect {
+            kind,
+            stride,
+            max,
+            args,
+            arguments,
+            counter,
+            signature,
+            #[cfg(feature = "diagnostics")]
+            pipeline,
+        });
+        true
+    }
+
+    /// Records the pending indirect executions: their clamp chunk first,
+    /// back to back in recorded order, then each execution in order.
+    /// Returns the executions dropped. Every other host recording flushes
+    /// first, so sequential order is preserved and nothing is reordered.
+    pub(crate) fn flush_indirect(&mut self, list: &HostList) -> u64 {
+        if self.pending.is_empty() {
+            return 0;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let reqs: Vec<crate::indirect::ClampReq> = pending
+            .iter()
+            .map(|p| crate::indirect::ClampReq {
+                buffer: p.args.buffer.clone(),
+                gpu: p.args.gpu(p.arguments),
+                kind: p.kind,
+                stride: p.stride,
+                records: p.max,
+            })
+            .collect();
+        if !crate::indirect::bound_chunk(list, &reqs) {
+            // No clamp (no host compiler, or no budget): every pending
+            // execution drops, as each would have before the hoist.
+            let n = pending.len() as u64;
+            #[cfg(feature = "diagnostics")]
+            for p in &pending {
+                crate::pipeline::note_why(format!(
+                    "indirect kind {}: not bounded (no clamp)",
+                    p.kind
+                ));
+                list.note_op(|| {
+                    format!(
+                        "DROPPED indirect kind {} max {} (not bounded) {}",
+                        p.kind,
+                        p.max,
+                        crate::pipeline::shaders_of(p.pipeline)
+                    )
+                });
+            }
+            crate::list::note_indirect_dropped(n);
+            return n;
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        let ran = match kind {
+        let mut dropped = 0;
+        let mut ready: Vec<*const ID3D12Resource> = Vec::new();
+        for (p, req) in pending.iter().zip(reqs.iter()) {
+            crate::indirect::ready_chunk(list, req, &mut ready);
+            if !self.run_pending(list, p) {
+                dropped += 1;
+            }
+        }
+        crate::indirect::done_chunk(list, &reqs);
+        crate::list::note_indirect_dropped(dropped);
+        dropped
+    }
+
+    /// Runs one pending indirect execution whose clamp the chunk recorded:
+    /// false if it drops.
+    fn run_pending(&mut self, list: &HostList, p: &PendingIndirect) -> bool {
+        const DRAW: u32 = 0;
+        const INDEXED: u32 = 1;
+        const DISPATCH: u32 = 2;
+        const MESH: u32 = 10;
+        #[cfg(feature = "diagnostics")]
+        let why = |what: &str| {
+            crate::pipeline::note_why(format!("indirect kind {}: {what}", p.kind));
+            list.note_op(|| {
+                format!(
+                    "DROPPED indirect kind {} max {} ({what}) {}",
+                    p.kind,
+                    p.max,
+                    crate::pipeline::shaders_of(p.pipeline)
+                )
+            });
+        };
+        let ran = match p.kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
                     not_run("rectangles");
                     false
-                }) && self.prepare(list, kind == INDEXED)
+                }) && self.prepare(list, p.kind == INDEXED)
             }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+                Some(q) if q.compute => self.bind(list, q, true),
                 _ => false,
             },
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
                     crate::pipeline::note_drop(self.pipeline as This);
-                    list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
+                    list.note_op(|| {
+                        format!(
+                            "DROPPED indirect kind {} (no host pipeline) {}",
+                            p.kind,
+                            crate::pipeline::shaders_of(p.pipeline)
+                        )
+                    });
                 }
-                Some(p) => why(&format!(
+                Some(q) => why(&format!(
                     "prepare failed (compute {}, mesh {}): {}",
-                    p.compute,
-                    p.mesh,
+                    q.compute,
+                    q.mesh,
                     NOT_RUN.with(|w| w.replace(""))
                 )),
             }
@@ -1676,36 +1805,44 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            let dims = match kind {
-                DISPATCH => dispatch_dims(arguments, stride),
+            let dims = match p.kind {
+                DISPATCH => dispatch_dims(p.arguments, p.stride),
                 _ => String::new(),
             };
             self.op_text(
-                format!("indirect kind {kind} max {max} {dims}at {arguments:#x}"),
-                kind == DISPATCH,
+                format!(
+                    "indirect kind {} max {} {dims}at {:#x}",
+                    p.kind, p.max, p.arguments
+                ),
+                p.kind == DISPATCH,
             )
         });
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                &p.signature,
+                p.max,
+                &p.args.buffer,
+                p.args.offset(p.arguments),
+                p.counter.as_ref().map(|(s, _)| &s.buffer),
+                p.counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
         // A listed frame: what the records held (after the clamp).
         #[cfg(feature = "diagnostics")]
         if crate::capture::dump_on() {
-            let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-            let name = crate::pipeline::shaders_of(pipeline);
-            crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
+            let count = p.counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            let name = crate::pipeline::shaders_of(p.pipeline);
+            crate::capture::read_indirect(
+                list,
+                (&p.args.buffer, p.args.offset(p.arguments)),
+                count,
+                (p.kind, p.stride, p.max),
+                name,
+            );
         }
-        crate::indirect::done(list, &args.buffer);
-        if kind == DISPATCH {
+        if p.kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
