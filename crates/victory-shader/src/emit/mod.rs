@@ -218,6 +218,8 @@ mod rect;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;
+#[cfg(all(test, windows))]
+mod quad_tests;
 mod sampler;
 #[cfg(all(test, windows))]
 mod semantics_tests;
