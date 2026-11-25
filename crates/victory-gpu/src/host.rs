@@ -98,6 +98,52 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Starvation counters (diagnostics, `VICTORY_GPU_TIMING`): the timeline
+/// depth histogram (submissions pushed at each depth since the last
+/// frame-rate line) and per-cause CPU blocking milliseconds (time in
+/// `settle` waits by what waited). Timing-only: measured around the waits
+/// that already happen, never added.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod starve {
+    /// Depth buckets `0..=16` (submissions in flight after a push).
+    pub(crate) const DEPTHS: usize = 17;
+    /// Blocking causes: in-flight full, list still running, range conflict,
+    /// staging/table conflict, drain/present wait.
+    pub(crate) const CAUSES: usize = 5;
+    pub(crate) const IN_FLIGHT: usize = 0;
+    pub(crate) const RUNNING: usize = 1;
+    pub(crate) const CONFLICT: usize = 2;
+    pub(crate) const STAGING_TABLE: usize = 3;
+    pub(crate) const DRAIN_PRESENT: usize = 4;
+
+    static HIST: [std::sync::atomic::AtomicU64; DEPTHS] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; DEPTHS];
+    static BLOCK_US: [std::sync::atomic::AtomicU64; CAUSES] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; CAUSES];
+
+    pub(crate) fn note_depth(len: usize) {
+        HIST[len.min(DEPTHS - 1)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_block(cause: usize, us: u64) {
+        if cause < CAUSES {
+            BLOCK_US[cause].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn take() -> ([u64; DEPTHS], [u64; CAUSES]) {
+        let mut hist = [0u64; DEPTHS];
+        for (i, h) in hist.iter_mut().enumerate() {
+            *h = HIST[i].swap(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut block = [0u64; CAUSES];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = BLOCK_US[i].swap(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        (hist, block)
+    }
+}
+
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
@@ -674,8 +720,21 @@ impl Drop for HostList {
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
+/// The last two slots are the list's busy pair (start at open, end at
+/// close), so the GPU time of un-noted work is an explicit residual.
 #[cfg(feature = "diagnostics")]
-const STAMPS: u32 = 4096;
+const STAMPS: u32 = 16384;
+
+/// The busy pair's slots in a list's timestamp heap (diagnostics, timing).
+#[cfg(feature = "diagnostics")]
+const BUSY_START: u32 = STAMPS - 2;
+#[cfg(feature = "diagnostics")]
+const BUSY_END: u32 = STAMPS - 1;
+
+/// Notes with timestamps at most (diagnostics, timing): indices `0` through
+/// this for `note_op`, this for the end stamp in `close`.
+#[cfg(feature = "diagnostics")]
+const MAX_TIMED_COUNT: u32 = STAMPS - 3;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -708,10 +767,22 @@ pub(crate) fn dred_on() -> bool {
 /// Whether each list of a submission is timed on its own, and slow ones are
 /// logged with their commands (`VICTORY_GPU_TIMING`, diagnostics builds; the
 /// commands are noted with `VICTORY_D3D12_DRED` or the timing on).
+/// Timing keeps the normal cuts grouping for stamps (the lists run as they
+/// do with the timing off); per-list alone execution is opt-in (below).
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
+}
+
+/// Whether timed lists each run alone in their own submission piece
+/// (`VICTORY_GPU_TIMING_ALONE=1`, diagnostics builds with `VICTORY_GPU_TIMING`
+/// on). Opt-in: the default timing keeps the normal cuts grouping, so the
+/// GPU executes the same batching with the timing off or on.
+#[cfg(feature = "diagnostics")]
+fn timing_alone() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING_ALONE"))
 }
 
 /// Whether recorded commands are noted at all: with device-removed data (the
@@ -1195,7 +1266,7 @@ impl Host {
             prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
-            Ok(HostList {
+            let made = HostList {
                 allocator: Mutex::new(allocator),
                 list,
                 deferred: Mutex::default(),
@@ -1216,7 +1287,10 @@ impl Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
-            })
+            };
+            #[cfg(feature = "diagnostics")]
+            made.emit_busy_start();
+            Ok(made)
         }
     }
 
@@ -1324,13 +1398,25 @@ impl Host {
         self.finish();
         for list in runs {
             if list.running() {
+                #[cfg(feature = "diagnostics")]
+                let block = std::time::Instant::now();
                 self.settle(list.last.load(Ordering::Acquire));
+                #[cfg(feature = "diagnostics")]
+                if timing() {
+                    starve::note_block(starve::RUNNING, block.elapsed().as_micros() as u64);
+                }
             }
         }
         if self.timeline.len() >= IN_FLIGHT
             && let Some((oldest, _)) = self.timeline.span()
         {
+            #[cfg(feature = "diagnostics")]
+            let block = std::time::Instant::now();
             self.settle(oldest);
+            #[cfg(feature = "diagnostics")]
+            if timing() {
+                starve::note_block(starve::IN_FLIGHT, block.elapsed().as_micros() as u64);
+            }
         }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
@@ -1443,12 +1529,16 @@ impl Host {
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         cuts.push(lists.len());
-        // Diagnostics: each list on its own, timed and waited for
-        // (`VICTORY_GPU_TIMING`).
+        // Diagnostics timing (`VICTORY_GPU_TIMING`): stamps stay in the normal
+        // cuts grouping (the lists run as with the timing off). Per-list alone
+        // execution is opt-in (`VICTORY_GPU_TIMING_ALONE=1`): each list runs
+        // and is waited for on its own, as before.
         #[cfg(feature = "diagnostics")]
         let timed = timing();
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timed {
+        let alone = timed && timing_alone();
+        #[cfg(feature = "diagnostics")]
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if alone {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -1462,9 +1552,16 @@ impl Host {
             cuts.windows(2).map(|c| &lists[c[0]..c[1]]).collect();
         // Each list ran alone and was waited for: a removal is its.
         #[cfg(feature = "diagnostics")]
-        let per_list = timed;
+        let per_list = alone;
         #[cfg(not(feature = "diagnostics"))]
         let per_list = false;
+        // Which runs each cuts group holds (their `firsts` lie in it).
+        #[cfg(feature = "diagnostics")]
+        let group_runs: Vec<Vec<usize>> = if alone {
+            (0..runs.len()).map(|i| vec![i]).collect()
+        } else {
+            group_members(&firsts, &cuts)
+        };
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -1494,8 +1591,16 @@ impl Host {
             if timed {
                 self.wait_gpu(*submitted, true);
                 crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
-                let times = runs[i].timed(self.frequency());
-                report_list(&times, started.elapsed().as_secs_f64() * 1e3);
+                let wall_ms = started.elapsed().as_secs_f64() * 1e3;
+                let member_runs: &[usize] = &group_runs[i];
+                let frequency = self.frequency();
+                let mut group_busy = 0.0;
+                for &r in member_runs {
+                    let (times, busy, residual, dropped) = runs[r].timed(frequency);
+                    group_busy += busy;
+                    report_list(&times, busy, residual, dropped, wall_ms / member_runs.len().max(1) as f64);
+                }
+                costs::add_submission(group_busy, wall_ms);
             }
             if per_list
                 && removed_in.is_none()
@@ -1515,6 +1620,10 @@ impl Host {
         // run, and with it every one before.
         pending.retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
         self.timeline.push(*submitted, touches, pending);
+        #[cfg(feature = "diagnostics")]
+        if timed {
+            starve::note_depth(self.timeline.len());
+        }
         #[cfg(feature = "diagnostics")]
         // One list's lock at a time: a submission may name a list twice.
         // (Copy-back runs when the submission finishes: `complete`.)
@@ -1571,7 +1680,13 @@ impl Host {
     /// submissions, `previous` from [`Host::frame_done`] at its present.
     fn previous_frame(&self, previous: Option<u64>) {
         if let Some(value) = previous {
+            #[cfg(feature = "diagnostics")]
+            let block = std::time::Instant::now();
             self.settle(value);
+            #[cfg(feature = "diagnostics")]
+            if timing() {
+                starve::note_block(starve::DRAIN_PRESENT, block.elapsed().as_micros() as u64);
+            }
         }
     }
 
@@ -1584,7 +1699,13 @@ impl Host {
     /// Finishes every submission made so far.
     pub(crate) fn drain(&self) {
         if let Some((_, newest)) = self.timeline.span() {
+            #[cfg(feature = "diagnostics")]
+            let block = std::time::Instant::now();
             self.settle(newest);
+            #[cfg(feature = "diagnostics")]
+            if timing() {
+                starve::note_block(starve::DRAIN_PRESENT, block.elapsed().as_micros() as u64);
+            }
         }
     }
 
@@ -1597,7 +1718,13 @@ impl Host {
             .timeline
             .conflict(address, address.saturating_add(len), writing)
         {
+            #[cfg(feature = "diagnostics")]
+            let block = std::time::Instant::now();
             self.settle(value);
+            #[cfg(feature = "diagnostics")]
+            if timing() {
+                starve::note_block(starve::CONFLICT, block.elapsed().as_micros() as u64);
+            }
         }
     }
 
@@ -1605,7 +1732,13 @@ impl Host {
     /// the submissions in flight that copy from it.
     pub(crate) fn settle_staging(&self, staging: usize) {
         if let Some(value) = self.timeline.staging_conflict(staging) {
+            #[cfg(feature = "diagnostics")]
+            let block = std::time::Instant::now();
             self.settle(value);
+            #[cfg(feature = "diagnostics")]
+            if timing() {
+                starve::note_block(starve::STAGING_TABLE, block.elapsed().as_micros() as u64);
+            }
         }
     }
 
@@ -1613,7 +1746,13 @@ impl Host {
     /// submissions in flight whose shaders read it.
     fn settle_table(&self, key: usize) {
         if let Some(value) = self.timeline.table_conflict(key) {
+            #[cfg(feature = "diagnostics")]
+            let block = std::time::Instant::now();
             self.settle(value);
+            #[cfg(feature = "diagnostics")]
+            if timing() {
+                starve::note_block(starve::STAGING_TABLE, block.elapsed().as_micros() as u64);
+            }
         }
     }
 
@@ -2072,33 +2211,62 @@ impl HostList {
             .as_ref()
     }
 
-    /// The noted commands' GPU time, longest first, as (milliseconds, text)
-    /// (diagnostics, timing on, after the list ran).
+    /// Records the list's busy-pair start stamp (diagnostics, timing on):
+    /// the GPU time before any command, so un-noted work is explicit.
+    /// Called with an open list (after `Reset` or creation). Timing-only:
+    /// a timestamp query, no barriers or copies.
     #[cfg(feature = "diagnostics")]
-    fn timed(&self, frequency: u64) -> Vec<(f64, String)> {
+    fn emit_busy_start(&self) {
+        if let Some((heap, _)) = self.stamps() {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, BUSY_START) };
+        }
+    }
+
+    /// The noted commands' GPU time with the list's busy pair (diagnostics,
+    /// timing on, after the list ran): per-note milliseconds longest first,
+    /// the list's GPU busy milliseconds, the residual (busy minus noted,
+    /// un-noted work, clamped at zero) and notes dropped past the stamps.
+    #[cfg(feature = "diagnostics")]
+    fn timed(&self, frequency: u64) -> (Vec<(f64, String)>, f64, f64, usize) {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
-            return Vec::new();
+        let total_notes = notes.len();
+        let count = (total_notes as u32).min(MAX_TIMED_COUNT);
+        let Some((_, back)) = self.stamps() else {
+            return (Vec::new(), 0.0, 0.0, total_notes);
         };
         let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        // The note stamps plus the two busy slots at the end of the buffer.
+        let end = u64::from(STAMPS) * 8;
+        let range = D3D12_RANGE { Begin: 0, End: end as usize };
         // SAFETY: a read-back buffer the finished list resolved into.
         let stamps: Vec<u64> = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
-                return Vec::new();
+                return (Vec::new(), 0.0, 0.0, total_notes);
             }
-            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), STAMPS as usize).to_vec();
             back.Unmap(0, None);
             s
         };
-        let mut times: Vec<(f64, String)> = (0..count)
+        let to_ms = |ticks: u64| ticks as f64 * 1e3 / frequency.max(1) as f64;
+        let mut times: Vec<(f64, String)> = (0..count as usize)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                (to_ms(ticks), notes[i].0.chars().take(300).collect())
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
-        times
+        let noted: f64 = (0..count as usize)
+            .map(|i| stamps[i + 1].saturating_sub(stamps[i]) as f64)
+            .sum::<f64>()
+            * 1e3
+            / frequency.max(1) as f64;
+        let busy_ticks = stamps[BUSY_END as usize].saturating_sub(stamps[BUSY_START as usize]);
+        // An unwritten busy pair (no start/end recorded) reads zero: no busy.
+        let busy = if busy_ticks == 0 { 0.0 } else { to_ms(busy_ticks) };
+        let residual = (busy - noted).max(0.0);
+        let dropped = total_notes.saturating_sub(count as usize);
+        (times, busy, residual, dropped)
     }
 
     /// The noted commands that took longest on the GPU, longest first, as
@@ -2127,11 +2295,25 @@ impl HostList {
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
-            // SAFETY: an open list, our heap and read-back buffer.
+            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(MAX_TIMED_COUNT);
+            // SAFETY: an open list, our heap and read-back buffer. Timing-only:
+            // timestamp queries and their resolve; no barriers or copies.
             unsafe {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+                // The per-submission busy pair's end: with the per-list start
+                // in `reset`, each submission's busy is its last end minus its
+                // first start (same GPU clock across heaps); the gap to the
+                // CPU wall is idle, the ratio utilisation.
+                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, BUSY_END);
+                self.list.ResolveQueryData(
+                    heap,
+                    D3D12_QUERY_TYPE_TIMESTAMP,
+                    BUSY_START,
+                    2,
+                    back,
+                    u64::from(BUSY_START) * 8,
+                );
             }
         }
         // SAFETY: our list.
@@ -2233,6 +2415,8 @@ impl HostList {
         if let Err(e) = unsafe { self.list.Reset(&allocator, None) } {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        #[cfg(feature = "diagnostics")]
+        self.emit_busy_start();
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -2510,10 +2694,11 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         // Timed notes are what `VICTORY_GPU_TIMING` reports on; markers are
-        // only what the device-removed report pairs with breadcrumbs.
+        // only what the device-removed report pairs with breadcrumbs. The last
+        // two stamp slots are the busy pair, so notes stop before them.
         if noting() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
+            if let Some((heap, _)) = self.stamps() && at < BUSY_START {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
@@ -4146,15 +4331,19 @@ impl Host {
 }
 
 /// With `VICTORY_GPU_TIMING`: adds one list's noted commands to the cost
-/// table, naming its slowest ones when it took over 50 ms on the GPU
-/// (diagnostics). `wall_ms` is how long the list's submission took.
+/// table, naming its slowest ones when its GPU busy took over 50 ms
+/// (diagnostics). `busy_ms` is the list's GPU time (stamps end minus start),
+/// `residual_ms` the busy not in any note, `dropped` the notes past the
+/// stamps, `wall_ms` the list's share of its submission's CPU wall.
 #[cfg(feature = "diagnostics")]
-fn report_list(times: &[(f64, String)], wall_ms: f64) {
-    costs::add(times, wall_ms);
-    let total: f64 = times.iter().map(|(ms, _)| ms).sum();
-    if total > 50.0 {
+fn report_list(times: &[(f64, String)], busy_ms: f64, residual_ms: f64, dropped: usize, wall_ms: f64) {
+    costs::add(times, residual_ms, dropped);
+    if busy_ms > 50.0 {
         tracing::warn!(
-            ms = total,
+            ms = busy_ms,
+            noted_ms = times.iter().map(|(ms, _)| ms).sum::<f64>(),
+            residual_ms,
+            dropped,
             wall_ms,
             commands = times.len(),
             "slow host list"
@@ -4188,42 +4377,132 @@ fn cost_label(text: &str) -> String {
     words.join(" ")
 }
 
+/// The note's kind for the kind-then-pipeline rows: the first word of its
+/// cost label, normalized (`draw`, `indexed`, `dispatch`, `mesh`, `copy`,
+/// `resolve`, `texture`, `DROPPED`, else `other`).
+#[cfg(feature = "diagnostics")]
+fn cost_kind(text: &str) -> String {
+    let first = cost_label(text)
+        .split(' ')
+        .next()
+        .unwrap_or("other")
+        .to_owned();
+    match first.as_str() {
+        "draw" | "indexed" | "dispatch" | "mesh" | "copy" | "resolve" | "texture" | "DROPPED" => first,
+        _ => "other".to_owned(),
+    }
+}
+
+/// How many draws (instances, dispatch groups, mesh groups) a note runs,
+/// for us-per-draw. `draw 36x1` and `indexed 6x2` count instances (the number
+/// after the `x`); `dispatch 4x2x2` counts groups (the product);
+/// `mesh 8` counts groups; anything else counts one per command.
+#[cfg(feature = "diagnostics")]
+fn parse_draws(text: &str) -> u64 {
+    let head = text.split(" | ").next().unwrap_or(text);
+    let mut words = head.split(' ');
+    let kind = words.next().unwrap_or("");
+    let size = words.next().unwrap_or("");
+    let product = |s: &str| {
+        s.split('x').try_fold(1u64, |a, p| {
+            p.parse::<u64>().ok().map(|v| a.saturating_mul(v.max(1)))
+        })
+    };
+    match kind {
+        "draw" | "indexed" => size
+            .split_once('x')
+            .and_then(|(_, m)| m.parse::<u64>().ok())
+            .map(|m| m.max(1))
+            .unwrap_or(1),
+        "dispatch" => product(size).unwrap_or(1).max(1),
+        "mesh" => size
+            .split('x')
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+            .map(|n| n.max(1))
+            .unwrap_or(1),
+        _ => 1,
+    }
+}
+
+/// Which run indices each cuts group holds: run `i` is in the group whose
+/// `cuts` window contains `firsts[i]` (diagnostics, timing). Alone mode does
+/// not use this (each run is its own group).
+#[cfg(feature = "diagnostics")]
+fn group_members(firsts: &[usize], cuts: &[usize]) -> Vec<Vec<usize>> {
+    cuts.windows(2)
+        .map(|c| {
+            (0..firsts.len())
+                .filter(|&i| firsts[i] >= c[0] && firsts[i] < c[1])
+                .collect()
+        })
+        .collect()
+}
+
 /// With `VICTORY_GPU_TIMING`: the GPU time the noted commands took since the
 /// last report, added up by what they ran, so that a frame's cost can be read
-/// off by pipeline (diagnostics).
+/// off by pipeline (diagnostics). Percentages are over GPU busy (the
+/// per-submission Begin/EndQuery pair's end minus start); the residual is the
+/// busy in no note, per list and per frame. Log-only, in the frame-rate
+/// line's companion report.
 #[cfg(feature = "diagnostics")]
 mod costs {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    /// Commands, their GPU milliseconds, and the lists and wall milliseconds
-    /// they came from, since the last report.
+    /// One kind-then-pipeline row: commands, their GPU milliseconds and the
+    /// draws (instances, groups) they ran.
+    type Row = (u64, f64, u64);
+
+    /// Commands, their GPU milliseconds, busy/wall and starvation inputs,
+    /// since the last report.
     #[derive(Default)]
     struct Tally {
-        by_label: HashMap<String, (u64, f64)>,
+        by_row: HashMap<(String, String), Row>,
         noted: f64,
+        residual: f64,
+        dropped: u64,
         lists: u64,
+        submissions: u64,
+        busy: f64,
         wall: f64,
     }
 
     static TALLY: Mutex<Option<Tally>> = Mutex::new(None);
 
-    /// Adds one list's noted commands, as (GPU milliseconds, note) longest
-    /// first, and how long the list took to run (wall milliseconds).
-    pub(super) fn add(times: &[(f64, String)], wall_ms: f64) {
+    /// Adds one list's noted commands (as GPU milliseconds and note, longest
+    /// first), its residual busy and its notes dropped past the stamps.
+    /// Submissions' busy and wall go through [`add_submission`].
+    pub(super) fn add(times: &[(f64, String)], residual_ms: f64, dropped: usize) {
         let mut tally = TALLY.lock().unwrap_or_else(|e| e.into_inner());
         let tally = tally.get_or_insert_with(Tally::default);
         tally.lists += 1;
-        tally.wall += wall_ms;
+        tally.residual += residual_ms;
+        tally.dropped += dropped as u64;
         for (ms, text) in times {
-            let entry = tally.by_label.entry(super::cost_label(text)).or_default();
+            let key = (super::cost_kind(text), super::cost_label(text));
+            let entry = tally.by_row.entry(key).or_default();
             entry.0 += 1;
             entry.1 += ms;
+            entry.2 += super::parse_draws(text);
             tally.noted += ms;
         }
     }
 
-    /// Logs the biggest items per frame since the last call, longest first.
+    /// Adds one submission piece's GPU busy and CPU wall milliseconds: the
+    /// busy pair (last end minus first start) and the `ExecuteCommandLists`
+    /// to fence-waited wall. The gap is idle; the ratio is utilisation.
+    pub(super) fn add_submission(busy_ms: f64, wall_ms: f64) {
+        let mut tally = TALLY.lock().unwrap_or_else(|e| e.into_inner());
+        let tally = tally.get_or_insert_with(Tally::default);
+        tally.submissions += 1;
+        tally.busy += busy_ms;
+        tally.wall += wall_ms;
+    }
+
+    /// Logs the biggest kind-then-pipeline rows per frame since the last
+    /// call (16 rows), with the residual, busy/gap/utilisation and the
+    /// timeline-depth histogram and per-cause blocking milliseconds.
     pub(super) fn log(frames: f64) {
         let Some(mut tally) = TALLY.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return;
@@ -4231,29 +4510,61 @@ mod costs {
         if tally.lists == 0 {
             return;
         }
-        let mut items: Vec<(String, (u64, f64))> = tally.by_label.drain().collect();
+        let mut items: Vec<((String, String), Row)> = tally.by_row.drain().collect();
         items.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
-        let noted = tally.noted.max(1e-6);
+        let busy = tally.busy.max(1e-6);
         let per_frame = |v: f64| v / frames;
-        let commands: u64 = items.iter().map(|(_, (n, _))| *n).sum();
-        let waited = if tally.wall > 0.0 {
-            format!(", {:.1} ms wall/frame", per_frame(tally.wall))
-        } else {
-            String::new()
-        };
+        let commands: u64 = items.iter().map(|(_, (n, _, _))| *n).sum();
+        let gap = (tally.wall - tally.busy).max(0.0);
+        let util = if tally.wall > 0.0 { 100.0 * tally.busy / tally.wall } else { 0.0 };
         tracing::info!(
-            "GPU cost by pipeline: {:.1} ms/frame over {:.0} lists ({:.0} commands/frame{waited})",
-            per_frame(tally.noted),
+            "GPU cost by pipeline: {:.1} ms/frame busy over {:.0} lists in {:.0} submissions ({:.0} commands/frame; wall {:.1} ms/frame, gap {:.1}, util {:.0}%; noted {:.1}, residual {:.1}, dropped {:.0})",
+            per_frame(tally.busy),
             per_frame(tally.lists as f64),
-            per_frame(commands as f64)
+            per_frame(tally.submissions as f64),
+            per_frame(commands as f64),
+            per_frame(tally.wall),
+            per_frame(gap),
+            util,
+            per_frame(tally.noted),
+            per_frame(tally.residual),
+            per_frame(tally.dropped as f64)
         );
-        for (label, (n, ms)) in items.iter().take(16) {
+        for ((kind, label), (n, ms, draws)) in items.iter().take(16) {
+            let us_per_draw = ms * 1000.0 / (*draws).max(1) as f64;
             tracing::info!(
-                "{:.2} ms/frame ({:.0}% of noted, {:.3} ms each, {:.1}/frame): {label}",
+                "{:.2} ms/frame ({:.0}% of busy, {:.3} ms each, {:.1} us/draw, {:.1}/frame): {kind} {label}",
                 per_frame(*ms),
-                100.0 * ms / noted,
+                100.0 * ms / busy,
                 ms / (*n).max(1) as f64,
+                us_per_draw,
                 per_frame(*n as f64)
+            );
+        }
+        let (hist, block) = super::starve::take();
+        let hist_line: Vec<String> = hist
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c > 0)
+            .map(|(d, &c)| format!("{d}:{:.1}", c as f64 / frames))
+            .collect();
+        if !hist_line.is_empty() {
+            tracing::info!(
+                "GPU starvation: timeline depth pushes/frame by depth ({}): {}",
+                super::starve::DEPTHS,
+                hist_line.join(" ")
+            );
+        }
+        let block_ms = block.iter().map(|&u| u as f64 / 1e3 / frames).collect::<Vec<_>>();
+        if block_ms.iter().any(|&m| m > 0.0) {
+            tracing::info!(
+                "GPU starvation blocking: {:.2} ms/frame (inflight {:.2}, running {:.2}, conflict {:.2}, staging/table {:.2}, drain/present {:.2})",
+                block_ms.iter().sum::<f64>(),
+                block_ms[super::starve::IN_FLIGHT],
+                block_ms[super::starve::RUNNING],
+                block_ms[super::starve::CONFLICT],
+                block_ms[super::starve::STAGING_TABLE],
+                block_ms[super::starve::DRAIN_PRESENT]
             );
         }
     }
@@ -5041,5 +5352,62 @@ mod submissions {
             slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap),
             0
         );
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod timing_report {
+    use super::{cost_kind, cost_label, group_members, parse_draws, BUSY_END, BUSY_START, MAX_TIMED_COUNT, STAMPS};
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn stamps_leave_room_for_the_busy_pair() {
+        assert_eq!(STAMPS, 16384);
+        assert_eq!(BUSY_START, STAMPS - 2);
+        assert_eq!(BUSY_END, STAMPS - 1);
+        assert_eq!(MAX_TIMED_COUNT, STAMPS - 3);
+        assert!(MAX_TIMED_COUNT < BUSY_START);
+    }
+
+    #[test]
+    fn cost_rows_split_kind_then_pipeline() {
+        assert_eq!(cost_kind("draw 36x1 [vs ab, ps cd] | u0=0x1"), "draw");
+        assert_eq!(cost_kind("indexed 6x2 [vs ab, ps cd]"), "indexed");
+        assert_eq!(cost_kind("dispatch 4x2x2 [cs ab]"), "dispatch");
+        assert_eq!(cost_kind("mesh 8 [ms ab]"), "mesh");
+        assert_eq!(cost_kind("copy resource 0x1 to 0x2"), "copy");
+        assert_eq!(cost_kind("DROPPED draw (no host pipeline) [vs ab]"), "DROPPED");
+        assert_eq!(cost_kind("something odd here"), "other");
+        assert_eq!(
+            cost_label("draw 36x1 [vs ab, ps cd] | u0=0x1234"),
+            "draw 36x1 [vs ab, ps cd]"
+        );
+        assert_eq!(cost_label("copy resource 0x1 to 0x2"), "copy resource");
+    }
+
+    #[test]
+    fn draws_count_instances_and_groups() {
+        assert_eq!(parse_draws("draw 36x1 [vs ab]"), 1);
+        assert_eq!(parse_draws("indexed 6x3 [vs ab]"), 3);
+        assert_eq!(parse_draws("dispatch 4x2x2 [cs ab]"), 16);
+        assert_eq!(parse_draws("mesh 8 [ms ab]"), 8);
+        assert_eq!(parse_draws("copy resource 0x1 to 0x2"), 1);
+        assert_eq!(parse_draws("resolve 0x1 to 0x2 format 1"), 1);
+    }
+
+    #[test]
+    fn cuts_groups_hold_their_runs() {
+        assert_eq!(group_members(&[0, 2], &[0, 4]), vec![vec![0, 1]]);
+        assert_eq!(group_members(&[0, 2, 3], &[0, 2, 4]), vec![vec![0], vec![1, 2]]);
+        assert_eq!(group_members(&[], &[0]), Vec::<Vec<usize>>::new());
+    }
+
+    #[test]
+    fn residual_is_busy_minus_noted_clamped() {
+        let residual = |busy: f64, noted: f64| (busy - noted).max(0.0);
+        assert_eq!(residual(3.0, 2.0), 1.0);
+        assert_eq!(residual(2.0, 2.0), 0.0);
+        assert_eq!(residual(1.0, 2.0), 0.0);
+        assert_eq!(residual(0.0, 0.0), 0.0);
     }
 }
