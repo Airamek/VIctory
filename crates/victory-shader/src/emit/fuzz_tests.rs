@@ -210,6 +210,7 @@ fn build(words: &[u32]) -> Result<HostShader, String> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })
     .map_err(|e| format!("lower: {e:?}"))?;
     let shader = HostShader {
@@ -226,6 +227,7 @@ fn build(words: &[u32]) -> Result<HostShader, String> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
