@@ -1575,6 +1575,19 @@ impl State {
         };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        // A call with no host pipeline cannot run, and that is the common
+        // case while the world builds its pipelines: #400 measures 1 400-1 750
+        // indirect calls a frame dropped this way. Drop it here, before the
+        // argument refresh and the clamp dispatch, which would otherwise copy
+        // the arguments and dispatch a compute shader for records nothing
+        // reads. Same order as the `is_skipped` check above, for the same
+        // reason.
+        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            why("no host pipeline");
+            return false;
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1602,7 +1615,7 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1623,7 +1636,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args);
+            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1650,9 +1663,6 @@ impl State {
                 kind == DISPATCH,
             )
         });
-        if let Some((counter, _)) = &counter {
-            list.buffer_state(counter, crate::host::BUFFER_INDIRECT_ARGUMENT);
-        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1672,7 +1682,7 @@ impl State {
             let name = crate::pipeline::shaders_of(pipeline);
             crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &args);
+        crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
