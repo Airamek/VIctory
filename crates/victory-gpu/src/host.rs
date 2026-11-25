@@ -1400,16 +1400,53 @@ static SPARE_ALLOCATORS_COPY: Mutex<Vec<ID3D12CommandAllocator>> = Mutex::new(Ve
 static SPARE_PRELUDES: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
 static SPARE_PRELUDES_COPY: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
 static SPARE_SCRATCH: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
+/// Mapped list upload buffers whose submissions finished, for lists reset
+/// while they run (upload() makes one committed resource per copy).
+static SPARE_UPLOADS: Mutex<Vec<(ID3D12Resource, usize, usize)>> = Mutex::new(Vec::new());
 /// Spares kept of each kind at most.
 const SPARES: usize = 256;
+/// Spared upload buffers kept at most, and their bytes (they are whole
+/// committed resources each).
+const SPARE_UPLOADS_MAX: usize = 64;
+const SPARE_UPLOADS_BYTES: u64 = 64 << 20;
 
 fn pool<T>(spares: &'static Mutex<Vec<T>>) -> std::sync::MutexGuard<'static, Vec<T>> {
     spares.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A spared mapped upload buffer of at least `size` bytes (capacity within
+/// twice that, best fit): committed resources are queue-agnostic, so one
+/// pool serves DIRECT lists (COPY lists never take list uploads).
+fn take_spare_upload(size: u64) -> Option<(ID3D12Resource, *mut u8, usize)> {
+    let size = size.max(1);
+    let max_fit = size.saturating_mul(2);
+    let mut pool = pool(&SPARE_UPLOADS);
+    let idx = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, cap))| *cap as u64 >= size && *cap as u64 <= max_fit)
+        .min_by_key(|(_, (_, _, cap))| *cap)
+        .map(|(i, _)| i)?;
+    let (buffer, data, cap) = pool.swap_remove(idx);
+    Some((buffer, data as *mut u8, cap))
+}
+
+/// Keeps finished upload buffers for reuse, bounded in count and bytes;
+/// the rest drop (their committed resources are freed).
+fn return_spare_uploads(uploads: Vec<(ID3D12Resource, usize, usize)>) {
+    let mut pool = pool(&SPARE_UPLOADS);
+    for (buffer, data, cap) in uploads {
+        let total: u64 = pool.iter().map(|(_, _, c)| *c as u64).sum();
+        if pool.len() >= SPARE_UPLOADS_MAX || total.saturating_add(cap as u64) > SPARE_UPLOADS_BYTES {
+            continue;
+        }
+        pool.push((buffer, data, cap));
+    }
+}
+
 impl Retired {
     /// Once the submission that used them has finished.
-    fn retire(self) {
+    fn retire(mut self) {
         // DIRECT and COPY pools stay apart: an allocator resets only its own kind.
         let (alloc_pool, prelude_pool) = match self.kind {
             ListKind::Direct => (&SPARE_ALLOCATORS, &SPARE_PRELUDES),
@@ -1427,6 +1464,9 @@ impl Retired {
         let mut spare = pool(&SPARE_SCRATCH);
         let room = SPARES.saturating_sub(spare.len());
         spare.extend(self.scratch.chunks.into_iter().take(room));
+        drop(spare);
+        // The submission finished: its upload buffers are free for reuse.
+        return_spare_uploads(std::mem::take(&mut self.deferred.uploads));
         drop((self.deferred, self.states, self.buffer_states, self.twins, self.budget));
     }
 }
@@ -3218,7 +3258,10 @@ impl HostList {
                 self.fresh_after
                     .store(self.last.load(Ordering::Acquire), Ordering::Release);
             } else {
-                *self.deferred() = Deferred::default();
+                // Nothing running uses the list: its finished upload buffers
+                // go back to the pool with the takes below.
+                let old = std::mem::take(&mut *self.deferred());
+                return_spare_uploads(old.uploads);
                 self.states
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -3817,19 +3860,24 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset. DIRECT only (COPY uses staging space).
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset (and returned to the host pool for reuse). DIRECT only (COPY
+    /// uses staging space).
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         if self.is_copy() {
             debug_assert!(false, "upload on a COPY list: staging_space only");
             return None;
         }
-        let (buffer, data) = host.list_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
+        let (buffer, data, cap) = match take_spare_upload(size) {
+            Some(spare) => spare,
+            None => {
+                let (buffer, data) = host.list_buffer(size)?;
+                (buffer, data, size.max(1) as usize)
+            }
+        };
+        name(&buffer, || format!("list upload {cap:#x}"));
         self.deferred()
             .uploads
-            .push((buffer.clone(), data as usize, size as usize));
+            .push((buffer.clone(), data as usize, cap));
         Some((buffer, data))
     }
 
@@ -3855,13 +3903,19 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.list_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
+            let (buffer, data, cap) = match take_spare_upload(len) {
+                Some(spare) => spare,
+                None => {
+                    let (buffer, data) = host.list_buffer(len)?;
+                    (buffer, data, len as usize)
+                }
+            };
+            name(&buffer, || format!("list scratch {cap:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             self.deferred()
                 .uploads
-                .push((buffer, data as usize, len as usize));
+                .push((buffer, data as usize, cap));
             return Some((gpu, data));
         }
         while s.chunks.get(s.current).is_some() && len > SCRATCH_CHUNK - s.used {
@@ -6299,6 +6353,33 @@ mod batch {   // `mod tests` is already taken at the top of this file
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// List upload buffers are pooled across resets: the same committed
+    /// resource and mapping serve the next upload. Needs a host GPU;
+    /// passes by without one.
+    #[test]
+    fn upload_buffers_are_pooled_across_list_resets() {
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let (first, first_ptr) = list.upload(host, 4096).expect("first upload");
+        let first_raw = first.as_raw();
+        // SAFETY: `list` is open from `new_list`; close it before `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        list.reset();
+        let (second, second_ptr) = list.upload(host, 4096).expect("second upload");
+        let second_raw = second.as_raw();
+        assert_eq!(first_raw, second_raw, "the pooled resource is reused");
+        assert_eq!(first_ptr, second_ptr, "the pooled mapping is reused");
+        drop((first, second));
+        // SAFETY: `list` is open again after `reset()`; close it before the final `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        list.reset();
     }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
