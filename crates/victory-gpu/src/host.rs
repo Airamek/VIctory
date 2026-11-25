@@ -1245,6 +1245,11 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: Mutex<Option<(ID3D12Resource, usize)>>,
+    /// The same word in the card's own memory, where the clamp uses it
+    /// when the list can zero it itself (`WriteBufferImmediate`): device
+    /// accesses stay on the card instead of crossing the bus to the
+    /// mapped word above.
+    card_budget: Mutex<Option<ID3D12Resource>>,
     /// The host fence value of its last submission (0: none): it is not
     /// reset, resubmitted or dropped before that one has finished.
     last: AtomicU64,
@@ -1446,6 +1451,7 @@ struct Retired {
     buffer_states: BufferStates,
     twins: std::collections::HashMap<usize, crate::twin::Use>,
     budget: Option<(ID3D12Resource, usize)>,
+    card_budget: Option<ID3D12Resource>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the scratch and budget pointers
@@ -1531,7 +1537,7 @@ impl Retired {
         // Readbacks are not pooled (READBACK heap, never upload memory):
         // they drop with `deferred` here.
         return_spare_uploads(std::mem::take(&mut self.deferred.uploads));
-        drop((self.deferred, self.states, self.buffer_states, self.twins, self.budget));
+        drop((self.deferred, self.states, self.buffer_states, self.twins, self.budget, self.card_budget));
     }
 }
 
@@ -1919,6 +1925,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: Mutex::default(),
+                card_budget: Mutex::default(),
                 last: AtomicU64::new(0),
                 fresh_after: AtomicU64::new(0),
                 arguments: Mutex::new(None),
@@ -3334,6 +3341,7 @@ impl HostList {
                 let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
                 let mut buffer_states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
                 let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+                let mut card_budget = self.card_budget.lock().unwrap_or_else(|e| e.into_inner());
                 let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
                 let retired = Retired {
                     kind: self.kind,
@@ -3345,6 +3353,7 @@ impl HostList {
                     buffer_states: std::mem::take(&mut *buffer_states),
                     twins: std::mem::take(&mut *twins),
                     budget: budget.take(),
+                    card_budget: card_budget.take(),
                 };
                 host.after(move || retired.retire());
                 // Still named by that submission: dropping waits for it.
@@ -4087,11 +4096,19 @@ impl HostList {
 
     /// The list's indirect-work budget (and its host address), zeroed at
     /// each submission of the list from the first use after a reset on.
-    /// DIRECT only.
-    pub(crate) fn budget(&self) -> Option<(ID3D12Resource, u64)> {
+    /// DIRECT only. In the card's own memory where the list can zero it
+    /// itself, so the clamp's accesses stay on the card instead of
+    /// crossing the bus to mapped memory; the mapped word otherwise.
+    /// The third return is whether the budget lives in the card's memory.
+    pub(crate) fn budget(&self) -> Option<(ID3D12Resource, u64, bool)> {
         if self.is_copy() {
             debug_assert!(false, "budget on a COPY list");
             return None;
+        }
+        if let Some(card) = self.card_budget() {
+            // SAFETY: a live buffer.
+            let va = unsafe { card.GetGPUVirtualAddress() };
+            return Some((card, va, true));
         }
         let (buffer, data) = {
             let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
@@ -4113,7 +4130,94 @@ impl HostList {
             ));
         }
         // SAFETY: a live buffer.
-        Some((buffer.clone(), unsafe { buffer.GetGPUVirtualAddress() }))
+        Some((buffer.clone(), unsafe { buffer.GetGPUVirtualAddress() }, false))
+    }
+
+    /// Whether the indirect-work budget is zeroed for this recording yet.
+    pub(crate) fn budget_zeroed(&self) -> bool {
+        self.deferred().budget_zeroed
+    }
+
+    /// The list's indirect-work budget in the card's own memory, zeroed in
+    /// the list before its first clamp of the recording. None where the
+    /// list cannot zero it itself (no `ID3D12GraphicsCommandList2`): the
+    /// caller falls back to the mapped word.
+    fn card_budget(&self) -> Option<ID3D12Resource> {
+        // SAFETY: plain interface query.
+        let list2 = self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
+        let mut card = self.card_budget.lock().unwrap_or_else(|e| e.into_inner());
+        if card.is_none() {
+            *card = Some(self.make_card_buffer()?);
+        }
+        let card = card.clone()?;
+        let mut deferred = self.deferred();
+        if !deferred.budget_zeroed {
+            deferred.budget_zeroed = true;
+            drop(deferred);
+            self.zero_card_budget(&list2, &card);
+        }
+        Some(card)
+    }
+
+    /// A device-local word for the list's indirect-work budget, in the
+    /// common state.
+    fn make_card_buffer(&self) -> Option<ID3D12Resource> {
+        let host = host()?;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Alignment: 0,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        let made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        let buffer = made.ok().and(buffer)?;
+        name(&buffer, || "indirect budget".into());
+        Some(buffer)
+    }
+
+    /// Records, before the list's first clamp of the recording, the zeroing
+    /// of the card's copy of the budget: common, written as a copy, then
+    /// left for unordered access until the chunk reverts it.
+    fn zero_card_budget(&self, list2: &ID3D12GraphicsCommandList2, card: &ID3D12Resource) {
+        // SAFETY: a live buffer.
+        let at = unsafe { card.GetGPUVirtualAddress() };
+        let zero = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at, Value: 0 };
+        // SAFETY: an open list; the buffer is the list's own and in the
+        // common state at the start of every recording.
+        unsafe {
+            self.list.ResourceBarrier(&[transition(
+                card,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
+            list2.WriteBufferImmediate(1, &zero, None);
+            self.list.ResourceBarrier(&[transition(
+                card,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
     }
 
     /// The list's argument buffer, at least `bytes` long, common between

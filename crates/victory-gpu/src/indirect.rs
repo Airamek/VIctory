@@ -217,13 +217,13 @@ pub(crate) fn bound_chunk(list: &HostList, reqs: &[ClampReq]) -> Option<Vec<(ID3
     if reqs.is_empty() {
         return Some(Vec::new());
     }
-    let (Some(c), Some((budget_res, budget))) = (clamp(), list.budget()) else {
-        return None;
-    };
+    let c = clamp()?;
     let l = &list.list;
     // One buffer for the chunk, a slice per request: executions of a chunk
     // run after all its clamps, so sharing one buffer at offset 0 would
-    // leave every execution reading the last clamp's records.
+    // leave every execution reading the last clamp's records. Offsets
+    // first: a request the clamp refuses records nothing, including the
+    // budget's zeroing.
     const ALIGN: u64 = 16;
     let mut offsets = Vec::with_capacity(reqs.len());
     let mut total = 0;
@@ -237,6 +237,9 @@ pub(crate) fn bound_chunk(list: &HostList, reqs: &[ClampReq]) -> Option<Vec<(ID3
             .checked_next_multiple_of(ALIGN)?;
     }
     let out = list.arguments(total.max(16))?;
+    let was_zeroed = list.budget_zeroed();
+    let (budget_res, budget, card) = list.budget()?;
+    let first = !was_zeroed;
     // SAFETY: a live buffer.
     let base = unsafe { out.GetGPUVirtualAddress() };
     // SAFETY: an open list; our root signature, pipeline and buffers, and
@@ -289,6 +292,17 @@ pub(crate) fn bound_chunk(list: &HostList, reqs: &[ClampReq]) -> Option<Vec<(ID3
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         )]);
+        // The card's copy of the budget goes back to common: the next
+        // recording zeroes it again. The mapped word never leaves common.
+        // No clamp ran in a later chunk with no records: nothing promoted
+        // it, so nothing reverts it.
+        if card && (first || reqs.iter().any(|r| r.records > 0)) {
+            l.ResourceBarrier(&[transition(
+                &budget_res,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
     }
     Some(offsets.into_iter().map(|at| (out.clone(), at)).collect())
 }
@@ -335,7 +349,7 @@ pub(crate) fn done_chunk(list: &HostList, clamped: &[ID3D12Resource]) {
 // per-list tracked buffer states if a driver or that validation minds.
 #[cfg(test)]
 pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
-    let (Some(c), Some((_, budget))) = (clamp(), list.budget()) else {
+    let (Some(c), Some((_, budget, _))) = (clamp(), list.budget()) else {
         return None;
     };
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
