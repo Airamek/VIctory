@@ -1883,6 +1883,20 @@ impl State {
             why("no host signature");
             return false;
         };
+        // Zero records execute nothing on the GPU: skip the refresh, the
+        // hoisted clamp and the execution, counting the draw or dispatch.
+        if max == 0 {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                self.op_text(format!("indirect kind {kind} max 0 at {arguments:#x}"), kind == DISPATCH)
+            });
+            if kind == DISPATCH {
+                DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            }
+            return true;
+        }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
@@ -1925,6 +1939,8 @@ impl State {
                 kind: p.kind,
                 stride: p.stride,
                 records: p.max,
+                args: p.args.buffer.clone(),
+                count: p.counter.as_ref().map(|(s, _)| s.buffer.clone()),
             })
             .collect();
         let Some(clamped) = crate::indirect::bound_chunk(list, &reqs) else {
@@ -1952,20 +1968,28 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let mut dropped = 0;
-        for (p, c) in pending.iter().zip(clamped.iter()) {
-            if !self.run_pending(list, p, c) {
+        for (p, (buffer, at)) in pending.iter().zip(clamped.iter()) {
+            if !self.run_pending(list, p, buffer, *at) {
                 dropped += 1;
             }
         }
-        crate::indirect::done_chunk(list, &clamped);
+        // The chunk shares one argument buffer; revert it once.
+        let mut buffers: Vec<ID3D12Resource> = Vec::new();
+        for (buffer, _) in clamped {
+            if !buffers.iter().any(|b| b.as_raw() == buffer.as_raw()) {
+                buffers.push(buffer.clone());
+            }
+        }
+        crate::indirect::done_chunk(list, &buffers);
         crate::list::note_indirect_dropped(dropped);
         dropped
     }
 
     /// Runs one pending indirect execution whose clamp the chunk recorded
-    /// into `clamped`: false if it drops (`flush_indirect` reverts the
-    /// chunk's buffers with [`done_chunk`] either way).
-    fn run_pending(&mut self, list: &HostList, p: &PendingIndirect, clamped: &ID3D12Resource) -> bool {
+    /// into the slice at `offset` of `clamped`: false if it drops
+    /// (`flush_indirect` reverts the chunk's buffers with [`done_chunk`]
+    /// either way).
+    fn run_pending(&mut self, list: &HostList, p: &PendingIndirect, clamped: &ID3D12Resource, offset: u64) -> bool {
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
@@ -2039,7 +2063,7 @@ impl State {
                 &p.signature,
                 p.max,
                 clamped,
-                0,
+                offset,
                 p.counter.as_ref().map(|(s, _)| &s.buffer),
                 p.counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -2053,7 +2077,7 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = p.counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pending_pipeline(p));
-                crate::capture::read_indirect(list, (clamped, 0), count, (p.kind, p.stride, p.max), name, always);
+                crate::capture::read_indirect(list, (clamped, offset), count, (p.kind, p.stride, p.max), name, always);
             }
         }
         if p.kind == DISPATCH {

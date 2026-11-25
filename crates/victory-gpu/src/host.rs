@@ -4085,10 +4085,10 @@ impl HostList {
         Some(result)
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on. DIRECT
-    /// only.
-    pub(crate) fn budget(&self) -> Option<u64> {
+    /// The list's indirect-work budget (and its host address), zeroed at
+    /// each submission of the list from the first use after a reset on.
+    /// DIRECT only.
+    pub(crate) fn budget(&self) -> Option<(ID3D12Resource, u64)> {
         if self.is_copy() {
             debug_assert!(false, "budget on a COPY list");
             return None;
@@ -4113,7 +4113,7 @@ impl HostList {
             ));
         }
         // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some((buffer.clone(), unsafe { buffer.GetGPUVirtualAddress() }))
     }
 
     /// The list's argument buffer, at least `bytes` long, common between

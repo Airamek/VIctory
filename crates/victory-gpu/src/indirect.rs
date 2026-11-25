@@ -19,7 +19,7 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
 
 use crate::host::{HostList, host, transition};
 
@@ -189,80 +189,112 @@ fn make() -> windows::core::Result<Clamp> {
 /// `stride` bytes apart at host address `gpu` (a title buffer's copy, only
 /// read), clamped in recorded order with the rest of its chunk (sequential
 /// order preserved; nothing reordered).
+/// `args` is the title buffer's host copy the clamp reads, `count` the one
+/// holding the title's record count, if any (for the pre-clamp barriers).
 pub(crate) struct ClampReq {
     pub(crate) gpu: u64,
     pub(crate) kind: u32,
     pub(crate) stride: u32,
     pub(crate) records: u32,
+    pub(crate) args: ID3D12Resource,
+    pub(crate) count: Option<ID3D12Resource>,
 }
 
 /// Records, in `list`, the clamps of `reqs` back to back as one sequential
-/// chunk: one leading unordered-access barrier, then one compute root
-/// signature and pipeline, then per request its constants, views and
-/// dispatch, each followed by an unordered-access barrier so the shared
-/// indirect-work budget is charged in request order. Each request clamps
-/// into the list's own argument buffer ([`HostList::arguments`]), moved to
-/// indirect arguments: the buffers, in request order, for the executions
-/// (and [`done_chunk`] after). Replaces the list's compute root signature
-/// and pipeline (callers bind theirs after). `None` if the clamp is not
-/// available, or a request's arguments are not 4-byte aligned (alignment
-/// checked by the caller when hoisted; nothing recorded).
-pub(crate) fn bound_chunk(list: &HostList, reqs: &[ClampReq]) -> Option<Vec<ID3D12Resource>> {
+/// chunk: unordered-access barriers scoped to the title buffers the clamps
+/// read (their argument copies, and any distinct count buffer) instead of
+/// a global flush, then one compute root signature and pipeline, then per
+/// request its constants, views and dispatch (none with no records), each
+/// followed by an unordered-access barrier on the shared budget so it is
+/// charged in request order. The requests clamp into slices of one of the
+/// list's argument buffers ([`HostList::arguments`]), at increasing
+/// offsets: the (buffer, offset) pairs, in request order, for the
+/// executions (and [`done_chunk`] after). Replaces the list's compute root
+/// signature and pipeline (callers bind theirs after). `None` if the clamp
+/// is not available, or a request's arguments are not 4-byte aligned
+/// (alignment checked by the caller when hoisted; nothing recorded).
+pub(crate) fn bound_chunk(list: &HostList, reqs: &[ClampReq]) -> Option<Vec<(ID3D12Resource, u64)>> {
     if reqs.is_empty() {
         return Some(Vec::new());
     }
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
+    let (Some(c), Some((budget_res, budget))) = (clamp(), list.budget()) else {
         return None;
     };
     let l = &list.list;
-    let mut outs = Vec::with_capacity(reqs.len());
+    // One buffer for the chunk, a slice per request: executions of a chunk
+    // run after all its clamps, so sharing one buffer at offset 0 would
+    // leave every execution reading the last clamp's records.
+    const ALIGN: u64 = 16;
+    let mut offsets = Vec::with_capacity(reqs.len());
+    let mut total = 0;
     for req in reqs {
         if !req.gpu.is_multiple_of(4) || !req.stride.is_multiple_of(4) {
             return None;
         }
-        let out = list.arguments(u64::from(req.stride) * u64::from(req.records.max(1)))?;
-        outs.push(out);
+        offsets.push(total);
+        total += u64::from(req.stride)
+            .checked_mul(u64::from(req.records.max(1)))?
+            .checked_next_multiple_of(ALIGN)?;
     }
+    let out = list.arguments(total.max(16))?;
+    // SAFETY: a live buffer.
+    let base = unsafe { out.GetGPUVirtualAddress() };
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // title buffers' copies the caller's list holds.
     unsafe {
-        // Earlier shader writes (the titles' argument passes) first.
-        l.ResourceBarrier(&[uav_barrier()]);
+        // Order earlier title shader writes into the clamps' argument
+        // copies (and any distinct count buffer) first, with barriers
+        // scoped to those buffers instead of a global flush: one per
+        // buffer, deduplicated.
+        let mut seen: Vec<*mut core::ffi::c_void> = Vec::new();
+        let mut pre: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+        for req in reqs {
+            for buffer in [&req.args].into_iter().chain(req.count.as_ref()) {
+                let raw = buffer.as_raw();
+                if !seen.contains(&raw) {
+                    seen.push(raw);
+                    pre.push(uav_barrier_for(buffer));
+                }
+            }
+        }
+        if !pre.is_empty() {
+            l.ResourceBarrier(&pre);
+        }
+        l.ResourceBarrier(&[transition(
+            &out,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
-        for (req, out) in reqs.iter().zip(outs.iter()) {
+        for (req, &at) in reqs.iter().zip(offsets.iter()) {
+            if req.records == 0 {
+                // Zero records clamp nothing and execute nothing: no
+                // dispatch and no unordered-access barriers; the slice is
+                // never read.
+                continue;
+            }
             let constants = [req.kind, req.stride, req.records, 0];
-            l.ResourceBarrier(&[transition(
-                out,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
             l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, req.gpu);
             l.SetComputeRootUnorderedAccessView(2, budget);
-            l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(3, base + at);
             // One group walks every record.
             l.Dispatch(req.records.min(1), 1, 1);
             // The shared budget reaches the next clamp in order.
-            l.ResourceBarrier(&[uav_barrier()]);
+            l.ResourceBarrier(&[uav_barrier_for(&budget_res)]);
         }
-        let to_args: Vec<D3D12_RESOURCE_BARRIER> = outs
-            .iter()
-            .map(|out| {
-                transition(
-                    out,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                )
-            })
-            .collect();
-        l.ResourceBarrier(&to_args);
+        l.ResourceBarrier(&[transition(
+            &out,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
     }
-    Some(outs)
+    Some(offsets.into_iter().map(|at| (out.clone(), at)).collect())
 }
 
 /// After the executions a chunk clamped: its argument buffers back to
-/// common.
+/// common (one per buffer; a chunk shares one).
 pub(crate) fn done_chunk(list: &HostList, clamped: &[ID3D12Resource]) {
     if clamped.is_empty() {
         return;
@@ -303,7 +335,7 @@ pub(crate) fn done_chunk(list: &HostList, clamped: &[ID3D12Resource]) {
 // per-list tracked buffer states if a driver or that validation minds.
 #[cfg(test)]
 pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
+    let (Some(c), Some((_, budget))) = (clamp(), list.budget()) else {
         return None;
     };
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
@@ -351,6 +383,8 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
     };
 }
 
+/// Test-only single clamps ([`bound`]) still flush globally.
+#[cfg(test)]
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -361,8 +395,37 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     }
 }
 
+/// An unordered-access barrier on one resource: earlier shader writes
+/// into it finish before later work reads or writes it.
+fn uav_barrier_for(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    #[cfg(test)]
+    tests::UAV_BARRIERS.with(|l| l.borrow_mut().push(resource.as_raw() as usize));
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed COM pointer; `ManuallyDrop` never
+                // releases it, and the caller keeps `resource` alive through
+                // `ResourceBarrier`.
+                pResource: std::mem::ManuallyDrop::new(Some(unsafe { std::mem::transmute_copy(resource) })),
+            }),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub(super) static UAV_BARRIERS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn take_uav_barriers() -> Vec<usize> {
+        UAV_BARRIERS.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -520,5 +583,75 @@ mod tests {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
+    }
+
+    /// A clamp chunk scopes its unordered-access barriers to the buffers
+    /// its clamps read (each argument copy once, any distinct count buffer
+    /// once, the list's budget once per clamping request) and never flushes
+    /// globally; requests with no records move their buffers straight to
+    /// indirect arguments, still paired with `done_chunk`.
+    #[test]
+    fn chunk_scopes_uav_barriers_and_skips_zero_records() {
+        use crate::host::tests::{issued, replay};
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let (args, args_data) = host.shared_buffer(256).unwrap();
+        let (count, _) = host.shared_buffer(256).unwrap();
+        // SAFETY: our mapped buffer; a live buffer.
+        let gpu = unsafe {
+            args_data.cast::<[u32; 3]>().write_volatile([70_000, 1, 1]);
+            args.GetGPUVirtualAddress()
+        };
+        let key = |r: &super::ID3D12Resource| r.as_raw() as usize;
+        let list = host.new_list().unwrap();
+        let budget_key = key(&list.budget().unwrap().0);
+
+        // Two clamping requests sharing one argument copy, one with a
+        // distinct count buffer, one with none, one with no records.
+        let reqs = [
+            (2u32, 12u32, 1u32, Some(count.clone())),
+            (0, 16, 1, None),
+            (1, 20, 1, None),
+            (2, 12, 0, None),
+        ];
+        let reqs: Vec<super::ClampReq> = reqs
+            .iter()
+            .map(|&(kind, stride, records, ref count)| super::ClampReq {
+                gpu,
+                kind,
+                stride,
+                records,
+                args: args.clone(),
+                count: count.clone(),
+            })
+            .collect();
+        take_uav_barriers();
+        issued();
+        let outs = super::bound_chunk(&list, &reqs).unwrap();
+        // One buffer for the chunk, a slice per request: distinct,
+        // 16-byte-aligned offsets in request order.
+        assert!(outs.iter().all(|(o, _)| key(o) == key(&outs[0].0)));
+        assert_eq!(
+            outs.iter().map(|(_, at)| *at).collect::<Vec<_>>(),
+            [0, 16, 32, 64]
+        );
+        let buffers = [outs[0].0.clone()];
+        super::done_chunk(&list, &buffers);
+        // Scoped barriers only: the argument copy, the distinct count
+        // buffer, then the budget once per clamping request (three clamping
+        // requests; the zero-record one clamps nothing).
+        assert_eq!(
+            take_uav_barriers(),
+            [key(&args), key(&count), budget_key, budget_key, budget_key]
+        );
+        // Every transition starts from the buffer's current state, and the
+        // chunk's buffer ends common again after `done_chunk`.
+        let mut states: std::collections::HashMap<usize, u32> = [(key(&outs[0].0), 0)].into_iter().collect();
+        replay(&issued(), &mut states).unwrap();
+        assert!(states.values().all(|&s| s == 0));
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
