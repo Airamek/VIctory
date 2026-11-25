@@ -24,6 +24,12 @@ mod bvh;
 
 type Why = &'static str;
 
+/// The dword of the host's view-stride table the element counts start at:
+/// one [`super::HEAP_VIEWS`] past the strides (see
+/// `victory_gpu::descriptor::host`), where shaders, which know no heap's
+/// size, look for them.
+const COUNTS_AT: u32 = super::HEAP_VIEWS;
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -4131,7 +4137,12 @@ impl<'a> Lower<'a> {
                     || un.starts_with("buffer_store_format")
                 {
                     (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                } else if *idxen
+                    && format.is_none()
+                    && stride >= 4
+                    && stride.is_multiple_of(4)
+                    && !stride.is_multiple_of(16)
+                {
                     (12 | u, stride)
                 } else {
                     (11 | u, 0)
@@ -4158,6 +4169,36 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
+        // A structured buffer's records, of a raw view's bytes (see above):
+        // raw-viewed structured buffers keep the size query, of bytes.
+        let records = (props.0 & 0xfff == 12 && props.1.is_multiple_of(16)).then_some(props.1);
+        let mut props = props;
+        if records.is_some() {
+            props = (11 | props.0 & 0x1000, 0);
+        }
+        // A typed or structured buffer's element count comes from the host's
+        // table of them by slot: the AMD driver's compiler crashes on a size
+        // query of a structured buffer from the heap and takes minutes over
+        // hundreds of a typed one's; the table holds the title's own count.
+        // (A structured buffer the host views raw keeps the query, of bytes.)
+        if image.is_none()
+            && records.is_none()
+            && matches!(props.0 & 0xfff, 10 | 12)
+            && let Ok(slot) = self.heap_slot(&src, false)
+        {
+            let n = self.slot_dword(slot, COUNTS_AT);
+            for k in 0..count {
+                let rel = k.wrapping_sub(u32::from(first));
+                if rel == 2 {
+                    self.write(inst, Reg::S(code + k as u8), n, None);
+                } else if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                    self.vals.insert(v, Val::Missing(OTHER));
+                }
+            }
+            return Ok(());
+            // A descriptor outside the heaps (a constant, a root view) falls
+            // through to the size query below: heap_slot errs there.
+        }
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -4209,7 +4250,14 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let mut n = field(self, 0);
+                if let Some(stride) = records {
+                    let st = self.s.m.i32(stride);
+                    n = self.s.m.bin(c, Bin::UDiv, n, st);
+                }
+                vec![(2, n)]
+            },
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -4825,10 +4873,63 @@ impl<'a> Lower<'a> {
             Source::Phi { .. } => return Err(WHY),
             _ => self.lane_heap_index(src, false)?,
         };
+        Ok(self.slot_dword(index, 0))
+    }
+
+    /// The heap slot of the descriptor `src` (descriptors from the resource
+    /// heap only): its index in each lane, for the host's view-stride table.
+    fn heap_slot(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+        const WHY: Why = "a descriptor outside the heaps";
+        match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+            Source::Fetched { load, first } => self.fetched_index(*load, *first, sampler),
+            Source::Phi { block, args } => {
+                let join = self.block[*block].ok_or(WHY)?;
+                let mut incoming = Vec::new();
+                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                    if self.block[q].is_none() {
+                        continue;
+                    }
+                    let tail = self.tail[q].ok_or(WHY)?;
+                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = match arg {
+                        Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+                        _ => return Err(WHY),
+                    };
+                    self.cur = here;
+                    incoming.push((index?, at));
+                }
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s.m.set_phi(phi, incoming);
+                Ok(phi)
+            }
+            _ => self.lane_heap_index(src, sampler),
+        }
+    }
+
+    /// What the host's view-stride table holds for heap slot `slot`, `from`
+    /// dwords on: the byte stride of its buffer view from 0, the element
+    /// count from [`COUNTS_AT`].
+    fn slot_dword(&mut self, slot: V, from: u32) -> V {
         let c = self.cur;
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
+        // A root view has no bounds: a wild index would read past the table.
+        let slot = if from != 0 {
+            let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+            let over = self.s.m.cmp(c, pred::IUGT, slot, last);
+            self.s.m.select(c, over, last, slot)
+        } else {
+            slot
+        };
+        let slot = if from != 0 {
+            let from = self.s.m.i32(from);
+            self.s.m.bin(c, Bin::Add, slot, from)
+        } else {
+            slot
+        };
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Mul, slot, four);
         let iu = self.s.m.undef(self.s.t.i32);
         let mask = self.s.m.i8(1);
         let r = self.s.op(
@@ -4840,7 +4941,7 @@ impl<'a> Lower<'a> {
             &[table, at, iu, mask, four],
         );
         let x = self.s.m.extract(c, r, 0);
-        Ok(self.as_int(x))
+        self.as_int(x)
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -8990,11 +9091,24 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    let s = self.s.m.i32(stride);
-                    let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                    let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
-                    (h, [index, off, iu], byte)
+                    // Structured buffers of 16-byte multiples are raw views
+                    // of their bytes on the host: D3D12 takes structured
+                    // views only on multiples of the stride, and AMD reads
+                    // element 0 for all of a raw view's.
+                    if stride >= 16 && stride.is_multiple_of(16) {
+                        let s = self.s.m.i32(stride);
+                        let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                        let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
+                        let (h, byte) =
+                            self.raw_view(site, src, byte, 4, (11 | u, 0), true, guard)?;
+                        (h, [byte, iu, iu], byte)
+                    } else {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        let s = self.s.m.i32(stride);
+                        let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                        let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
+                        (h, [index, off, iu], byte)
+                    }
                 }
                 None => {
                     let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
@@ -9124,11 +9238,22 @@ impl<'a> Lower<'a> {
                         if stride < 4 || !stride.is_multiple_of(4) {
                             return Err("a structured buffer of unknown stride");
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
-                        let s = self.s.m.i32(stride);
-                        let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
+                        if stride >= 16 && stride.is_multiple_of(16) {
+                            let s = self.s.m.i32(stride);
+                            let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                            let byte_off = self.s.m.bin(self.cur, Bin::Add, row, off);
+                            let n = 4 * count;
+                            let (h, at) =
+                                self.raw_view(site, src, byte_off, n, (11 | u, 0), true, guard)?;
+                            args.extend([h, at, iu]);
+                            (byte, bytes) = (at, n);
+                        } else {
+                            args.push(self.handle(site, src, false, (12 | u, stride))?);
+                            args.extend([index, off]);
+                            let s = self.s.m.i32(stride);
+                            let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                            (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
+                        }
                     }
                     None => {
                         let n = 4 * count;
@@ -9232,15 +9357,32 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
+                    if stride >= 16 && stride.is_multiple_of(16) {
+                        let s = self.s.m.i32(stride);
+                        let row = self.s.m.bin(c, Bin::Mul, index, s);
+                        let byte = self.s.m.bin(c, Bin::Add, row, off);
+                        let bytes = 4 * count;
+                        let (h, byte) =
+                            self.raw_view(site, src, byte, bytes, (11 | u, 0), false, guard)?;
+                        self.s.op(
+                            self.cur,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, byte, iu, mask, align],
+                        )
+                    } else {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, index, off, mask, align],
+                        )
+                    }
                 }
                 None => {
                     let bytes = 4 * count;

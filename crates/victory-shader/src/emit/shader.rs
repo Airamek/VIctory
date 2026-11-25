@@ -14,7 +14,9 @@ pub const SAMPLER_SPACE: u32 = 0;
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
 /// parameter) of the view-stride table: dword `i` is the byte stride of
-/// the buffer view at view-heap index `i`.
+/// the buffer view at view-heap index `i`, dword `HEAP_VIEWS + i` its
+/// element count (a size query of a structured buffer from the heap crashes
+/// the AMD driver's compiler, so shaders take the title's own count there).
 pub const VIEW_STRIDES: u8 = 255;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").

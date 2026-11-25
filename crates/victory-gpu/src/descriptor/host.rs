@@ -42,8 +42,11 @@ pub(crate) struct HostHeap {
     pairs_end: u32,
     /// View heaps: the view-stride table translated shaders read
     /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
-    /// byte stride of the buffer view there, 0 for none. Mapped at the
-    /// address kept beside it.
+    /// byte stride of the buffer view there, 0 for none; followed by the
+    /// element count of the buffer view there from [`COUNTS_AT`] dwords on
+    /// (a size query of a structured buffer from the heap crashes the AMD
+    /// driver's compiler, so shaders take the title's own count from here).
+    /// Mapped at the address kept beside it.
     strides: Option<(ID3D12Resource, usize)>,
     /// View heaps: the view-mark table translated shaders read
     /// (`victory_shader::emit`, "Write marks"), two dwords per slot as the
@@ -87,6 +90,11 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The dword of the view-stride table the element counts start at: one
+/// [`victory_shader::emit::HEAP_VIEWS`] past the strides, where shaders,
+/// which know no heap's size, look for them.
+const COUNTS_AT: u32 = victory_shader::emit::HEAP_VIEWS;
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released. A world
@@ -125,8 +133,14 @@ impl HostHeap {
         // Every slot a shader can index (title slots, also past a capped
         // heap, and dynamic ones): shaders read the table as a root view,
         // which has no bounds, at indices clamped below `HEAP_VIEWS`.
+        // The element counts follow the strides, from `COUNTS_AT` dwords on
+        // (where shaders, which know no heap's size, look for them).
         let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
+            .then(|| {
+                host.upload_buffer(
+                    (u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) + u64::from(COUNTS_AT)) * 4,
+                )
+            })
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
         let marks = (!sampler)
@@ -494,19 +508,35 @@ impl HostHeap {
     }
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
-    /// for slot `index` in the view-stride table.
+    /// for slot `index` in the view-stride table, and the element count of
+    /// its buffer view (0 for anything else) from [`COUNTS_AT`] dwords on.
     fn set_stride(&self, index: u32, view: Option<&View>) {
-        self.write_stride(index, view.map_or(0, view_stride));
+        let (stride, count) = view.map_or((0, 0), |v| (view_stride(v), view_count(v)));
+        self.write_stride_count(index, stride, count);
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
+        self.write_stride_count(index, stride, 0);
+    }
+
+    /// The stride and the element count of the buffer view in slot `index`
+    /// (zeros for anything else), for shaders: a size query of a structured
+    /// buffer from the heap crashes the AMD driver's compiler, so shaders
+    /// take the title's own count from the table.
+    fn write_stride_count(&self, index: u32, stride: u32, count: u32) {
         let Some((_, data)) = &self.strides else { return };
         if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
             return;
         }
-        // SAFETY: a dword of the mapped table, which has one per slot below
-        // the larger of the title's count and `HEAP_VIEWS`.
-        unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
+        // SAFETY: dwords of the mapped table, which holds one stride per
+        // slot below the larger of the title's count and `HEAP_VIEWS`, and
+        // the counts `COUNTS_AT` dwords on.
+        unsafe {
+            (*data as *mut u32).add(index as usize).write_volatile(stride);
+            (*data as *mut u32)
+                .add((COUNTS_AT + index) as usize)
+                .write_volatile(count)
+        };
     }
 
     /// The view-stride table, for root SRV `VIEW_STRIDES`.
@@ -818,6 +848,44 @@ fn view_stride(view: &View) -> u32 {
     element.max(1) as u32
 }
 
+/// Whether structured buffers of this stride are raw views on the host (as
+/// the shaders take them: `emit::lower`): AMD reads element 0 for every
+/// element of a raw view through a structured buffer.
+fn raw_stride(stride: u32) -> bool {
+    stride >= 16 && stride.is_multiple_of(16)
+}
+
+/// The elements of the title's buffer view `view` (0 for other views): what
+/// the view-stride table holds from [`COUNTS_AT`] dwords on, so shaders take
+/// a typed or structured buffer's count without a size query (which crashes
+/// the AMD driver's compiler on structured buffers from the heap).
+fn view_count(view: &View) -> u32 {
+    let srv = |w: &[u32; 10]| {
+        let desc = srv_desc(w);
+        // SAFETY: a buffer view's union member.
+        (desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
+            .then_some(unsafe { desc.Anonymous.Buffer }.NumElements)
+    };
+    let uav = |w: &[u32; 10]| {
+        let desc = uav_desc(w);
+        // SAFETY: a buffer view's union member.
+        (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+            .then_some(unsafe { desc.Anonymous.Buffer }.NumElements)
+    };
+    match view {
+        View::Shader(_, Some(desc)) => srv(desc),
+        View::Placed(false, resource, desc) if resource[0] == 1 => {
+            desc[..10].try_into().ok().and_then(srv)
+        }
+        View::Unordered(_, _, Some(desc)) => uav(desc),
+        View::Placed(true, resource, desc) if resource[0] == 1 => {
+            desc[..10].try_into().ok().and_then(uav)
+        }
+        _ => None,
+    }
+    .unwrap_or(0)
+}
+
 /// A buffer view of title memory at `address` on its host copy: the first
 /// element moves by the copy's offset.
 /// Bytes per element of a buffer view.
@@ -916,6 +984,56 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    // Structured buffers of 16-byte multiples are raw views of their bytes
+    // on the host: D3D12 takes structured views only on multiples of the
+    // stride, and AMD reads element 0 for all of a raw view's elements
+    // through a structured buffer. Shaders read them as raw (emit::lower).
+    // SAFETY: a buffer view's union member.
+    let structured = raw_stride(unsafe { desc.Anonymous.Buffer }.StructureByteStride);
+    if structured {
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        let stride = u64::from(buffer.StructureByteStride);
+        let start = address + buffer.FirstElement * stride;
+        let bytes = u64::from(buffer.NumElements) * stride;
+        let Some((shadow, own)) = crate::shadow::for_view(start, bytes, 0) else {
+            #[cfg(feature = "diagnostics")]
+            if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                tracing::info!(start = format_args!("{start:#x}"), len, stride, count = buffer.NumElements, "refused buffer view: no host copy");
+            }
+            return None;
+        };
+        let first = shadow.offset(start) / 4;
+        let dwords = bytes / 4;
+        let Ok(dwords) = u32::try_from(dwords) else {
+            once!(bytes, "structured raw buffer view too large for a raw view");
+            return None;
+        };
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        *buffer = D3D12_BUFFER_SRV {
+            FirstElement: first,
+            NumElements: dwords,
+            StructureByteStride: 0,
+            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+        };
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        if !in_buffer(&shadow.buffer, first, dwords, 4) {
+            #[cfg(feature = "diagnostics")]
+            if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                tracing::info!(start = format_args!("{start:#x}"), first, dwords, "refused buffer view: empty or past its copy");
+            }
+            once!(first, dwords, "structured raw buffer view empty or past its host copy");
+            return None;
+        }
+        let host = host()?;
+        // SAFETY: a live buffer and a slot of our heap.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+        };
+        return Some(Some((shadow.buffer.clone(), own.then_some(shadow))));
+    }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -976,6 +1094,53 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    // SAFETY: a buffer view's union member.
+    let structured = raw_stride(unsafe { desc.Anonymous.Buffer }.StructureByteStride);
+    if structured {
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        let stride = u64::from(buffer.StructureByteStride);
+        let start = address + buffer.FirstElement * stride;
+        let bytes = u64::from(buffer.NumElements) * stride;
+        let (shadow, own) = crate::shadow::for_view(start, bytes, 0)?;
+        // SAFETY: a live buffer.
+        let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            once!("unordered access to a buffer whose host copy shaders cannot write");
+            return None;
+        }
+        let first = shadow.offset(start) / 4;
+        let Ok(dwords) = u32::try_from(bytes / 4) else {
+            once!(bytes, "structured raw unordered view too large for a raw view");
+            return None;
+        };
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        *buffer = D3D12_BUFFER_UAV {
+            FirstElement: first,
+            NumElements: dwords,
+            StructureByteStride: 0,
+            CounterOffsetInBytes: 0,
+            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+        };
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        if !in_buffer(&shadow.buffer, first, dwords, 4) {
+            once!(first, dwords, "structured raw unordered view empty or past its host copy");
+            return None;
+        }
+        let host = host()?;
+        // SAFETY: a live buffer and a slot of our heap.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                &shadow.buffer,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                at,
+            )
+        };
+        MARK.with(|m| m.set(shadow.mark_entry(start)));
+        return Some(Some((shadow.buffer.clone(), own.then_some(shadow))));
+    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -1641,5 +1806,103 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// Structured buffers of 16-byte multiples are raw views on the host:
+    /// AMD reads element 0 for every element of a raw view through a
+    /// structured buffer.
+    #[test]
+    fn sixteen_byte_multiples_are_raw() {
+        for stride in [0, 1, 4, 8, 12, 20, 24, 28, 60] {
+            assert!(!raw_stride(stride), "stride {stride}");
+        }
+        for stride in [16, 32, 48, 64, 80] {
+            assert!(raw_stride(stride), "stride {stride}");
+        }
+    }
+
+    fn srv_words(first: u64, count: u32, stride: u32) -> [u32; 10] {
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: first,
+                    NumElements: count,
+                    StructureByteStride: stride,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        };
+        // SAFETY: the description is at least 40 bytes; the table reads its
+        // first ten dwords.
+        unsafe { std::ptr::from_ref(&desc).cast::<[u32; 10]>().read_unaligned() }
+    }
+
+    fn uav_words(first: u64, count: u32, stride: u32) -> [u32; 10] {
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: first,
+                    NumElements: count,
+                    StructureByteStride: stride,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                },
+            },
+        };
+        // SAFETY: as above.
+        unsafe { std::ptr::from_ref(&desc).cast::<[u32; 10]>().read_unaligned() }
+    }
+
+    /// The stride and count tables hold the title's own values: strides for
+    /// address math, counts so shaders skip the size query that crashes the
+    /// AMD compiler on structured buffers from the heap.
+    #[test]
+    fn stride_and_count_tables_hold_title_values() {
+        let buffer = |words: [u32; 10]| View::Shader(0, Some(words));
+        let ubuffer = |words: [u32; 10]| View::Unordered(0, 0, Some(words));
+        // Structured strides, including 16-byte multiples (raw on host but
+        // keeping the title stride for shader address math) and 60 (the
+        // world case that crashed the AMD compiler).
+        for stride in [16, 32, 60] {
+            let view = buffer(srv_words(0, 9, stride));
+            assert_eq!(view_stride(&view), stride);
+            assert_eq!(view_count(&view), 9);
+            let view = ubuffer(uav_words(2, 7, stride));
+            assert_eq!(view_stride(&view), stride);
+            assert_eq!(view_count(&view), 7);
+        }
+        // Raw and typed views: stride 4 for raw, the element for typed.
+        let raw_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 64,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: the description is at least 40 bytes.
+        let raw_words: [u32; 10] = unsafe {
+            std::ptr::from_ref(&raw_desc).cast::<[u32; 10]>().read_unaligned()
+        };
+        let raw = buffer(raw_words);
+        assert_eq!(view_stride(&raw), 4);
+        assert_eq!(view_count(&raw), 64);
+        let missing: View = View::Shader(1, None);
+        assert_eq!((view_stride(&missing), view_count(&missing)), (0, 0));
+        // A texture-dimensioned descriptor is neither.
+        let mut tex = srv_words(0, 64, 0);
+        tex[1] = 4;
+        let tex = buffer(tex);
+        assert_eq!((view_stride(&tex), view_count(&tex)), (0, 0));
     }
 }

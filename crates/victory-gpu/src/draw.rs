@@ -2230,6 +2230,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             (src + 0x100, 0x18_0000u32, (0..16).map(|k| 0x5000 + k).collect::<Vec<u32>>()),
             // The copy's last 256 bytes: four lanes inside, the rest past it.
             (src + 4 * MIB - 256, 0, (0..16).map(|k| if k < 4 { 0x7000 + k } else { 0 }).collect()),
+            // Mid-copy 16-byte records (the AMD pack's structured case): all
+            // sixteen lanes inside, proving no crash and correct reads.
+            (src + 0x2000, 0x4000u32, (0..16).map(|k| 0x7000 + k).collect::<Vec<u32>>()),
         ];
         for (round, (address, offset, want)) in cases.into_iter().enumerate() {
             if round > 0 {

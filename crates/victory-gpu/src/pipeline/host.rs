@@ -200,7 +200,7 @@ impl GraphicsState {
             .collect();
         format!(
             "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
+            self.effective_blend(),
             self.sample_mask,
             self.rasterizer,
             self.depth,
@@ -210,6 +210,21 @@ impl GraphicsState {
             self.depth_format.0,
             self.samples
         )
+    }
+
+    /// The blend state the host pipeline is made with: [`Self::blend`]
+    /// without blending on integer render targets (D3D12 forbids blending
+    /// there; the title enables it anyway, and AMD misrenders or refuses the
+    /// pipeline). Logic operations stay as the title set them.
+    pub(crate) fn effective_blend(&self) -> D3D12_BLEND_DESC {
+        let mut out = self.blend;
+        let n = self.targets.NumRenderTargets.min(8) as usize;
+        for (i, rt) in out.RenderTarget.iter_mut().enumerate().take(n) {
+            if integer_rt(self.targets.RTFormats[i]) {
+                rt.BlendEnable = false.into();
+            }
+        }
+        out
     }
 
     /// Whether these are a pass over the screen's draws: no vertex input, no
@@ -645,7 +660,7 @@ impl HostPipeline {
                 pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
                 BytecodeLength: gs.len(),
             },
-            BlendState: g.blend,
+            BlendState: g.effective_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -690,7 +705,7 @@ impl HostPipeline {
             depth = ?g.depth,
             dsv = g.depth_format.0,
             targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
-            blend = ?g.blend.RenderTarget[0],
+            blend = ?g.effective_blend().RenderTarget[0],
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
@@ -752,7 +767,7 @@ fn mesh_pipeline(
     stream.root = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw());
     stream.ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
     stream.ps = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
-    stream.blend = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend);
+    stream.blend = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.effective_blend());
     stream.mask = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask);
     stream.raster = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer);
     stream.depth = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth);
@@ -834,6 +849,37 @@ fn root_signature(
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
+}
+
+/// Whether a render-target format is an integer format: D3D12 forbids
+/// blending on integer render targets, so [`GraphicsState::effective_blend`]
+/// clears `BlendEnable` there. Matches the DXGI `*_UINT` / `*_SINT` formats
+/// (verified against `windows::Win32::Graphics::Dxgi::Common`).
+fn integer_rt(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
 }
 
 /// Copies a blend description field-by-field into zeroed memory so
@@ -998,5 +1044,26 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    /// Blending is off on integer render targets (D3D12 forbids it; the
+    /// title enables it anyway) and stays on for float targets.
+    #[test]
+    fn no_blending_on_integer_render_targets() {
+        let enabled = || D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            ..Default::default()
+        };
+        let mut state = GraphicsState::default();
+        state.blend.RenderTarget[0] = enabled();
+        state.blend.RenderTarget[1] = enabled();
+        state.targets.NumRenderTargets = 2;
+        // R32_UINT (integer) and R8G8B8A8_UNORM (float).
+        state.targets.RTFormats[0] = DXGI_FORMAT_R32_UINT;
+        state.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let out = state.effective_blend();
+        assert!(!out.RenderTarget[0].BlendEnable.as_bool());
+        assert!(out.RenderTarget[1].BlendEnable.as_bool());
     }
 }
