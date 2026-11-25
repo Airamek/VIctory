@@ -2920,11 +2920,16 @@ impl<'a> Lower<'a> {
             .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
         self.s.m.select(c, helper, own, first)
     }
-    /// Whether a quad-local read must reach discarded lanes: after a pixel's
-    /// discard they are the host's helpers, which only quad reads see (wave
-    /// reads give 0 from them on AMD).
+    /// Whether a read of another lane of this lane's quad must reach helper
+    /// lanes: in a pixel shader, always. At a triangle's edge the quad's
+    /// other pixels are helpers (and so are discarded ones), which only quad
+    /// reads see: wave reads give 0 from them on AMD, so a derivative taken
+    /// by hand (`quad_perm`) was the whole value there, the texture read
+    /// that used it took its smallest level, and the triangles' edges showed
+    /// as lines on car paint, glass and skin. Upstream does this after
+    /// discards only (77053a0).
     fn helpers_read(&self, quad: bool) -> bool {
-        quad && self.s.pixel && !self.x.st.discards.is_empty()
+        quad && self.s.pixel
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
