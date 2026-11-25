@@ -561,19 +561,37 @@ fn layout(key: usize) -> Arc<Layout> {
 /// once `settle` has finished the submissions in flight that read it
 /// (outside our locks: finishing one runs its lists' work, which takes
 /// them); one that went out of date only since is rewritten next time.
+///
+/// `seen` remembers the preparations done this submission, by view heap
+/// key: the heap identity and copies' generation they saw. A heap
+/// prepared already for the same pair finds the same shared table (only
+/// the submitting thread rewrites tables while the submission prepares,
+/// and a replaced heap or a changed copy set misses the check below), so
+/// its walk would queue nothing new and settle nothing: skipped.
 pub(crate) fn prepare(
     key: usize,
+    seen: &mut crate::fx::Map<usize, (usize, u64)>,
     settle: impl FnOnce(),
     mut add: impl FnMut(&Arc<Shadow>, usize, usize, Option<u32>),
 ) {
-    let stale = with_heap(key, |heap| {
+    let now = crate::shadow::generation();
+    let Some((stale, host)) = with_heap(key, |heap| {
         let host = std::ptr::from_ref(heap) as usize;
-        shared()
+        let generation = shared()
             .iter()
             .find(|(k, s)| *k == key && s.host == host)
-            .is_some_and(|(_, s)| s.generation != crate::shadow::generation())
+            .map(|(_, s)| s.generation);
+        // The heap prepared already at this copies' generation, and the
+        // same table is still there: unchanged since, nothing to do. The
+        // heap lookup itself stays: it is the identity check.
+        if generation == Some(now) && seen.get(&key).is_some_and(|&(h, g)| h == host && g == now) {
+            return None;
+        }
+        Some((generation.is_some_and(|g| g != now), host))
     })
-    .unwrap_or(false);
+    .flatten() else {
+        return;
+    };
     if stale {
         settle();
     }
@@ -588,6 +606,11 @@ pub(crate) fn prepare(
         Some(s.layout.clone())
     })
     .flatten();
+    // Remember the successful prepare (a missing heap stays uncached: it
+    // may appear next time).
+    if layout.is_some() {
+        seen.insert(key, (host, now));
+    }
     // Copies the title has not written since they took it are passed by
     // without touching them (the table names every copy, ~4,700 in the world).
     // Each range's change-tracker bit goes with it, so the submission's
@@ -811,6 +834,51 @@ mod tests {
         assert_eq!(look_up(&dwords, 0x40_0010), (106, 0x10));
         assert_eq!(look_up(&dwords, 0).0, 100);
         assert_eq!(owner[BLOCK + 0x40], Some(2));
+    }
+
+    /// A heap's page-table walk runs once per copies' generation: the
+    /// second prepare at the same generation queues nothing. Needs a host
+    /// GPU (a view heap and a shadow copy); passes by without one.
+    #[test]
+    fn a_heap_prepares_its_table_walk_once_per_generation() {
+        use crate::watch::PAGE;
+        let _guard = gpu_test_lock();
+        let (Some(host), Some(_heap)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        // The heap's table names the copy (as a list using title memory
+        // would leave it).
+        let list = host.new_list().unwrap();
+        drop(bind(&list, OURS).expect("a page table"));
+        let mut seen = crate::fx::Map::default();
+        // Tests running in parallel may move the copies' generation between
+        // the two prepares; only a pair sharing one counts.
+        for _ in 0..100 {
+            let before = crate::shadow::generation();
+            let mut first = 0;
+            prepare(OURS, &mut seen, || {}, |_, _, _, _| first += 1);
+            let mut second = 0;
+            prepare(OURS, &mut seen, || {}, |_, _, _, _| second += 1);
+            if before == crate::shadow::generation() {
+                assert!(first > 0, "the first prepare walks the table");
+                assert_eq!(second, 0, "the repeat at the same generation is cached");
+                drop(copy);
+                crate::shadow::unregister(p, p as u64);
+                crate::watch::tests::free(p);
+                // Closed, as recorded lists are before the frame resets them.
+                list.close();
+                list.reset();
+                return;
+            }
+        }
+        panic!("the generation kept moving under 100 prepare pairs");
     }
 
     #[test]

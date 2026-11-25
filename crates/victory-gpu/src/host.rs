@@ -4640,21 +4640,34 @@ impl HostList {
                     // the rewrite below settles for it only when stale.
                     let conflict = batch.table_conflict(heap);
                     let host = batch.host;
+                    // The walk's ranges are queued after the prepare decided
+                    // the table: collected first, so the cache borrow does
+                    // not overlap the batch below (same order, same calls).
+                    let mut adds: Vec<(
+                        std::sync::Arc<crate::shadow::Shadow>,
+                        usize,
+                        usize,
+                        Option<u32>,
+                    )> = Vec::new();
                     crate::memory::prepare(
                         heap,
+                        &mut batch.tables_prepared,
                         || {
                             if let Some((host, v)) = host.zip(conflict) {
                                 host.settle_table_value(v);
                             }
                         },
                         |s, a, l, bit| {
-                            batch.settle_refresh(s, a, l);
-                            batch.add_cached(s, a, l, bit);
-                            batch
-                                .shaders
-                                .push((std::sync::Arc::as_ptr(s) as usize, a, a + l));
+                            adds.push((s.clone(), a, l, bit));
                         },
                     );
+                    for (s, a, l, bit) in &adds {
+                        batch.settle_refresh(s, *a, *l);
+                        batch.add_cached(s, *a, *l, *bit);
+                        batch
+                            .shaders
+                            .push((std::sync::Arc::as_ptr(s) as usize, *a, *a + *l));
+                    }
                     batch.tables.insert(heap);
                     continue;
                 }
@@ -4887,6 +4900,13 @@ struct Batch<'a> {
     /// Table conflict answers this submission, by view heap key (as above:
     /// asked once per heap per submission).
     table_settles: crate::fx::Map<usize, Option<u64>>,
+    /// Page-table preparations done this submission, by view heap key:
+    /// the heap identity and copies' generation they saw. A repeat for
+    /// the same pair finds the same shared table (only this thread
+    /// rewrites tables while the submission prepares, and any replacement
+    /// or copy-set change misses the generation check), so its walk
+    /// would queue nothing new and settle nothing: skipped.
+    tables_prepared: crate::fx::Map<usize, (usize, u64)>,
 }
 
 /// Whether conflict answer `v` (the newest in-flight submission touching
