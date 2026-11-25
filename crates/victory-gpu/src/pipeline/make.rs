@@ -18,9 +18,15 @@
 //! once exhaust the commit charge and contend inside the driver (each takes
 //! seconds), stalling every worker behind them.
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! Passes over the screen (no vertex input, no depth) have workers and a
+//! longer budget of their own: the title fills its lighting tables with
+//! such draws once, at the world's first frame, and behind a world's worth
+//! of pipelines they waited minutes; a run that lost them had no diffuse
+//! light at all.
+//!
+//! shortcut: the budgets (half a second of waiting per title frame, 20 s
+//! for screen passes) are guesses; another pass the title runs only once
+//! and whose pipeline takes longer is lost.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,6 +48,8 @@ pub(crate) struct Pending {
     made: OnceLock<Option<HostPipeline>>,
     /// Its worker was lost to it: it will not be made.
     lost: AtomicBool,
+    /// A pass over the screen (see [`GraphicsState::screen_pass`]).
+    screen: bool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     pub(crate) key: String,
@@ -62,10 +70,12 @@ impl Pending {
             let state = graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
             format!("{shaders:?}\t{state}")
         });
+        let screen = graphics.as_ref().is_some_and(|g| g.screen_pass());
         Pending {
             key,
             shaders,
             graphics,
+            screen,
             queued: AtomicBool::new(false),
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
@@ -234,6 +244,9 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 /// Waiting allowed per title frame, over all threads.
 const BUDGET: Duration = Duration::from_millis(500);
 
+/// The same for passes over the screen (below the title's 30 s watchdog).
+const SCREEN_BUDGET: Duration = Duration::from_secs(20);
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -257,8 +270,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         if p.lost.load(Ordering::Relaxed) {
             return None;
         }
-        // With a world's worth queued there is no use in waiting.
-        if waiting() < 64 {
+        // With a world's worth queued there is no use in waiting, except
+        // for screen passes: their own lane is short and their own budget
+        // long, so they are not dropped behind the storm.
+        if p.screen || waiting() < 64 {
             wait(p, crate::frame::current());
         }
     }
@@ -293,14 +308,17 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` while frame `frame` has budget of its kind left.
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-    static WAITED_US: AtomicU64 = AtomicU64::new(0);
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        WAITED_US.store(0, Ordering::Relaxed);
+    static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
+    static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let kind = usize::from(p.screen);
+    let budget = [BUDGET, SCREEN_BUDGET][kind];
+    let waited = &WAITED_US[kind];
+    if FRAME[kind].swap(frame, Ordering::Relaxed) != frame {
+        waited.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -311,23 +329,30 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Pipelines for the workers: those draws wait for, then those started
-/// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+/// Pipelines for the workers: the screen passes, those draws wait for,
+/// then those started early. One channel: screen workers take lane 0 only,
+/// so a world's worth never buries the few table fills.
+static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 3]>, Condvar) =
+    (Mutex::new([VecDeque::new(), VecDeque::new(), VecDeque::new()]), Condvar::new());
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Hands `p` to the workers (half the logical processors, 2 to 8, and two
+/// for screen passes), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
+    static SCREEN_WORKERS: OnceLock<usize> = OnceLock::new();
+    let screen = p.screen;
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        (0..n).filter(|i| worker(*i)).count()
+        (0..n).filter(|i| worker(*i, false)).count()
     });
-    if workers == 0 {
+    let screen_workers = *SCREEN_WORKERS.get_or_init(|| {
+        (0..2).filter(|i| worker(i + 50, true)).count()
+    });
+    let available = if screen { screen_workers } else { workers };
+    if available == 0 {
         // No worker: made here instead.
         if !p.taken.swap(true, Ordering::Relaxed) {
             p.make();
@@ -335,19 +360,22 @@ fn queue(p: Arc<Pending>, now: bool) {
         }
         return;
     }
+    let lane = if screen { 0 } else if now { 1 } else { 2 };
     let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
-    work.notify_one();
+    lock.lock().unwrap_or_else(|e| e.into_inner())[lane].push_back(p);
+    // Two worker kinds share one channel: wake all so the right kind
+    // takes it (pools are small, at most 8 + 2).
+    work.notify_all();
 }
 
 /// What the workers (by thread) are making.
 static AT_WORK: Mutex<Vec<(u32, Arc<Pending>)>> = Mutex::new(Vec::new());
 
-/// Starts worker `i`; true if it runs.
-fn worker(i: usize) -> bool {
+/// Starts worker `i`, for screen passes or for the others; true if it runs.
+fn worker(i: usize, screen: bool) -> bool {
     let spawned = std::thread::Builder::new()
         .name(format!("victory-pipelines-{i}"))
-        .spawn(work);
+        .spawn(move || work(screen));
     if let Err(e) = &spawned {
         tracing::warn!(error = %e, "no pipeline worker");
     }
@@ -360,26 +388,28 @@ fn worker(i: usize) -> bool {
 #[allow(dead_code)] // No caller yet: the library.rs half is excluded.
 pub(super) fn worker_lost(id: u32) {
     static LOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
-    let mut lost = false;
+    let mut lost = None;
     AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| {
         if w.0 == id {
             w.1.lost.store(true, Ordering::Relaxed);
-            lost = true;
+            lost = Some(w.1.screen);
         }
         w.0 != id
     });
-    if lost {
+    if let Some(screen) = lost {
         // A lost worker never comes back from its compile (it sleeps in the
         // crash handler or stays stopped), so it never reaches its own
         // count below: it is accounted for here instead.
         WAITING.fetch_sub(1, Ordering::Relaxed);
-        worker(LOST.fetch_add(1, Ordering::Relaxed));
+        worker(LOST.fetch_add(1, Ordering::Relaxed), screen);
     }
 }
 
 /// A worker: makes queued pipelines, those draws wait for first, and saves
-/// the cache when idle (first uses of pipelines made before).
-fn work() {
+/// the cache when idle (first uses of pipelines made before). Screen
+/// workers take the screen lane only, so table fills never wait behind a
+/// world's worth; the others take the draw and early lanes in order.
+fn work(screen: bool) {
     // Below the title's own threads (loading, recording).
     // SAFETY: plain calls on our own thread.
     let id = unsafe {
@@ -392,7 +422,12 @@ fn work() {
         let p = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(p) = queues.iter_mut().find_map(VecDeque::pop_front) {
+                let next = if screen {
+                    queues[0].pop_front()
+                } else {
+                    queues[1].pop_front().or_else(|| queues[2].pop_front())
+                };
+                if let Some(p) = next {
                     break p;
                 }
                 let (held, waited) = work
