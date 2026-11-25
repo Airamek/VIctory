@@ -389,7 +389,11 @@ fn create() -> windows::core::Result<Host> {
             "host diagnostics self-id v1: VICTORY_COPY_QUEUE={} VICTORY_GPU_TIMING={} profile={} WARP={} GBV={} DRED={} DEBUG={}",
             crate::switch::on("VICTORY_COPY_QUEUE"),
             crate::switch::on("VICTORY_GPU_TIMING"),
-            if cfg!(debug_assertions) { "debug" } else { "release" },
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
             crate::switch::on("VICTORY_D3D12_WARP"),
             crate::switch::on("VICTORY_D3D12_GBV"),
             crate::switch::on("VICTORY_D3D12_DRED"),
