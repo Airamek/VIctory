@@ -2582,33 +2582,43 @@ impl Host {
     /// len)` (or, with `writing`, writes it): finishes the submissions in
     /// flight whose GPU work writes it (or reads it), so that the step sees
     /// title memory and host copies as if they had run when submitted.
-    pub(crate) fn settle_range(&self, address: usize, len: usize, writing: bool) {
-        if let Some(value) = self
-            .timeline
+    /// The newest submission in flight whose GPU work touches `[address,
+    /// address + len)` (or reads it, with `writing`), if any: asked once
+    /// per submission by [`Batch::settle`] (the set in flight does not
+    /// change while the submission prepares: its own push comes after,
+    /// under the submission lock, and finishing only drops entries whose
+    /// values would wait as no-ops).
+    fn conflict_range(&self, address: usize, len: usize, writing: bool) -> Option<u64> {
+        self.timeline
             .conflict(address, address.saturating_add(len), writing)
-        {
-            #[cfg(feature = "diagnostics")]
-            let block = std::time::Instant::now();
-            self.settle(value);
-            #[cfg(feature = "diagnostics")]
-            if timing() {
-                starve::note_block(starve::CONFLICT, block.elapsed().as_micros() as u64);
-            }
+    }
+
+    /// Finishes the submissions in flight a conflict answer names, noting
+    /// a real wait for the diagnostics timing.
+    #[cfg(feature = "diagnostics")]
+    fn settle_noted(&self, value: u64, what: usize) {
+        let block = std::time::Instant::now();
+        self.settle(value);
+        if timing() {
+            starve::note_block(what, block.elapsed().as_micros() as u64);
         }
     }
 
-    /// Before view heap `key`'s page table is rewritten: finishes the
-    /// submissions in flight whose shaders read it.
-    fn settle_table(&self, key: usize) {
-        if let Some(value) = self.timeline.table_conflict(key) {
-            #[cfg(feature = "diagnostics")]
-            let block = std::time::Instant::now();
-            self.settle(value);
-            #[cfg(feature = "diagnostics")]
-            if timing() {
-                starve::note_block(starve::STAGING_TABLE, block.elapsed().as_micros() as u64);
-            }
-        }
+    /// The newest submission in flight whose shaders read view heap `key`'s
+    /// page table, if any: asked once per submission (as
+    /// [`Host::conflict_range`], the set in flight is fixed while the
+    /// submission prepares).
+    fn table_conflict(&self, key: usize) -> Option<u64> {
+        self.timeline.table_conflict(key)
+    }
+
+    /// Before view heap `key`'s page table is rewritten for a conflict
+    /// asked by [`Batch::table_conflict`]: finishes those submissions.
+    fn settle_table_value(&self, value: u64) {
+        #[cfg(feature = "diagnostics")]
+        self.settle_noted(value, starve::STAGING_TABLE);
+        #[cfg(not(feature = "diagnostics"))]
+        self.settle(value);
     }
 
     /// Runs `signal` once every submission made so far has finished.
@@ -4625,12 +4635,16 @@ impl HostList {
                     // page table may write any copy it names (the pages they
                     // wrote are known only once they have run): the
                     // submission counts as writing them all.
+                    // The table's readers do not change mid-submission, so
+                    // its conflict is asked once per heap per submission;
+                    // the rewrite below settles for it only when stale.
+                    let conflict = batch.table_conflict(heap);
                     let host = batch.host;
                     crate::memory::prepare(
                         heap,
                         || {
-                            if let Some(host) = host {
-                                host.settle_table(heap);
+                            if let Some((host, v)) = host.zip(conflict) {
+                                host.settle_table_value(v);
                             }
                         },
                         |s, a, l, bit| {
@@ -4859,6 +4873,30 @@ struct Batch<'a> {
     /// submissions); unmapped pages are never remembered (the title may map
     /// them), so this is never cleared mid-submission.
     committed: crate::fx::Set<usize>,
+    /// The newest in-flight submission value waited for this submission:
+    /// a conflict answer at or below it names only finished submissions,
+    /// so no wait is needed (the submission waits in order, finishing
+    /// everything up to each value it waits for).
+    settled: u64,
+    /// Conflict answers this submission, by range and mode: the set in
+    /// flight does not change while the submission prepares (its own push
+    /// comes after, under the submission lock, and finishing only drops
+    /// entries whose values wait as no-ops), so a repeated range scans
+    /// the timeline once.
+    range_settles: crate::fx::Map<(usize, usize, bool), Option<u64>>,
+    /// Table conflict answers this submission, by view heap key (as above:
+    /// asked once per heap per submission).
+    table_settles: crate::fx::Map<usize, Option<u64>>,
+}
+
+/// Whether conflict answer `v` (the newest in-flight submission touching
+/// a range, if any) still needs a wait after `settled`, and the new
+/// settled max: waits are only for submissions not waited for yet.
+/// Pure (unit-tested): the wait itself stays with the caller.
+fn wait_for(settled: &mut u64, v: Option<u64>) -> Option<u64> {
+    let v = v.filter(|&v| v > *settled)?;
+    *settled = v;
+    Some(v)
 }
 
 /// Entries that pay back data-parallel copies: at least this many ranges
@@ -4885,20 +4923,43 @@ fn copy_threads(entries: usize) -> usize {
 impl Batch<'_> {
     /// Before a step reads (or, with `writing`, writes) title memory
     /// `[address, address + len)`: earlier submissions whose GPU work
-    /// writes (or reads) it are finished first.
-    fn settle(&self, address: usize, len: usize, writing: bool) {
-        if let Some(host) = self.host {
-            host.settle_range(address, len, writing);
+    /// writes (or reads) it are finished first. The conflict is asked once
+    /// per range per submission (see `range_settles`); a repeat waits only
+    /// for a submission newer than everything waited for so far.
+    fn settle(&mut self, address: usize, len: usize, writing: bool) {
+        let Some(host) = self.host else { return };
+        let to = address.saturating_add(len);
+        let v = *self
+            .range_settles
+            .entry((address, to, writing))
+            .or_insert_with(|| host.conflict_range(address, len, writing));
+        if let Some(v) = wait_for(&mut self.settled, v) {
+            #[cfg(feature = "diagnostics")]
+            host.settle_noted(v, starve::CONFLICT);
+            #[cfg(not(feature = "diagnostics"))]
+            host.settle(v);
         }
+    }
+
+    /// The newest submission in flight whose shaders read view heap `key`'s
+    /// page table, asked once per submission (see `table_settles`).
+    fn table_conflict(&mut self, key: usize) -> Option<u64> {
+        let host = self.host?;
+        *self
+            .table_settles
+            .entry(key)
+            .or_insert_with(|| host.table_conflict(key))
     }
 
     /// Before a refresh of `[address, address + len)` of `shadow`: as
     /// [`Batch::settle`], but a submission whose shaders write the range
     /// through the same copy is waited for only if the title wrote a page
     /// of the overlap since the copy took it (the world's big heap is both
-    /// refreshed and written by shaders in most submissions).
+    /// refreshed and written by shaders in most submissions). The answer
+    /// depends on title writes racing the submission, so it is asked every
+    /// time; only the wait itself is skipped when already covered.
     fn settle_refresh(
-        &self,
+        &mut self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
@@ -4909,6 +4970,7 @@ impl Batch<'_> {
         if let Some(value) = host
             .timeline
             .refresh_conflict(copy, address, to, |a, b| shadow.stale(a, b))
+            && wait_for(&mut self.settled, Some(value)).is_some()
         {
             host.settle(value);
         }
@@ -6926,6 +6988,24 @@ mod batch {   // `mod tests` is already taken at the top of this file
             ),
             "both overflowing steps survive unmerged"
         );
+    }
+
+    /// A conflict answer waits only past what was waited for: the first
+    /// conflict of a submission waits, a repeat or an older one does not,
+    /// and a newer one waits and moves the mark. Needs no GPU: the wait
+    /// itself stays with the caller.
+    #[test]
+    fn waits_cover_everything_up_to_the_newest_one_waited_for() {
+        let mut settled = 0;
+        assert_eq!(wait_for(&mut settled, None), None);
+        assert_eq!(settled, 0, "nothing in flight: nothing waited");
+        assert_eq!(wait_for(&mut settled, Some(5)), Some(5));
+        assert_eq!(settled, 5);
+        assert_eq!(wait_for(&mut settled, Some(3)), None, "already finished");
+        assert_eq!(wait_for(&mut settled, Some(5)), None, "waited for");
+        assert_eq!(wait_for(&mut settled, Some(7)), Some(7));
+        assert_eq!(settled, 7);
+        assert_eq!(wait_for(&mut settled, None), None);
     }
 
     /// Ranges of one copy stay disjoint: what a range overlaps, or lies
