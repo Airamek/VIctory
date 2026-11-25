@@ -764,11 +764,12 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
 }
 
-/// Whether each list of a submission is timed on its own, and slow ones are
-/// logged with their commands (`VICTORY_GPU_TIMING`, diagnostics builds; the
-/// commands are noted with `VICTORY_D3D12_DRED` or the timing on).
-/// Timing keeps the normal cuts grouping for stamps (the lists run as they
-/// do with the timing off); per-list alone execution is opt-in (below).
+/// Whether the GPU time of each list's noted commands is read back, and slow
+/// lists are logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
+/// builds; the commands are noted with `VICTORY_D3D12_DRED` or the timing on).
+/// Timing keeps the normal cuts grouping for execution (the lists run as they
+/// do with the timing off); per-list alone execution, which is also what lets
+/// a device removal name the list it happened in, is opt-in (below).
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -2235,19 +2236,43 @@ impl HostList {
         let Some((_, back)) = self.stamps() else {
             return (Vec::new(), 0.0, 0.0, total_notes);
         };
+        // Only what this list wrote: the note stamps `0..=count` ((count + 1)
+        // qwords) plus the busy pair at `BUSY_START` (2 qwords). The 128 KB
+        // buffer is never mapped or copied whole; diagnostics-only path.
+        let needed = count as usize + 1;
         let mut data = std::ptr::null_mut();
-        // The note stamps plus the two busy slots at the end of the buffer.
-        let end = u64::from(STAMPS) * 8;
-        let range = D3D12_RANGE { Begin: 0, End: end as usize };
-        // SAFETY: a read-back buffer the finished list resolved into.
-        let stamps: Vec<u64> = unsafe {
+        // SAFETY: a read-back buffer the finished list resolved into; both
+        // ranges lie inside it (the resolves above wrote them).
+        let prefix: Vec<u64> = unsafe {
+            let range = D3D12_RANGE {
+                Begin: 0,
+                End: needed * 8,
+            };
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
                 return (Vec::new(), 0.0, 0.0, total_notes);
             }
-            let s = std::slice::from_raw_parts(data.cast::<u64>(), STAMPS as usize).to_vec();
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), needed).to_vec();
             back.Unmap(0, None);
             s
         };
+        // SAFETY: the same read-back buffer, offset into its busy slots.
+        let busy_pair: [u64; 2] = unsafe {
+            let range = D3D12_RANGE {
+                Begin: BUSY_START as usize * 8,
+                End: STAMPS as usize * 8,
+            };
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return (Vec::new(), 0.0, 0.0, total_notes);
+            }
+            let s = std::slice::from_raw_parts(
+                data.cast::<u64>().add(BUSY_START as usize),
+                2,
+            )
+            .to_vec();
+            back.Unmap(0, None);
+            [s[0], s[1]]
+        };
+        let stamps = prefix;
         let to_ms = |ticks: u64| ticks as f64 * 1e3 / frequency.max(1) as f64;
         let mut times: Vec<(f64, String)> = (0..count as usize)
             .map(|i| {
@@ -2261,7 +2286,7 @@ impl HostList {
             .sum::<f64>()
             * 1e3
             / frequency.max(1) as f64;
-        let busy_ticks = stamps[BUSY_END as usize].saturating_sub(stamps[BUSY_START as usize]);
+        let busy_ticks = busy_pair[1].saturating_sub(busy_pair[0]);
         // An unwritten busy pair (no start/end recorded) reads zero: no busy.
         let busy = if busy_ticks == 0 { 0.0 } else { to_ms(busy_ticks) };
         let residual = (busy - noted).max(0.0);
@@ -2301,10 +2326,12 @@ impl HostList {
             unsafe {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
-                // The per-submission busy pair's end: with the per-list start
-                // in `reset`, each submission's busy is its last end minus its
-                // first start (same GPU clock across heaps); the gap to the
-                // CPU wall is idle, the ratio utilisation.
+                // The list's busy-pair end: with the start in `reset`
+                // (`emit_busy_start`), the submission's reported busy is the sum
+                // of its lists' pairs (same GPU clock across heaps). Prelude
+                // lists are not bracketed, so their transition work stays out
+                // of busy; the gap to the CPU wall is idle plus that untimed
+                // work (and any overlap), the ratio busy over wall.
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, BUSY_END);
                 self.list.ResolveQueryData(
                     heap,
@@ -4332,9 +4359,10 @@ impl Host {
 
 /// With `VICTORY_GPU_TIMING`: adds one list's noted commands to the cost
 /// table, naming its slowest ones when its GPU busy took over 50 ms
-/// (diagnostics). `busy_ms` is the list's GPU time (stamps end minus start),
-/// `residual_ms` the busy not in any note, `dropped` the notes past the
-/// stamps, `wall_ms` the list's share of its submission's CPU wall.
+/// (diagnostics). `busy_ms` is the list's GPU time (its busy-pair end minus
+/// start, prelude work excluded), `residual_ms` the busy not in any note,
+/// `dropped` the notes past the stamps, `wall_ms` the list's share of its
+/// submission's CPU wall.
 #[cfg(feature = "diagnostics")]
 fn report_list(times: &[(f64, String)], busy_ms: f64, residual_ms: f64, dropped: usize, wall_ms: f64) {
     costs::add(times, residual_ms, dropped);
@@ -4441,9 +4469,10 @@ fn group_members(firsts: &[usize], cuts: &[usize]) -> Vec<Vec<usize>> {
 
 /// With `VICTORY_GPU_TIMING`: the GPU time the noted commands took since the
 /// last report, added up by what they ran, so that a frame's cost can be read
-/// off by pipeline (diagnostics). Percentages are over GPU busy (the
-/// per-submission Begin/EndQuery pair's end minus start); the residual is the
-/// busy in no note, per list and per frame. Log-only, in the frame-rate
+/// off by pipeline (diagnostics). Percentages are over summed GPU busy (the
+/// sum of the lists' busy-pair end minus start; prelude lists hold transitions
+/// only and are not bracketed, so their GPU time is excluded); the residual is
+/// the busy in no note, per list and per frame. Log-only, in the frame-rate
 /// line's companion report.
 #[cfg(feature = "diagnostics")]
 mod costs {
@@ -4489,9 +4518,11 @@ mod costs {
         }
     }
 
-    /// Adds one submission piece's GPU busy and CPU wall milliseconds: the
-    /// busy pair (last end minus first start) and the `ExecuteCommandLists`
-    /// to fence-waited wall. The gap is idle; the ratio is utilisation.
+    /// Adds one submission piece's summed GPU busy (the sum of its lists'
+    /// busy pairs, prelude work excluded) and CPU wall milliseconds (the
+    /// `ExecuteCommandLists` to fence-waited wall). The gap is wall minus
+    /// summed busy (idle plus untimed prelude work and any overlap); the ratio
+    /// is busy over wall.
     pub(super) fn add_submission(busy_ms: f64, wall_ms: f64) {
         let mut tally = TALLY.lock().unwrap_or_else(|e| e.into_inner());
         let tally = tally.get_or_insert_with(Tally::default);
@@ -4501,24 +4532,39 @@ mod costs {
     }
 
     /// Logs the biggest kind-then-pipeline rows per frame since the last
-    /// call (16 rows), with the residual, busy/gap/utilisation and the
+    /// call (16 rows), with the residual, summed-busy/gap/utilisation and the
     /// timeline-depth histogram and per-cause blocking milliseconds.
+    /// Starvation counters are drained even when no lists were timed, so an
+    /// early return never carries them into the next period.
     pub(super) fn log(frames: f64) {
+        let (hist, block) = super::starve::take();
         let Some(mut tally) = TALLY.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            log_starvation(&hist, &block, frames);
             return;
         };
         if tally.lists == 0 {
+            log_starvation(&hist, &block, frames);
             return;
         }
         let mut items: Vec<((String, String), Row)> = tally.by_row.drain().collect();
         items.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
-        let busy = tally.busy.max(1e-6);
+        // Percentages below divide by summed busy: guard the near-zero case
+        // instead of scaling by `max(1e-6)`, which would report huge shares
+        // for a ~zero busy.
+        let busy_for_pct = if tally.busy > 1e-9 { tally.busy } else { 0.0 };
+        let pct_of_busy = |ms: f64| {
+            if busy_for_pct > 0.0 {
+                100.0 * ms / busy_for_pct
+            } else {
+                0.0
+            }
+        };
         let per_frame = |v: f64| v / frames;
         let commands: u64 = items.iter().map(|(_, (n, _, _))| *n).sum();
         let gap = (tally.wall - tally.busy).max(0.0);
         let util = if tally.wall > 0.0 { 100.0 * tally.busy / tally.wall } else { 0.0 };
         tracing::info!(
-            "GPU cost by pipeline: {:.1} ms/frame busy over {:.0} lists in {:.0} submissions ({:.0} commands/frame; wall {:.1} ms/frame, gap {:.1}, util {:.0}%; noted {:.1}, residual {:.1}, dropped {:.0})",
+            "GPU cost by pipeline: {:.1} ms/frame summed busy over {:.0} lists in {:.0} submissions ({:.0} commands/frame; wall {:.1} ms/frame, gap {:.1}, util {:.0}%; noted {:.1}, residual {:.1}, dropped {:.0})",
             per_frame(tally.busy),
             per_frame(tally.lists as f64),
             per_frame(tally.submissions as f64),
@@ -4535,13 +4581,19 @@ mod costs {
             tracing::info!(
                 "{:.2} ms/frame ({:.0}% of busy, {:.3} ms each, {:.1} us/draw, {:.1}/frame): {kind} {label}",
                 per_frame(*ms),
-                100.0 * ms / busy,
+                pct_of_busy(*ms),
                 ms / (*n).max(1) as f64,
                 us_per_draw,
                 per_frame(*n as f64)
             );
         }
-        let (hist, block) = super::starve::take();
+        log_starvation(&hist, &block, frames);
+    }
+
+    /// Logs the drained starvation histogram and per-cause blocking
+    /// milliseconds per frame (diagnostics, timing). Called from [`log`]
+    /// even when no lists were timed.
+    fn log_starvation(hist: &[u64; super::starve::DEPTHS], block: &[u64; super::starve::CAUSES], frames: f64) {
         let hist_line: Vec<String> = hist
             .iter()
             .enumerate()
