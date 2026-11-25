@@ -48,8 +48,6 @@ pub(crate) struct Touches {
     pub(crate) labels: Vec<(usize, usize)>,
     /// What it reads (host copies and textures brought up to date for it).
     pub(crate) reads: Vec<(usize, usize)>,
-    /// Shared texture upload buffers that the GPU may still read.
-    pub(crate) staging: std::collections::HashSet<usize>,
     /// Title-memory page tables (by view heap key) its shaders read.
     pub(crate) tables: std::collections::HashSet<usize>,
 }
@@ -62,7 +60,6 @@ struct Entry<W> {
     labels: Ranges,
     shaders: Vec<(usize, usize, usize)>,
     reads: Ranges,
-    staging: std::collections::HashSet<usize>,
     tables: std::collections::HashSet<usize>,
     /// Title fence signals the title queued after it.
     signals: Vec<Signal>,
@@ -97,7 +94,6 @@ impl<W> Timeline<W> {
             shaders,
             labels,
             reads,
-            staging,
             tables,
         } = touches;
         let writes = shaders
@@ -110,7 +106,6 @@ impl<W> Timeline<W> {
             labels: Ranges::new(labels),
             shaders,
             reads: Ranges::new(reads),
-            staging,
             tables,
             signals: Vec::new(),
             work: Some(work),
@@ -151,15 +146,6 @@ impl<W> Timeline<W> {
             .iter()
             .rev()
             .find(|e| e.writes.overlaps(from, to) || writing && e.reads.overlaps(from, to))
-            .map(|e| e.value)
-    }
-
-    /// The most recent submission still reading this host staging allocation.
-    pub(crate) fn staging_conflict(&self, staging: usize) -> Option<u64> {
-        self.entries()
-            .iter()
-            .rev()
-            .find(|e| e.staging.contains(&staging))
             .map(|e| e.value)
     }
 
@@ -346,21 +332,5 @@ mod tests {
         assert_eq!(t.refresh_conflict(1, 0x8000, 0x9001, clean), Some(1));
         t.finish(2, |()| {});
         assert_eq!(t.conflict(0x1000, 0x2000, true), None);
-
-        // Shared texture staging buffers track the newest in-flight reader.
-        let staging_a = 0xDEAD_0000usize;
-        let staging_b = 0xDEAD_1000usize;
-        let mut t1 = Touches::default();
-        t1.staging.insert(staging_a);
-        let mut t2 = Touches::default();
-        t2.staging.insert(staging_a);
-        t2.staging.insert(staging_b);
-        t.push(3, t1, ());
-        t.push(4, t2, ());
-        assert_eq!(t.staging_conflict(staging_a), Some(4));
-        assert_eq!(t.staging_conflict(staging_b), Some(4));
-        assert_eq!(t.staging_conflict(0xDEAD_2000), None);
-        t.finish(4, |()| {});
-        assert_eq!(t.staging_conflict(staging_a), None);
     }
 }

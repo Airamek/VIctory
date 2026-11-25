@@ -423,9 +423,9 @@ fn peek(when: &str) {
     }
 }
 
-/// In a listed frame: copies an indirect execution's records (`args`:
-/// buffer, offset; in the indirect-argument state) and its count (in the
-/// unordered-access state unless in the same buffer) to readback memory,
+/// In a listed frame: copies an indirect execution's records (`args`: the
+/// list's argument buffer and offset, in the indirect-argument state) and
+/// its count (a title buffer's copy) to readback memory,
 /// logged once the list has run: how many records ask for work, and the
 /// first ones.
 pub(crate) fn read_indirect(
@@ -434,6 +434,7 @@ pub(crate) fn read_indirect(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, max): (u32, u32, u32),
     name: String,
+    always: bool,
 ) {
     struct Readback(ID3D12Resource);
     // SAFETY: D3D12 objects are free-threaded.
@@ -456,7 +457,6 @@ pub(crate) fn read_indirect(
     let mut buffer: Option<ID3D12Resource> = None;
     let l = &list.list;
     use crate::host::transition;
-    use windows::core::Interface;
     let (arg_state, copy) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
     // SAFETY: plain creation; an open list and live buffers in the states
     // named, put back after the copies.
@@ -472,15 +472,8 @@ pub(crate) fn read_indirect(
         l.ResourceBarrier(&[transition(args.0, arg_state, copy)]);
         l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
         if let Some((c, at)) = count {
-            let same = c.as_raw() == args.0.as_raw();
-            let state = if same { copy } else { D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
-            if !same {
-                l.ResourceBarrier(&[transition(c, state, copy)]);
-            }
+            // A title buffer's copy: never transitioned, the read promotes it.
             l.CopyBufferRegion(&buffer, len, c, at, 4);
-            if !same {
-                l.ResourceBarrier(&[transition(c, copy, state)]);
-            }
         }
         l.ResourceBarrier(&[transition(args.0, copy, arg_state)]);
         list.keep(&buffer);
@@ -488,7 +481,8 @@ pub(crate) fn read_indirect(
         let counted = count.is_some();
         list.defer_after(move || {
             // Recorded ahead: logged if the frame running it is listed.
-            if !listed(crate::queue::presented() + 1) {
+            let frame = crate::queue::presented() + 1;
+            if !always && !listed(frame) {
                 return;
             }
             let mut data = std::ptr::null_mut();
@@ -513,7 +507,7 @@ pub(crate) fn read_indirect(
             let shown: Vec<&[u32]> = (0..records.min(4)).map(first).collect();
             tracing::info!(
                 target: "victory_gpu::trace",
-                "indirect kind {kind} max {max} count {n:?}: {busy} of {records} records with work, {total} in all; first {shown:?} {name}"
+                "indirect kind {kind} max {max} count {n:?}: {busy} of {records} records with work, {total} in all; first {shown:?} {name} frame {frame}"
             );
             buffer.0.Unmap(0, None);
         });
@@ -629,12 +623,20 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
+            // The PNG drops alpha: its range and how many texels have each
+            // channel zero are logged.
+            let (mut low, mut high, mut zero) = ([255u8; 4], [0u8; 4], [0usize; 4]);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
+                    for c in 0..4 {
+                        (low[c], high[c]) = (low[c].min(p[c]), high[c].max(p[c]));
+                        zero[c] += usize::from(p[c] == 0);
+                    }
                     out.extend([p[0], p[1], p[2], 255]);
                 }
             }
+            tracing::info!(format, ?low, ?high, ?zero, texels = w * h, "target values (8-bit, RGBA)");
             return Some(out);
         }
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
@@ -658,6 +660,11 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         9..=10 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
         11..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
         33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
+        // Signed 32-bit RGBA and RG color channels.
+        4 => (16, Box::new(move |b| [0, 1, 2].map(|i| u32_at(b, i) as i32 as f32))),
+        18 => (8, Box::new(move |b| {
+            [u32_at(b, 0) as i32 as f32, u32_at(b, 1) as i32 as f32, 0.0]
+        })),
         1..=2 => (16, Box::new(move |b| {
             [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
         })),
@@ -713,6 +720,27 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     Some(out)
 }
 
+#[test]
+fn signed_32_bit_color_captures_decode_negative_components() {
+    let rg = [-(1 << 30), 1 << 29, i32::MAX, 1 << 28, -(1 << 29), i32::MAX];
+    let rgba = [
+        -(1 << 30), 1 << 29, -(1 << 28), i32::MAX, i32::MAX,
+        1 << 28, -(1 << 29), 1 << 29, i32::MAX, i32::MAX,
+    ];
+    let rg: Vec<_> = rg.into_iter().flat_map(i32::to_le_bytes).collect();
+    let rgba: Vec<_> = rgba.into_iter().flat_map(i32::to_le_bytes).collect();
+    assert_eq!(
+        [
+            to_rgba(DXGI_FORMAT_R32G32_SINT.0 as u32, 1, 2, 12, &rg),
+            to_rgba(DXGI_FORMAT_R32G32B32A32_SINT.0 as u32, 1, 2, 20, &rgba),
+        ],
+        [
+            Some(vec![0, 127, 0, 255, 63, 0, 0, 255]),
+            Some(vec![0, 127, 0, 255, 63, 0, 127, 255]),
+        ]
+    );
+}
+
 /// Pixels per side of the grid [`probe`] reads.
 const GRID: u32 = 4;
 /// Bytes between the grid's pixels in the readback buffer (placement
@@ -748,20 +776,29 @@ pub(crate) fn probe(
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
     };
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation; an open list; locations naming live resources.
-    unsafe {
-        device
-            .CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
+    // One buffer for every present: each is waited for before the next
+    // (made and released per present, it cost a kernel call per frame).
+    static BUFFER: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    let buffer = BUFFER
+        .get_or_init(|| {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            unsafe {
+                device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+            }
             .ok()?;
-        let buffer = buffer?;
+            buffer
+        })
+        .clone()?;
+    // SAFETY: an open list; locations naming live resources.
+    unsafe {
         for i in 0..GRID * GRID {
             let (x, y) = (
                 (2 * (i % GRID) + 1) * d.Width as u32 / (2 * GRID),
