@@ -93,6 +93,14 @@ compiles none of those either; the library belongs to the GPU and driver it
 was made on. Run again, it skips what is there in seconds; stopped
 early, it keeps what it made.
 
+For a build to keep rather than iterate on, `--profile ship` adds link-time
+optimisation across the whole crate graph (`target\shipictory.exe`). It
+compiles several times slower than `--release` for the same feature set and
+the same outputs; two other game ports measured 5-10% off their CPU frame
+time from the same setting, which here would help shader translation at
+first use, `translate --cache`, page comparisons and BCPack. It does not
+speed up GPU work or the driver's pipeline compiles.
+
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
 [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
