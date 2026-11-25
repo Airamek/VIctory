@@ -38,6 +38,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod page_batch;
+
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
 /// made the checks of the world's big buffers cost more than the copies
 /// they saved.
@@ -613,14 +615,13 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         n == 0 || info.State != MEM_COMMIT
     };
     let mut taken = Vec::with_capacity(pages.len());
-    let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
+    // Normalize alias pages before grouping protection calls. Exclude
+    // every active writer under the same guard lock as before.
+    let pages = page_batch::eligible(pages, &g.busy);
     // Cached holes cost no system call: still taken (read as zeros), and
     // only a remap makes them retried.
     let mut fresh = Vec::with_capacity(pages.len());
-    for &p in pages {
-        if busy(p) {
-            continue;
-        }
+    for p in pages {
         if g.holes.contains(&p) {
             taken.push(p);
         } else {
@@ -927,6 +928,31 @@ pub(crate) mod tests {
     pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn overlapping_kernel_writers_keep_pages_open_until_both_finish() {
+        let p = pool(6);
+        let t = track(p, 6 * PAGE, true).expect("tracked pool");
+        assert_eq!(t.take(p, p + 6 * PAGE), [(p, p + 6 * PAGE)]);
+        let first = writing(p + PAGE, 3 * PAGE);
+        let second = writing(p + 2 * PAGE, 3 * PAGE);
+        let duplicate = writing(p + 2 * PAGE, 3 * PAGE);
+        let extra = [writing(p, 1), writing(p + 5 * PAGE, 1), writing(p + 5 * PAGE, 1)];
+        t.take(p, p + 6 * PAGE);
+        assert!((0..6).all(|i| t.changed(p / PAGE + i)));
+        drop(first);
+        drop(second);
+        drop(extra);
+        t.take(p, p + 6 * PAGE);
+        for i in 0..6 {
+            assert_eq!(t.changed(p / PAGE + i), (2..5).contains(&i));
+        }
+        drop(duplicate);
+        t.take(p, p + 6 * PAGE);
+        assert!((0..6).all(|i| !t.changed(p / PAGE + i)));
+        drop(t);
+        free(p);
     }
 
     /// Everything is changed at first; after taking, only what is written
