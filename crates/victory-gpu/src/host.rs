@@ -98,6 +98,21 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Copy-queue counters for the frame-rate line (diagnostics,
+/// `VICTORY_COPY_QUEUE`): copy-engine submissions, textures they uploaded,
+/// and DIRECT Waits on the copy fence since the last frame-rate line, plus
+/// the last copy fence value signalled. Wall time includes this work (the
+/// DIRECT Wait counts as waiting for the GPU) while `VICTORY_GPU_TIMING`
+/// stamps DIRECT lists only, so the line reconciles wall vs busy.
+#[cfg(feature = "diagnostics")]
+static COPY_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static COPY_UPLOADED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static COPY_WAITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static COPY_SIGNALLED: AtomicU64 = AtomicU64::new(0);
+
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
@@ -1096,6 +1111,33 @@ pub(crate) fn copy_enabled() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_COPY_QUEUE"))
 }
 
+/// The copy-queue suffix for the frame-rate line (diagnostics): uploads
+/// moved to the COPY queue, the copy fence value, and the DIRECT Wait
+/// count over `frames` (the log period's frames), so wall vs busy
+/// reconciles from the log alone. Empty unless the gate is on, leaving
+/// the line as before. Copy work is unstamped by `VICTORY_GPU_TIMING`
+/// (busy covers DIRECT lists only) while the wall time includes it (the
+/// DIRECT Wait counts as waiting for the GPU): the suffix says so rather
+/// than hiding it.
+#[cfg(feature = "diagnostics")]
+fn copy_log_note(frames: f64) -> String {
+    let frames = frames.max(1.0);
+    let submissions = COPY_SUBMISSIONS.swap(0, Ordering::Relaxed);
+    let uploaded = COPY_UPLOADED.swap(0, Ordering::Relaxed);
+    let waits = COPY_WAITS.swap(0, Ordering::Relaxed);
+    if !copy_enabled() {
+        return String::new();
+    }
+    let signalled = COPY_SIGNALLED.load(Ordering::Relaxed);
+    let completed = host().map(|h| h.copy_completed()).unwrap_or(u64::MAX);
+    format!(
+        "; copy queue: {:.1} textures/frame uploaded on COPY in {} submissions, copy fence signalled {signalled} completed {completed}, {:.1} DIRECT waits/frame (copy work unstamped by VICTORY_GPU_TIMING: busy excludes copy, wall includes it)",
+        uploaded as f64 / frames,
+        submissions,
+        waits as f64 / frames,
+    )
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     /// Which queue the list runs on.
@@ -2058,6 +2100,11 @@ impl Host {
                     1
                 ));
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                COPY_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
+                COPY_SIGNALLED.store(copy_value, Ordering::Relaxed);
+            }
             // The DIRECT side makes the uploaded textures readable after the
             // Wait below: every texture the COPY list leaves in COPY_DEST
             // starts the first DIRECT run in SHADER_RESOURCE, so its prelude
@@ -2073,6 +2120,8 @@ impl Host {
                 for copy in &uploaded {
                     first.ensure_shader_resource(copy);
                 }
+                #[cfg(feature = "diagnostics")]
+                COPY_UPLOADED.fetch_add(uploaded.len() as u64, Ordering::Relaxed);
             }
         }
         let mut repeats = Vec::new();
@@ -2185,6 +2234,8 @@ impl Host {
                     && let (Some(copy_fence), true) = (&self.copy_fence, true)
                 {
                     let _ = self.queue.Wait(copy_fence, copy_value);
+                    #[cfg(feature = "diagnostics")]
+                    COPY_WAITS.fetch_add(1, Ordering::Relaxed);
                 }
                 self.queue.ExecuteCommandLists(group);
                 self.queue.Signal(&self.fence, *submitted)
@@ -4945,12 +4996,19 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            // Copy-queue counters (diagnostics, gate on): appended to the
+            // fps line so wall vs busy reconciles from the log alone.
+            // Otherwise empty, leaving the line as before.
+            #[cfg(feature = "diagnostics")]
+            let copy_note = copy_log_note(self.copy_stats_frames as f64);
+            #[cfg(not(feature = "diagnostics"))]
+            let copy_note = String::new();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} ms host \
                  wait for submissions; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
+                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame{copy_note}",
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
