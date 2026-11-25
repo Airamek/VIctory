@@ -76,6 +76,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Of them, large ones by table: the records each was made from and
+    /// the first dynamic slot. A shader that reads less of one takes the
+    /// same copy, by prefix.
+    large_tables: LargeTables,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -240,6 +244,33 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// Tables from this many entries on are made once for every length shaders
+/// read them to: copies of the same table at several lengths took most of
+/// the dynamic slots, and heavy frames ran out of them.
+const LARGE: u32 = 64;
+
+/// Large tables made afresh in this list, by table: the records each copy
+/// was made from and its first dynamic slot.
+type LargeTables = std::collections::HashMap<u64, Vec<(Vec<[u32; 3]>, u32)>>;
+
+/// The longest `table` of `heap` was asked for, now for `n` entries.
+fn longest(heap: &crate::descriptor::Heap, table: u64, n: u32) -> u32 {
+    static LONGEST: std::sync::Mutex<Option<std::collections::HashMap<u64, u32>>> =
+        std::sync::Mutex::new(None);
+    let mut all = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
+    let most = all.get_or_insert_default().entry(table).or_insert(n);
+    *most = (*most).max(n);
+    if heap.index(table + u64::from(*most - 1) * 32).is_some() { *most } else { n }
+}
+
+/// A large table's copy reused for a shorter read: the first copy whose
+/// records cover `needed` entries and match what is there now, by prefix.
+fn large_reuse(made: &[(Vec<[u32; 3]>, u32)], records: &[[u32; 3]], needed: usize) -> Option<u32> {
+    made.iter()
+        .find(|(r, _)| r.len() >= needed && r[..needed] == records[..needed.min(records.len())])
+        .map(|&(_, first)| first)
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -315,6 +346,7 @@ impl State {
     pub(crate) fn cut(&mut self, list: &HostList) {
         self.host_state_lost();
         self.fresh_tables.clear();
+        self.large_tables.clear();
         self.root_slots.clear();
         self.memory = None;
         let fixed = std::mem::take(&mut self.fixed);
@@ -1293,6 +1325,9 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            // Shaders read such a table to many lengths, and a copy for each
+            // ran out of slots: the longest seen serves all.
+            let n = if n >= LARGE { longest(heap, table, n) } else { n };
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -1303,6 +1338,36 @@ impl State {
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
                 (table, h.finish())
+            };
+            // A large table read to fewer entries reuses the copy by prefix:
+            // its first `needed` records match what is there now.
+            let large_records: Option<Vec<[u32; 3]>> = if n >= LARGE {
+                let records: Vec<[u32; 3]> = (0..n)
+                    // SAFETY: descriptor slots in title memory.
+                    .map(|k| unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() })
+                    .collect();
+                let needed = entries
+                    .iter()
+                    .map(|u| u.table_offset_dwords as usize / 8 + 1)
+                    .max()
+                    .unwrap_or(1);
+                if let Some(first) = large_reuse(
+                    self.large_tables.get(&table).map_or(&[], Vec::as_slice),
+                    &records,
+                    needed,
+                ) {
+                    for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+                        if let Some(view) = crate::descriptor::view(handle) {
+                            readable(list, u, &view, true);
+                        }
+                    }
+                    made.push((slot, first * 32));
+                    continue;
+                }
+                Some(records)
+            } else {
+                None
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -1324,6 +1389,9 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
+            if let Some(records) = large_records {
+                self.large_tables.entry(table).or_default().push((records, first));
+            }
             list.keep_dynamic(heap.id(), first, n);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
@@ -2198,6 +2266,23 @@ mod tests {
 
         state.set_root_signature(true, std::ptr::null());
         assert!(state.compute.is_empty());
+    }
+
+    /// Large table copies are reused by record prefix: a shorter read with
+    /// matching records hits, a longer one or changed records misses.
+    #[test]
+    fn large_table_copies_are_reused_by_record_prefix() {
+        let made = vec![
+            (vec![[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]], 40),
+            (vec![[9, 9, 9], [8, 8, 8]], 90),
+        ];
+        let now: Vec<[u32; 3]> = vec![[1, 2, 3], [4, 5, 6], [7, 8, 9], [0, 0, 0]];
+        assert_eq!(large_reuse(&made, &now, 3), Some(40), "prefix matches");
+        assert_eq!(large_reuse(&made, &now, 5), None, "longer than the copy");
+        let changed: Vec<[u32; 3]> = vec![[1, 2, 3], [4, 5, 7], [7, 8, 9]];
+        assert_eq!(large_reuse(&made, &changed, 2), None, "records changed");
+        assert_eq!(large_reuse(&[], &now, 1), None, "nothing made");
+        assert_eq!(large_reuse(&made, &now, 0), Some(40), "empty need matches first");
     }
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
