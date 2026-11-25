@@ -98,6 +98,11 @@ struct Guards {
     /// with no question to the runtime (whose lock its page mappings hold
     /// for long).
     alias_of: BTreeMap<usize, Vec<usize>>,
+    /// Pages where `VirtualProtect` failed and `VirtualQuery` found nothing
+    /// committed (placeholders, not yet mapped): counted as taken without
+    /// retrying either call until the runtime reports a mapping
+    /// ([`title_memory_remapped`]).
+    holes: BTreeSet<usize>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -110,6 +115,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
+    holes: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -266,6 +272,10 @@ impl Drop for Tracked {
         }
         for page in free {
             open(&mut g, page);
+            // No tracker names this page any more: a cached hole would be
+            // stale if the address is reused for committed memory without a
+            // remap report (tests map views without one).
+            g.holes.remove(&page);
         }
     }
 }
@@ -409,7 +419,9 @@ impl Tracked {
 
 /// Makes `pages` read-only where not already (in runs), and returns those
 /// now guarded or with nothing mapped (taken either way); a page that is
-/// mapped but cannot be guarded is left out (it stays changed).
+/// mapped but cannot be guarded is left out (it stays changed). Pages with
+/// nothing mapped are memoized in [`Guards::holes`] so later takes cost no
+/// system call until [`title_memory_remapped`] clears them.
 fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     #[cfg(feature = "diagnostics")]
     let counted = |calls: u64, pages: u64| {
@@ -435,10 +447,29 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     };
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
-    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
+    // Cached holes cost no system call: still taken (read as zeros), and
+    // only a remap makes them retried.
+    let mut fresh = Vec::with_capacity(pages.len());
+    for &p in pages {
+        if busy(p) {
+            continue;
+        }
+        if g.holes.contains(&p) {
+            taken.push(p);
+        } else {
+            fresh.push(p);
+        }
+    }
+    let pages = fresh;
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
+            taken.push(pages[i]);
+            i += 1;
+            continue;
+        }
+        // Holes cached since the last pass stay taken without a query.
+        if g.holes.contains(&pages[i]) {
             taken.push(pages[i]);
             i += 1;
             continue;
@@ -461,7 +492,10 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
             if set(page, page + 1) {
                 g.protected.insert(page);
                 taken.push(page);
+            } else if g.holes.contains(&page) {
+                taken.push(page);
             } else if unmapped(page) {
+                g.holes.insert(page);
                 taken.push(page);
             }
         }
@@ -573,6 +607,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             }
         }
     }
+    // Mappings may have filled cached holes: retry those pages next take.
+    g.holes.retain(|&p| p < first || p >= last);
 }
 
 /// The runtime mapped the page at `at` where `others` show it already: the
@@ -752,6 +788,37 @@ pub(crate) mod tests {
         title_memory_remapped(r, PAGE);
         assert_eq!(t.take(r, r + 2 * PAGE), [(r, r + PAGE)]);
         drop(t);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Unmapped pages are memoized as holes: no `VirtualProtect`/`VirtualQuery`
+    /// retry while still unmapped, and a remap makes them retried.
+    #[test]
+    fn unmapped_holes_are_cached_until_remapped() {
+        // SAFETY: a reservation of ours, freed below.
+        let r = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(r, 0);
+        let t = track(r, 2 * PAGE, true).expect("reserved memory is tracked");
+        assert_eq!(t.take(r, r + 2 * PAGE).len(), 1, "copied once (as zeros)");
+        {
+            let g = guards();
+            assert!(g.holes.contains(&(r / PAGE)) && g.holes.contains(&(r / PAGE + 1)));
+        }
+        // Still changed through a fresh tracker, but served from the cache.
+        let u = track(r, 2 * PAGE, true).expect("reserved memory is tracked");
+        assert_eq!(u.take(r, r + 2 * PAGE).len(), 1);
+        {
+            let g = guards();
+            assert!(g.holes.contains(&(r / PAGE)) && g.holes.contains(&(r / PAGE + 1)));
+            assert!(!g.protected.contains(&(r / PAGE)));
+        }
+        title_memory_remapped(r, 2 * PAGE);
+        {
+            let g = guards();
+            assert!(!g.holes.contains(&(r / PAGE)) && !g.holes.contains(&(r / PAGE + 1)));
+        }
+        drop((t, u));
         // SAFETY: our reservation.
         unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
     }
