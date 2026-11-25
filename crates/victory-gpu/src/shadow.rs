@@ -243,6 +243,12 @@ impl Shadow {
         address - self.start + self.base
     }
 
+    /// Whether `[address, address + len)` lies wholly inside the buffer.
+    pub(crate) fn covers(&self, address: usize, len: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        start <= address && address.checked_add(len).is_some_and(|to| to <= end)
+    }
+
     /// Where the title memory it copies starts, and its length.
     pub(crate) fn range(&self) -> (u64, u64) {
         (self.start, self.len)
@@ -883,7 +889,7 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        let _ = crate::host::copy_mapped(at, from as *const u8, to - from, false);
         to - from
     }
 }

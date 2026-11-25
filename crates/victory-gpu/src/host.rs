@@ -2128,38 +2128,60 @@ impl Host {
         let mut repeats = Vec::new();
         let mut cuts = vec![0];
         let mut since_cut: Vec<*const HostList> = Vec::with_capacity(runs.len());
+        // Submission-time steps first, for every list: a buffer-to-buffer
+        // copy queued by one step is dropped by a later step touching its
+        // range ([`Batch::title_written`], [`Batch::gpu_wrote`]), so the
+        // preludes below record only what no later step touched.
+        let mut repeated: Vec<bool> = Vec::with_capacity(runs.len());
+        let mut made_repeats: Vec<Option<Repeat>> = Vec::with_capacity(runs.len());
         for (i, list) in runs.iter().enumerate() {
             let id: *const HostList = *list;
-            let repeated = runs[..i].iter().any(|&l| std::ptr::eq(l, id));
-            if since_cut.contains(&id) {
-                cuts.push(lists.len());
-                since_cut.clear();
-            }
-            since_cut.push(id);
+            let is_repeated = runs[..i].iter().any(|&l| std::ptr::eq(l, id));
+            repeated.push(is_repeated);
             // A repeat's steps would rewrite the list's own memory (upload
             // memory, scratch, budget word) before its earlier run has read
             // it: they write into memory of the submission instead, which
             // the repeat's prelude copies into the list's on the GPU, in
             // queue order.
-            batch.redirect = repeated.then(Vec::new);
+            batch.redirect = is_repeated.then(Vec::new);
             list.run_deferred(&mut batch);
-            let repeat = batch
-                .redirect
-                .take()
-                .filter(|r| !r.is_empty())
-                .and_then(|r| list.repeat(self, r));
+            made_repeats.push(
+                batch
+                    .redirect
+                    .take()
+                    .filter(|r| !r.is_empty())
+                    .and_then(|r| list.repeat(self, r)),
+            );
+        }
+        batch.flush();
+        // Then the preludes, in run order: each records its list's state
+        // moves and its surviving buffer-to-buffer copies, which run before
+        // the list's own commands on the GPU.
+        for (i, list) in runs.iter().enumerate() {
+            let id: *const HostList = *list;
+            if since_cut.contains(&id) {
+                cuts.push(lists.len());
+                since_cut.clear();
+            }
+            since_cut.push(id);
+            let copies = batch.take_gpu_copies(list);
+            for copy in &copies {
+                list.keep(&copy.src.buffer);
+                list.keep(&copy.dst.buffer);
+            }
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed =
                 crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            if let Some((prelude, spare)) = list.prelude(repeated.then_some(self), repeat.as_ref())
+            if let Some((prelude, spare)) =
+                list.prelude(repeated[i].then_some(self), made_repeats[i].as_ref(), &copies)
             {
                 lists.push(Some(prelude));
                 if let Some(spare) = spare {
                     preludes.push((spare, list.kind));
                 }
             }
-            repeats.extend(repeat);
+            repeats.extend(made_repeats[i].take());
             lists.push(list.list.cast().ok());
         }
         batch.flush();
@@ -3484,10 +3506,14 @@ impl HostList {
     /// into a spare prelude from `repeated`, returned for the submission to
     /// keep until it has run.
     /// A repeat's `repeat` bytes go into the list's memory first.
+    /// `buffer_copies` are the list's surviving buffer-to-buffer copies
+    /// ([`Batch::queue_gpu_copy`]): recorded shadow-to-shadow before the
+    /// state moves.
     fn prelude(
         &self,
         repeated: Option<&Host>,
         repeat: Option<&Repeat>,
+        buffer_copies: &[GpuCopy],
     ) -> Option<(ID3D12CommandList, Option<Prelude>)> {
 
         // Depth textures and their twins first, from their real states and
@@ -3508,6 +3534,7 @@ impl HostList {
         let up_to_date = |first: &u32, real: u32| real == *first;
         if copies.is_empty()
             && repeat.is_none()
+            && buffer_copies.is_empty()
             && states.values().all(|(first, _, copy)| {
                 up_to_date(first, copy.state.load(Ordering::Relaxed))
             })
@@ -3593,6 +3620,14 @@ impl HostList {
                         if !back.is_empty() {
                             list.ResourceBarrier(&back);
                         }
+                    }
+                    if !buffer_copies.is_empty() {
+                        // The list's buffers may start the call in any
+                        // state the last submission left (unlike the
+                        // repeat's, which decay): each buffer goes from its
+                        // real state to what its copies need and back to
+                        // common, which `moves` then expects.
+                        record_gpu_copies(list, buffer_copies);
                     }
                     let barriers = moves();
                     if !barriers.is_empty() {
@@ -4088,8 +4123,11 @@ impl HostList {
                     }
                     batch.settle(src, len, false);
                     batch.settle(dst, len, true);
-                    batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    batch.title_written(dst, len);
+                    let whole = copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    if whole {
+                        batch.queue_gpu_copy(self, src, dst, len);
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -4102,11 +4140,11 @@ impl HostList {
                     match &mut batch.redirect {
                         Some(redirect) => {
                             let mut bytes = vec![0; len];
-                            copy_mapped(bytes.as_mut_ptr(), src as *const u8, len, false);
+                            let _ = copy_mapped(bytes.as_mut_ptr(), src as *const u8, len, false);
                             redirect.push((dst, bytes));
                         }
                         None => {
-                            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                            let _ = copy_mapped(dst as *mut u8, src as *const u8, len, false);
                         }
                     }
                     len
@@ -4130,7 +4168,7 @@ impl HostList {
                         Step::Run(_, (to, written), (from, read)) => {
                             batch.settle(from, read, false);
                             batch.settle(to, written, true);
-                            batch.title_written();
+                            batch.title_written(to, written);
                         }
                         Step::Host(_, (from, read), writes) => {
                             batch.settle(from, read, false);
@@ -4172,6 +4210,12 @@ impl HostList {
                         batch.flush();
                     }
                     shadow.writing(*address, *len, *marked);
+                    // Shaders write the copy on the GPU: a queued
+                    // buffer-to-buffer copy touching the range would read or
+                    // overwrite their bytes instead of the title's, so it
+                    // falls back to the CPU copy (whose bytes are already in
+                    // title memory).
+                    batch.gpu_wrote(shadow, *address, *len);
 
                     continue;
                 }
@@ -4366,6 +4410,30 @@ impl HullCache {
     }
 }
 
+/// A buffer-to-buffer copy (`Step::Copy`) to run on the GPU instead of
+/// re-copying on the CPU: the shadows holding the title source and
+/// destination, the offsets there, and the title ranges (for ordering
+/// against later steps). The list that recorded it owns it until its
+/// prelude records it (see `Batch::queue_gpu_copy`).
+struct GpuCopy {
+    src: std::sync::Arc<crate::shadow::Shadow>,
+    src_off: u64,
+    dst: std::sync::Arc<crate::shadow::Shadow>,
+    dst_off: u64,
+    len: usize,
+    src_addr: usize,
+    dst_addr: usize,
+}
+
+/// Whether `[at, at + len)` overlaps any of `ranges` (`(from, to)`).
+fn ranges_overlap(ranges: &[(usize, usize)], at: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = at.saturating_add(len);
+    ranges.iter().any(|&(from, to)| from < end && at < to)
+}
+
 #[derive(Default)]
 struct Batch<'a> {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -4391,6 +4459,14 @@ struct Batch<'a> {
     submission_gen: u64,
     /// Heap-hull ranges queued so far in the submission (see `HullCache`).
     hull: HullCache,
+    /// Ranges of copies the submission's shaders write (copy key, title
+    /// from, title to, in step order): a queued buffer-to-buffer copy
+    /// touching one falls back to the CPU copy.
+    gpu_written: Vec<(usize, usize, usize)>,
+    /// Buffer-to-buffer copies queued for the GPU, by owning list (its
+    /// pointer as `usize`): recorded into the list's prelude once all the
+    /// submission's steps ran (so no later step touches their ranges).
+    gpu_copies: Vec<(usize, GpuCopy)>,
 }
 
 /// Entries that pay back data-parallel copies: at least this many ranges
@@ -4500,12 +4576,26 @@ impl Batch<'_> {
         self.hull.note(key, address, len, now, dirty);
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
-    fn title_written(&mut self) {
+    /// Before a step that writes `[address, address + len)` of title memory:
+    /// pending refreshes are done first, and textures are checked again
+    /// after it. Queued buffer-to-buffer copies touching the range fall back
+    /// to their CPU copy (already in title memory): the GPU must not copy
+    /// the range's older bytes over its newer ones, or read them.
+    fn title_written(&mut self, address: usize, len: usize) {
         self.flush();
         self.current.clear();
         self.hull.clear();
+        let written = (address, address.saturating_add(len));
+        #[cfg(feature = "diagnostics")]
+        let before = self.gpu_copies.len();
+        self.gpu_copies.retain(|(_, c)| {
+            !ranges_overlap(&[written], c.src_addr, c.len) && !ranges_overlap(&[written], c.dst_addr, c.len)
+        });
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::GpuCopyDropped,
+            (before - self.gpu_copies.len()) as u64,
+        );
     }
 
     /// Does the refreshes; returns the bytes copied. Serial: the takes
@@ -4563,6 +4653,116 @@ impl Batch<'_> {
             (*a, *b) = (from, to);
         }
     }
+
+    /// A buffer-to-buffer copy (`Step::Copy` of title `[src, src + len)` to
+    /// `[dst, dst + len)`, owned by `list`) for the GPU: after the CPU copy
+    /// above put the same bytes in title memory, the destination shadow
+    /// holds them once the list's prelude copies the refreshed source
+    /// shadow into it. Later refreshes of the destination in this submission
+    /// are skipped (it is current); its tracker is left alone, so a later
+    /// title write refreshes it again as before.
+    ///
+    /// Queued only when the bytes the GPU will read are pinned: the source
+    /// shadow is refreshed here (changed pages only, as a refresh would),
+    /// and a later step touching either range drops the copy
+    /// ([`Batch::title_written`], [`Batch::gpu_wrote`]). Falls back to the
+    /// CPU copy (already done) when the shadows do not cover the ranges, or
+    /// share a buffer (one barrier cannot move both ends), or the submission
+    /// already declared shader writes over them.
+    fn queue_gpu_copy(&mut self, list: &HostList, src: usize, dst: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let (Some(src_shadow), Some(dst_shadow)) = (
+            crate::shadow::find(src as u64, len as u64),
+            crate::shadow::find(dst as u64, len as u64),
+        ) else {
+            return;
+        };
+        if !src_shadow.covers(src, len) || !dst_shadow.covers(dst, len) {
+            return;
+        }
+        // One buffer cannot be both ends of one barrier pair without an
+        // ordering the prelude does not record: the arena shares buffers
+        // between view copies, and the same title range may sit in two
+        // copies at once.
+        if src_shadow.buffer.as_raw() == dst_shadow.buffer.as_raw() {
+            return;
+        }
+        let (src_key, dst_key) = (
+            std::sync::Arc::as_ptr(&src_shadow) as usize,
+            std::sync::Arc::as_ptr(&dst_shadow) as usize,
+        );
+        if self.gpu_written.iter().any(|&(key, from, to)| {
+            (key == src_key && from < src.saturating_add(len) && src < to)
+                || (key == dst_key && from < dst.saturating_add(len) && dst < to)
+        }) {
+            return;
+        }
+        // Pin the source bytes the GPU will read (changed pages only: the
+        // second half of finding 1's fewer, larger ranges is the flush
+        // machinery this shares). Unmapped title pages read as zeros, as in
+        // the CPU copy above.
+        src_shadow.update(src, len);
+        self.note_current(&dst_shadow, dst, dst + len);
+        let (src_off, dst_off) = (src_shadow.offset(src as u64), dst_shadow.offset(dst as u64));
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GpuCopies, 1);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GpuCopyBytes, len as u64);
+        self.gpu_copies.push((
+            list as *const HostList as usize,
+            GpuCopy {
+                src: src_shadow,
+                src_off,
+                dst: dst_shadow,
+                dst_off,
+                len,
+                src_addr: src,
+                dst_addr: dst,
+            },
+        ));
+    }
+
+    /// Shaders of the submission write `[address, address + len)` of
+    /// `shadow` on the GPU: queued buffer-to-buffer copies touching the
+    /// range fall back to their CPU copy (done), as in
+    /// [`Batch::title_written`]. Unlike a title write this clears no
+    /// `current` range, so a dropped copy's destination is unmarked itself.
+    fn gpu_wrote(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let end = address.saturating_add(len);
+        self.gpu_written.push((key, address, end));
+        let before = self.gpu_copies.len();
+        self.gpu_copies.retain(|(_, c)| {
+            !(std::sync::Arc::ptr_eq(&c.src, shadow) && address < c.src_addr.saturating_add(c.len) && c.src_addr < end)
+                && !(std::sync::Arc::ptr_eq(&c.dst, shadow) && address < c.dst_addr.saturating_add(c.len) && c.dst_addr < end)
+        });
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::GpuCopyDropped,
+            (before - self.gpu_copies.len()) as u64,
+        );
+        if before != self.gpu_copies.len() {
+            self.current.remove(&key);
+        }
+    }
+
+    /// The owning list's queued buffer-to-buffer copies, in step order.
+    fn take_gpu_copies(&mut self, list: &HostList) -> Vec<GpuCopy> {
+        let key = list as *const HostList as usize;
+        let mut out = Vec::new();
+        let mut kept = Vec::with_capacity(self.gpu_copies.len());
+        for (owner, copy) in self.gpu_copies.drain(..) {
+            if owner == key {
+                out.push(copy);
+            } else {
+                kept.push((owner, copy));
+            }
+        }
+        self.gpu_copies = kept;
+        out
+    }
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -4578,19 +4778,23 @@ impl Batch<'_> {
 /// made copies run at 100-200 MB/s; a title destination is asked only once
 /// its copy has failed (asked before each, the world's 80 copies per frame
 /// cost 60 ms).
-pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+///
+/// Returns whether the whole range copied by the fast path (no unmapped
+/// page met): buffer-to-buffer copies run on the GPU only then, falling back
+/// to this CPU copy for unmapped runs.
+pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) -> bool {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
             // SAFETY: timing only: the caller vouches for the source.
             unsafe { std::ptr::copy(src, dst, len) };
-            return;
+            return true;
         }
-        2 => return,
+        2 => return false,
         _ => {}
     }
     if len == 0 {
-        return;
+        return true;
     }
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
@@ -4600,13 +4804,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
-        return;
+        return true;
     }
     // The copy stopped at an unmapped page. One of a title destination ends
     // it: the retries below write the destination themselves (zeros for
     // what cannot be read), and would fault there.
     if title_dst && !crate::texture::committed(dst, len) {
-        return;
+        return false;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
@@ -4628,6 +4832,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
             });
         }
     });
+    false
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -4729,19 +4934,19 @@ mod title_copies {
         let from = pattern();
         // All mapped: copied, through a destination that was never asked.
         let to = holed(0xee);
-        copy_mapped(to, from.as_ptr(), BLOCK, true);
+        assert!(copy_mapped(to, from.as_ptr(), BLOCK, true), "mapped runs copy whole");
         assert_eq!(block(to, 0), &from[..BLOCK]);
         release(to);
         // An unmapped block in the destination: nothing faults, and nothing
         // arrives from that block on.
         let to = holed(0xee);
-        copy_mapped(to, from.as_ptr(), 3 * BLOCK, true);
+        assert!(!copy_mapped(to, from.as_ptr(), 3 * BLOCK, true), "unmapped runs fall back");
         assert!(block(to, 2).iter().all(|&b| b == 0xee));
         release(to);
         // An unmapped block in the source reads as zeros.
         let holes = holed(7);
         let mut to = vec![0xeeu8; 3 * BLOCK];
-        copy_mapped(to.as_mut_ptr(), holes, 3 * BLOCK, true);
+        assert!(!copy_mapped(to.as_mut_ptr(), holes, 3 * BLOCK, true), "unmapped runs fall back");
         assert!(to[..BLOCK].iter().all(|&b| b == 7));
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
@@ -5919,12 +6124,80 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
     text
 }
 
+/// Records buffer-to-buffer copies into an open prelude: each
+/// `CopyBufferRegion` shadow-to-shadow, between barriers taking each buffer
+/// from its real state to what the copies need and back to common (which the
+/// prelude's state moves then expect). The owning list keeps the buffers
+/// alive until the submission has run.
+fn record_gpu_copies(list: &ID3D12GraphicsCommandList, copies: &[GpuCopy]) {
+    // One barrier pair per buffer (a buffer may feed several copies): from
+    // its real state to the union of what the copies need, and back.
+    let mut ends: Vec<(ID3D12Resource, u32, u32)> = Vec::new();
+    let mut need = |buffer: &ID3D12Resource, real: u32, copy: u32| {
+        match ends.iter_mut().find(|(b, _, _)| b.as_raw() == buffer.as_raw()) {
+            Some((_, _, want)) => *want |= copy,
+            None => ends.push((buffer.clone(), real, copy)),
+        }
+    };
+    for copy in copies {
+        need(
+            &copy.src.buffer,
+            copy.src.state.load(Ordering::Relaxed),
+            D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
+        );
+        need(
+            &copy.dst.buffer,
+            copy.dst.state.load(Ordering::Relaxed),
+            D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
+        );
+    }
+    // SAFETY: an open prelude and live shadow buffers (kept by the list).
+    unsafe {
+        list.ResourceBarrier(
+            &ends
+                .iter()
+                .map(|(buffer, real, want)| {
+                    transition(
+                        buffer,
+                        D3D12_RESOURCE_STATES(*real as i32),
+                        D3D12_RESOURCE_STATES(*want as i32),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        for copy in copies {
+            list.CopyBufferRegion(
+                &copy.dst.buffer,
+                copy.dst_off,
+                &copy.src.buffer,
+                copy.src_off,
+                copy.len as u64,
+            );
+        }
+        list.ResourceBarrier(
+            &ends
+                .iter()
+                .map(|(buffer, _, want)| {
+                    transition(
+                        buffer,
+                        D3D12_RESOURCE_STATES(*want as i32),
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    for copy in copies {
+        copy.src.state.store(D3D12_RESOURCE_STATE_COMMON.0 as u32, Ordering::Relaxed);
+        copy.dst.state.store(D3D12_RESOURCE_STATE_COMMON.0 as u32, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn transition(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
-) -> D3D12_RESOURCE_BARRIER {
-    #[cfg(test)]
+) -> D3D12_RESOURCE_BARRIER {    #[cfg(test)]
     tests::ISSUED.with(|l| l.borrow_mut().push((resource.as_raw() as usize, before.0 as u32, after.0 as u32)));
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -6076,7 +6349,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
         assert_eq!(batch.flush(), 0, "the repeat finds it already queued");
         // SAFETY: our pool, guarded since the copy took it.
         unsafe { ((p + 8) as *mut u8).write_volatile(1) };
-        batch.title_written();
+        batch.title_written(p, len);
         batch.add_cached(&copy, p, len, copy.dirty_bit());
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
@@ -6112,7 +6385,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
         unsafe { (p as *mut u8).write_volatile(1) };
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), 0, "nothing again in the submission");
-        batch.title_written();
+        batch.title_written(p, len);
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
@@ -6247,6 +6520,92 @@ mod batch {   // `mod tests` is already taken at the top of this file
         assert_eq!(copy_threads(PARALLEL_ENTRIES - 1), 1);
         assert!(copy_threads(PARALLEL_ENTRIES) >= 2);
         assert!(copy_threads(1 << 20) <= 8);
+    }
+
+    /// Buffer-to-buffer copy ranges overlap by their bytes, end to end.
+    /// Needs no GPU: the queue and drop checks below run on these.
+    #[test]
+    fn copy_ranges_overlap_by_their_bytes() {
+        assert!(ranges_overlap(&[(100, 200)], 150, 10), "inside");
+        assert!(ranges_overlap(&[(100, 200)], 90, 20), "reaching in from below");
+        assert!(ranges_overlap(&[(100, 200)], 190, 20), "reaching in from above");
+        assert!(ranges_overlap(&[(100, 200)], 50, 200), "covering");
+        assert!(ranges_overlap(&[(100, 200), (300, 400)], 350, 10), "the second range");
+        assert!(!ranges_overlap(&[(100, 200)], 200, 10), "touching at the end");
+        assert!(!ranges_overlap(&[(100, 200)], 90, 10), "touching at the start");
+        assert!(!ranges_overlap(&[(100, 200)], 50, 10), "disjoint");
+        assert!(!ranges_overlap(&[], 150, 10), "no ranges");
+        assert!(!ranges_overlap(&[(100, 200)], 150, 0), "nothing overlaps nothing");
+    }
+
+    /// A buffer-to-buffer copy queues for the GPU while no step touches its
+    /// ranges, and falls back to its CPU copy (already in title memory) when
+    /// a later step writes title memory over them or declares shader writes
+    /// over them. Needs a host GPU; passes by without one.
+    #[test]
+    fn buffer_copies_queue_for_the_gpu_until_a_step_touches_them() {
+        use crate::watch::PAGE;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (p, q) = (crate::watch::tests::pool(1), crate::watch::tests::pool(1));
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        crate::shadow::register(q, q as u64, PAGE as u64);
+        let (Some(src), Some(dst)) = (
+            crate::shadow::find(p as u64, PAGE as u64),
+            crate::shadow::find(q as u64, PAGE as u64),
+        ) else {
+            crate::shadow::unregister(q, q as u64);
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let list = host.new_list().expect("a host list");
+        let mut batch = Batch {
+            host: Some(host),
+            submission_gen: crate::shadow::generation(),
+            ..Batch::default()
+        };
+        // SAFETY: a byte of our pool.
+        unsafe { (p as *mut u8).write_volatile(0x5a) };
+        batch.queue_gpu_copy(&list, p, q, PAGE);
+        assert_eq!(batch.gpu_copies.len(), 1, "a copy between two buffers queues");
+        batch.title_written(q + PAGE, PAGE);
+        assert_eq!(batch.gpu_copies.len(), 1, "a write elsewhere keeps it");
+        batch.title_written(p, 1);
+        assert!(batch.gpu_copies.is_empty(), "a write over the source drops it");
+        batch.queue_gpu_copy(&list, p, q, PAGE);
+        let other = host.new_list().expect("another host list");
+        assert!(batch.take_gpu_copies(&other).is_empty(), "another list takes nothing");
+        let mine = batch.take_gpu_copies(&list);
+        assert_eq!(mine.len(), 1, "the owning list takes its copy");
+        assert_eq!((mine[0].src_addr, mine[0].dst_addr, mine[0].len), (p, q, PAGE));
+        assert_ne!(
+            std::sync::Arc::as_ptr(&mine[0].src),
+            std::sync::Arc::as_ptr(&mine[0].dst),
+            "copies between two buffers"
+        );
+        drop(mine);
+        // A declared shader write over the destination drops queued copies
+        // (and unmarks the destination), and later copies touching it are
+        // not queued at all: the shaders' bytes are not the title's.
+        batch.queue_gpu_copy(&list, p, q, PAGE);
+        batch.gpu_wrote(&dst, q + PAGE / 2, PAGE);
+        assert!(batch.gpu_copies.is_empty(), "a shader write over the destination drops it");
+        assert!(
+            !batch
+                .current
+                .contains_key(&(std::sync::Arc::as_ptr(&dst) as usize)),
+            "the drop unmarks the destination's current range"
+        );
+        batch.queue_gpu_copy(&list, p, q, PAGE);
+        assert!(batch.gpu_copies.is_empty(), "no queueing over a declared shader write");
+        drop(other);
+        drop(src);
+        drop(dst);
+        crate::shadow::unregister(q, q as u64);
+        crate::shadow::unregister(p, p as u64);
+        crate::watch::tests::free(p);
+        crate::watch::tests::free(q);
     }
 
 
@@ -6508,6 +6867,61 @@ mod submissions {
         );
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A deferred buffer-to-buffer copy reaches title memory by the CPU copy
+    /// and its shadows by the GPU one: after the submission, the destination
+    /// shadow holds the source's bytes with no refresh queued for it (only
+    /// the CPU path runs without a host GPU, when this returns early).
+    #[test]
+    fn deferred_buffer_copies_reach_title_memory_and_their_shadows() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else { return };
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (p, q) = (crate::watch::tests::pool(1), crate::watch::tests::pool(1));
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        crate::shadow::register(q, q as u64, PAGE as u64);
+        let (Some(src), Some(dst)) = (
+            crate::shadow::find(p as u64, PAGE as u64),
+            crate::shadow::find(q as u64, PAGE as u64),
+        ) else {
+            crate::shadow::unregister(q, q as u64);
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        // SAFETY: bytes of our pools.
+        unsafe {
+            for i in 0..PAGE {
+                ((p + i) as *mut u8).write_volatile((i % 251) as u8 + 1);
+                ((q + i) as *mut u8).write_volatile(0);
+            }
+        }
+        let list = host.new_list().unwrap();
+        list.defer_copy(q as *mut u8, p as *const u8, PAGE);
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        // SAFETY: bytes of our pools; the submission finished.
+        unsafe {
+            for i in 0..PAGE {
+                assert_eq!(((q + i) as *const u8).read_volatile(), (i % 251) as u8 + 1);
+            }
+        }
+        let want: Vec<u32> = (0..PAGE / 4)
+            .map(|w| {
+                u32::from_le_bytes(core::array::from_fn(|b| ((4 * w + b) % 251) as u8 + 1))
+            })
+            .collect();
+        assert_eq!(src.read_host(p as u64, PAGE / 4), want, "the source shadow refreshed");
+        assert_eq!(dst.read_host(q as u64, PAGE / 4), want, "the GPU copy's bytes");
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        drop(src);
+        drop(dst);
+        crate::shadow::unregister(q, q as u64);
+        crate::shadow::unregister(p, p as u64);
+        crate::watch::tests::free(p);
+        crate::watch::tests::free(q);
     }
 
     #[test]

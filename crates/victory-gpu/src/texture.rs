@@ -663,7 +663,7 @@ impl Staging {
                 let (a, b) = span(i);
                 if !done.contains(&(a, b)) {
                     // SAFETY: inside the buffer of the texture's size.
-                    crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
+                    let _ = crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
                     (bytes, _) = (bytes + b - a, done.push((a, b)));
                 }
             }
