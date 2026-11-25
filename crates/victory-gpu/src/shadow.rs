@@ -26,7 +26,7 @@ use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
 #[cfg(test)]
-mod snapshot_tests;
+pub(crate) mod snapshot_tests;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {

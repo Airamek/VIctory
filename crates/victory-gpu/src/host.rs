@@ -2334,10 +2334,11 @@ impl Batch {
         self.current.clear();
     }
 
-    /// Does the refreshes; returns the bytes copied. One thread per host
-    /// copy where there are enough of them: entries name distinct copies
-    /// (`pending` merged each copy's), so their updates touch disjoint
-    /// title ranges and copy mappings.
+    /// Does the refreshes; returns the bytes copied. Serial: the takes
+    /// share the title-memory guard lock with the title threads' fault
+    /// handler, and one take is microseconds — threads convoyed on it for
+    /// no wall-time win (diag7: guard waits 20×, per-take cost 4×), so the
+    /// updates stay on the submitting thread.
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
@@ -2347,41 +2348,11 @@ impl Batch {
             self.note_current(shadow, *from, *to);
         }
         let mut total = 0;
-        #[cfg(feature = "diagnostics")]
-        let mut ranges: Vec<(usize, usize, u64)> = Vec::new();
-        let mut subs = Vec::new();
-        if copy_threads(refreshes.len()) <= 1 {
-            subs.push(Self::refresh_many(&refreshes));
-        } else {
-            let chunk = refreshes
-                .len()
-                .div_ceil(copy_threads(refreshes.len()));
-            std::thread::scope(|s| {
-                let mut parts = refreshes.chunks(chunk);
-                // The submitting thread takes the first chunk itself.
-                let mine = parts.next();
-                let mut handles = Vec::new();
-                for part in parts {
-                    handles.push(s.spawn(move || Self::refresh_many(part)));
-                }
-                if let Some(part) = mine {
-                    subs.push(Self::refresh_many(part));
-                }
-                for h in handles {
-                    subs.push(h.join().expect("a refresh thread panicked"));
-                }
-            });
-        }
-        for (sub, local) in subs {
-            total += sub;
+        for (shadow, from, to) in refreshes {
+            let (copied, us) = Self::refresh_one(&shadow, from, to);
             #[cfg(feature = "diagnostics")]
-            ranges.extend(local);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = local;
-        }
-        #[cfg(feature = "diagnostics")]
-        for (from, len, us) in ranges {
-            crate::copystat::range(from, len, us, 0);
+            crate::copystat::range(from, to - from, us, 0);
+            total += copied;
         }
         total
     }
@@ -2398,27 +2369,6 @@ impl Batch {
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         (copied, us)
-    }
-
-    /// The refreshes of `part` (one thread's chunk): bytes copied, and per
-    /// range (start, length, microseconds) for diagnostics.
-    fn refresh_many(
-        part: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
-    ) -> (usize, Vec<(usize, usize, u64)>) {
-        let mut total = 0;
-        #[cfg(feature = "diagnostics")]
-        let mut ranges = Vec::with_capacity(part.len());
-        #[cfg(not(feature = "diagnostics"))]
-        let ranges = Vec::new();
-        for (shadow, from, to) in part {
-            let (copied, us) = Self::refresh_one(shadow, *from, *to);
-            total += copied;
-            #[cfg(feature = "diagnostics")]
-            ranges.push((*from, *to - *from, us));
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = us;
-        }
-        (total, ranges)
     }
 
     /// Remembers a flushed refresh as the copy's range brought up to date:
@@ -3609,10 +3559,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         crate::watch::tests::free(p);
     }
 
-    /// Enough host copies flush their refreshes on threads: disjoint copies
-    /// copy what the title wrote, each once, as in one thread.
+    /// Enough host copies flush their refreshes in one batch: disjoint
+    /// copies copy what the title wrote, each once (serial: the takes
+    /// share the guard lock, so threads convoyed — see `Batch::flush`).
     #[test]
-    fn parallel_flush_copies_each_copy_once() {
+    fn flush_copies_each_copy_once() {
         use crate::watch::PAGE;
         const COPIES: usize = 20;
         let mut pools = Vec::with_capacity(COPIES);
@@ -3664,9 +3615,13 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 
     /// Enough declared ranges copy back on threads: what the GPU wrote goes
-    /// back in every range, overlapping ranges of one copy in order.
+    /// back in every range, overlapping ranges of one copy in order. Holds
+    /// the snapshots' test lock: the block is one for all copies.
     #[test]
     fn parallel_copy_back_goes_back_in_every_range() {
+        let _one = crate::shadow::snapshot_tests::ONE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::watch::PAGE;
         const COPIES: usize = 16;
         let mut pools = Vec::with_capacity(COPIES);

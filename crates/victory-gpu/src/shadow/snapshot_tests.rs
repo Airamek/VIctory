@@ -1,7 +1,7 @@
 use super::*;
 
 /// The snapshots are one for all copies: one test at a time.
-pub(super) static ONE: Mutex<()> = Mutex::new(());
+pub(crate) static ONE: Mutex<()> = Mutex::new(());
 
 /// Parts kept of a copy, against a byte-by-byte model.
 #[test]
