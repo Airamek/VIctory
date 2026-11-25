@@ -55,6 +55,9 @@ pub(crate) struct Touches {
 struct Entry<W> {
     /// The host fence value the submission signals.
     value: u64,
+    /// The copy fence value its upload signals (0: uploads stayed on the
+    /// direct queue): the submission has run once both fences passed it.
+    copy_value: u64,
     /// Everything it writes, shaders' and labels'.
     writes: Ranges,
     labels: Ranges,
@@ -89,7 +92,8 @@ impl<W> Timeline<W> {
 
     /// A submission that signals `value` (higher than any before it), the
     /// title memory its GPU work touches, and its work once it ran.
-    pub(crate) fn push(&self, value: u64, touches: Touches, work: W) {
+    /// `copy_value` is the copy fence its upload signals (0: none).
+    pub(crate) fn push(&self, value: u64, copy_value: u64, touches: Touches, work: W) {
         let Touches {
             shaders,
             labels,
@@ -102,6 +106,7 @@ impl<W> Timeline<W> {
             .chain(labels.iter().copied());
         self.entries().push_back(Entry {
             value,
+            copy_value,
             writes: Ranges::new(writes.collect()),
             labels: Ranges::new(labels),
             shaders,
@@ -214,13 +219,27 @@ impl<W> Timeline<W> {
     /// Finishes, oldest first, the submissions whose values are at most
     /// `reached`: `finish` takes each one's work, then its signals run.
     /// Returns once those are all finished, by this thread or another.
-    pub(crate) fn finish(&self, reached: u64, mut finish: impl FnMut(W)) {
+    /// Kept for tests; production finishes via [`Timeline::finish_both`].
+    #[allow(dead_code)]
+    pub(crate) fn finish(&self, reached: u64, finish: impl FnMut(W)) {
+        self.finish_both(reached, u64::MAX, finish);
+    }
+
+    /// As [`Timeline::finish`], for submissions with copy work: one is
+    /// finished once its direct value passed `reached` and its copy value
+    /// passed `copy_reached`. With no copy work (`copy_value` 0) the second
+    /// check always passes.
+    pub(crate) fn finish_both(&self, reached: u64, copy_reached: u64, mut finish: impl FnMut(W)) {
         let _finishing = self.finishing.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let work = {
                 let mut entries = self.entries();
                 match entries.front_mut() {
-                    Some(first) if first.value <= reached => first.work.take(),
+                    Some(first)
+                        if first.value <= reached && first.copy_value <= copy_reached =>
+                    {
+                        first.work.take()
+                    }
                     _ => return,
                 }
             };
@@ -263,8 +282,8 @@ mod tests {
         // Nothing in flight: a signal is at once.
         let l = log.clone();
         t.after(move || note(&l, "signal 0"));
-        t.push(1, Touches::default(), "work 1");
-        t.push(2, Touches::default(), "work 2");
+        t.push(1, 0, Touches::default(), "work 1");
+        t.push(2, 0, Touches::default(), "work 2");
         // Queued after both: behind the second's work.
         let l = log.clone();
         t.after(move || note(&l, "signal 2"));
@@ -297,6 +316,7 @@ mod tests {
         };
         t.push(
             1,
+            0,
             touches(
                 vec![(1, 0x1000, 0x2000)],
                 vec![(0x9000, 0x9004)],
@@ -304,7 +324,7 @@ mod tests {
             ),
             (),
         );
-        t.push(2, touches(vec![(1, 0x1800, 0x1900)], vec![], vec![]), ());
+        t.push(2, 0, touches(vec![(1, 0x1800, 0x1900)], vec![], vec![]), ());
         // Reading what either writes waits for the newest that does.
         assert_eq!(t.conflict(0x1880, 0x1890, false), Some(2));
         assert_eq!(t.conflict(0x1000, 0x1010, false), Some(1));
