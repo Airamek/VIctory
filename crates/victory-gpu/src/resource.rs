@@ -802,6 +802,8 @@ impl HostTexture {
         });
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        TEXTURE_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TEXTURE_MADE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
             texture,
             state: state.into(),
@@ -844,6 +846,18 @@ static SAVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 #[cfg(windows)]
 static REPLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Host textures made and freed since the last frame-rate line (counts
+/// and bytes): whether the count grows because the title streams (made
+/// with nothing freed) or churns (both high).
+#[cfg(windows)]
+static TEXTURE_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static TEXTURE_MADE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static TEXTURE_FREED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static TEXTURE_FREED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Host textures alive, their bytes and the bytes of those lists used,
 /// title textures that shared one (and the bytes that saved), those that
 /// replaced their memory's.
@@ -854,11 +868,27 @@ pub(crate) fn texture_counts() -> (u64, u64, u64, u64, u64, u64) {
     (TEXTURES.load(Relaxed), TEXTURE_BYTES.load(Relaxed), USED.load(Relaxed), shared.0, shared.1, shared.2)
 }
 
+/// Host textures made and freed since the last call (counts, bytes):
+/// the frame-rate line's companion, showing whether the live count grows
+/// from streaming or churn.
+#[cfg(windows)]
+pub(crate) fn texture_flow() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        TEXTURE_MADE.swap(0, Relaxed),
+        TEXTURE_MADE_BYTES.swap(0, Relaxed),
+        TEXTURE_FREED.swap(0, Relaxed),
+        TEXTURE_FREED_BYTES.swap(0, Relaxed),
+    )
+}
+
 #[cfg(windows)]
 impl Drop for HostTexture {
     fn drop(&mut self) {
         TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        TEXTURE_FREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TEXTURE_FREED_BYTES.fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
         if *self.used.get_mut() {
             USED.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
