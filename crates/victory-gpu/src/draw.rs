@@ -220,8 +220,7 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
         }
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
+    let gpu = list.fill_scratch(address as *const u8, len)?;
     Some(gpu)
 }
 
