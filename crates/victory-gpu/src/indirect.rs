@@ -176,11 +176,106 @@ fn make() -> windows::core::Result<Clamp> {
     }
 }
 
+/// One hoisted clamp: `records` records of `kind` (PC argument numbering)
+/// `stride` bytes apart at host address `gpu` in `buffer`, clamped in
+/// recorded order with the rest of its chunk (sequential order preserved;
+/// nothing reordered).
+pub(crate) struct ClampReq {
+    pub(crate) buffer: ID3D12Resource,
+    pub(crate) gpu: u64,
+    pub(crate) kind: u32,
+    pub(crate) stride: u32,
+    pub(crate) records: u32,
+}
+
+/// Records, in `list`, the clamps of `reqs` back to back as one sequential
+/// chunk: one leading unordered-access barrier, then one compute root
+/// signature and pipeline, then per request its constants, views and
+/// dispatch, each followed by an unordered-access barrier so the shared
+/// indirect-work budget is charged in request order. Buffers stay unordered
+/// access; move each to indirect arguments before its execution (and back
+/// with [`done_chunk`] after). Replaces the list's compute root signature
+/// and pipeline (callers bind theirs after). False if the clamp is not
+/// available (nothing recorded). Every request's arguments must be 4-byte
+/// aligned (checked by the caller when hoisted).
+pub(crate) fn bound_chunk(list: &HostList, reqs: &[ClampReq]) -> bool {
+    if reqs.is_empty() {
+        return true;
+    }
+    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
+        return false;
+    };
+    let l = &list.list;
+    // SAFETY: an open list; our root signature, pipeline and live buffers
+    // the caller's list holds (its refreshes keep them).
+    unsafe {
+        // Earlier shader writes (the titles' argument passes) first.
+        l.ResourceBarrier(&[uav_barrier()]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        for req in reqs {
+            let constants = [req.kind, req.stride, req.records, 0];
+            l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+            l.SetComputeRootUnorderedAccessView(1, req.gpu);
+            l.SetComputeRootUnorderedAccessView(2, budget);
+            // One group walks every record.
+            l.Dispatch(req.records.min(1), 1, 1);
+            // The shared budget reaches the next clamp in order.
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
+    }
+    true
+}
+
+/// Moves a chunk-clamped buffer to indirect arguments, unless already
+/// moved by this chunk (`ready`: the raw pointers of those). Buffers stay
+/// ready until [`done_chunk`].
+pub(crate) fn ready_chunk(list: &HostList, req: &ClampReq, ready: &mut Vec<*const ID3D12Resource>) {
+    let raw = &req.buffer as *const ID3D12Resource;
+    if ready.contains(&raw) {
+        return;
+    }
+    ready.push(raw);
+    // SAFETY: an open list and a live buffer.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(
+            &req.buffer,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )])
+    };
+}
+
+/// After the executions a chunk clamped: every buffer it moved back to
+/// unordered access, where the title's passes keep using it.
+pub(crate) fn done_chunk(list: &HostList, reqs: &[ClampReq]) {
+    let mut seen: Vec<*const ID3D12Resource> = Vec::new();
+    let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+    for req in reqs {
+        let raw = &req.buffer as *const ID3D12Resource;
+        if seen.contains(&raw) {
+            continue;
+        }
+        seen.push(raw);
+        barriers.push(transition(
+            &req.buffer,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        ));
+    }
+    if !barriers.is_empty() {
+        // SAFETY: an open list and live buffers.
+        unsafe { list.list.ResourceBarrier(&barriers) };
+    }
+}
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` in
 /// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
 /// the list's compute root signature and pipeline (callers bind theirs
 /// after). False if the clamp is not available.
+///
+/// Test-only single-record path (production hoists through [`bound_chunk`]).
+#[cfg(test)]
 pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
@@ -221,6 +316,9 @@ pub(crate) fn bound(
 
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
+///
+/// Test-only (production reverts chunks with [`done_chunk`]).
+#[cfg(test)]
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     // SAFETY: an open list and a live buffer.
     unsafe {
