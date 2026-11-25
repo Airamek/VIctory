@@ -38,6 +38,41 @@ fn snapshots_keep_each_declared_byte_once() {
     }
 }
 
+/// A keep of megabytes fills its slots on threads: what the GPU wrote
+/// still goes back exactly, and the block is empty with the last range.
+#[test]
+fn big_snapshot_fills_in_parallel() {
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let len: usize = 32 * PAGE;
+    let mut title = vec![0x44u8; len + PAGE];
+    let start = (title.as_mut_ptr() as usize).next_multiple_of(PAGE);
+    let Some((buffer, data)) = host().and_then(|h| h.shared_buffer(len as u64)) else {
+        return; // no host GPU here
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Shadow::new(buffer, data, gpu, start as u64, len as u64);
+    assert_eq!(shadow.update(start, len), len);
+    assert!(len >= 1 << 20, "the keep takes the threaded path");
+    shadow.writing(start, len);
+    // The shaders write across the whole keep, and the title meanwhile.
+    // SAFETY: inside the mapping and the title's memory.
+    unsafe {
+        data.add(100).write(0x77);
+        data.add(len - 1).write(0x78);
+        ((start + 200) as *mut u8).write(0x79);
+    }
+    shadow.copy_back(start, len);
+    // SAFETY: the title's memory.
+    unsafe {
+        assert_eq!((start as *const u8).read_volatile(), 0x44);
+        assert_eq!(((start + 100) as *const u8).read_volatile(), 0x77);
+        assert_eq!(((start + len - 1) as *const u8).read_volatile(), 0x78);
+        assert_eq!(((start + 200) as *const u8).read_volatile(), 0x79);
+    }
+    assert_eq!(all_kept(), (0, 0));
+}
+
 /// Two overlapping declared ranges and one apart: the bytes the GPU
 /// changed go back, the title's own concurrent writes stay, and what
 /// changed outside every declared range does not go back.

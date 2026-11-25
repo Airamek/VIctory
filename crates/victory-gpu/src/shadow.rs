@@ -85,6 +85,18 @@ fn snapshots_mut() -> std::sync::RwLockWriteGuard<'static, Snapshots> {
     SNAPSHOTS.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Threads filling one snapshot keep: big keeps split by bytes (a 1 MB
+/// keep is already worth a second thread); half the logical processors,
+/// as the pipeline workers, so the title's threads still have cores.
+fn snapshot_threads(total: usize) -> usize {
+    const PARALLEL_SNAPSHOT_BYTES: usize = 1 << 20;
+    if total < PARALLEL_SNAPSHOT_BYTES {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map_or(2, |n| (n.get() / 2).clamp(2, 8))
+}
+
 /// Gives up the snapshots of `parts`.
 fn forget(parts: &mut Vec<Part>) {
     let mut snapshots = snapshots_mut();
@@ -150,7 +162,8 @@ fn kept<'a>(
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // whose disjoint ranges different submission threads refresh and compare
 // (one thread per host copy in a parallel batch, one range at a time per
-// copy), and title memory is read through the kernel.
+// copy), whose snapshot slots different threads fill (disjoint bytes of one
+// reservation), and title memory is read through the kernel.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
@@ -300,7 +313,9 @@ impl Shadow {
     /// each byte once per submission, however many ranges declare it, and
     /// none between them (the world declares overlapping views of its 174 MB
     /// heap dozens of times), in reused memory (fresh snapshots cost ~2.3
-    /// million page faults per world frame).
+    /// million page faults per world frame). Big keeps are filled on
+    /// threads: the slots are disjoint, so they share nothing but a read
+    /// hold on the block (which also pins its allocation while filling).
     pub(crate) fn writing(&self, address: usize, len: usize) {
         self.pending
             .lock()
@@ -321,16 +336,117 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::SnapshotBytes, bytes);
             crate::copystat::snapshot(self.start, self.len, bytes);
         }
-        let mut snapshots = snapshots_mut();
+        let total: usize = gaps.iter().map(|(a, b)| b - a).sum();
+        // The slots, reserved under one short lock; filled after it (each
+        // byte once: the gaps partition the kept bytes).
+        let base = {
+            let mut snapshots = snapshots_mut();
+            let base = snapshots.bytes.len();
+            snapshots.bytes.reserve(total);
+            // SAFETY: every reserved byte is filled below before any reader
+            // runs (copy-back is a later phase; tests sharing the block hold
+            // its single-test lock, and the read hold below pins this
+            // allocation meanwhile). The lint fires on the pattern, not on
+            // a use: the fill covers exactly `total` bytes by construction.
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                snapshots.bytes.set_len(base + total)
+            };
+            snapshots.parts += gaps.len();
+            base
+        };
+        let mut jobs: Vec<(usize, usize, usize)> = Vec::with_capacity(gaps.len());
+        let mut at = base;
         for (from, to) in gaps {
-            // SAFETY: inside the mapping.
-            let host = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
-            let at = snapshots.bytes.len();
-            snapshots.bytes.extend_from_slice(host);
-            snapshots.parts += 1;
             parts.push(Part { from, to, at });
+            jobs.push((from, at - base, to - from));
+            at += to - from;
         }
         parts.sort_unstable_by_key(|p| p.from);
+        self.fill_snapshot(jobs, base, total);
+    }
+
+    /// Copies the kept bytes (`(offset in the copy, offset in the reserved
+    /// block, length)`) into the snapshot block at `base`: on threads where
+    /// the keep is big enough, each thread disjoint bytes of one
+    /// reservation.
+    fn fill_snapshot(&self, jobs: Vec<(usize, usize, usize)>, base: usize, total: usize) {
+        // The block, held for reading while filling (no reallocation
+        // meanwhile: that takes the write lock, which this hold excludes;
+        // the fill itself needs no lock, its bytes are disjoint).
+        let hold = snapshots();
+        let dst = hold.bytes.as_ptr() as usize;
+        if snapshot_threads(total) <= 1 {
+            for (from, at, len) in jobs {
+                // SAFETY: `from` is inside the mapping and `base + at` in
+                // the reservation, both `len` bytes, disjoint per job.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.data.add(from), (dst + base + at) as *mut u8, len);
+                }
+            }
+            return;
+        }
+        // Split the jobs into per-thread byte quotas (a single big gap is
+        // split across threads, not stuck on one).
+        let quota = total.div_ceil(snapshot_threads(total));
+        let mut chunks: Vec<Vec<(usize, usize, usize)>> = Vec::new();
+        let mut current: Vec<(usize, usize, usize)> = Vec::new();
+        let mut used = 0;
+        for (from, at, len) in jobs {
+            let (mut from, mut at, mut len) = (from, at, len);
+            while len > 0 {
+                if used == quota {
+                    chunks.push(std::mem::take(&mut current));
+                    used = 0;
+                }
+                let n = (quota - used).min(len);
+                current.push((from, at, n));
+                from += n;
+                at += n;
+                len -= n;
+                used += n;
+            }
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        let data = self.data as usize;
+        std::thread::scope(|s| {
+            let mut parts = chunks.into_iter();
+            // The submitting thread takes the first chunk itself.
+            let mine = parts.next();
+            let mut handles = Vec::new();
+            for chunk in parts {
+                handles.push(s.spawn(move || {
+                    for (from, at, len) in chunk {
+                        // SAFETY: as above; chunks partition the jobs.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                (data as *const u8).add(from),
+                                (dst + base + at) as *mut u8,
+                                len,
+                            );
+                        }
+                    }
+                }));
+            }
+            if let Some(chunk) = mine {
+                for (from, at, len) in chunk {
+                    // SAFETY: as above.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.data.add(from),
+                            (dst + base + at) as *mut u8,
+                            len,
+                        );
+                    }
+                }
+            }
+            for h in handles {
+                h.join().expect("a snapshot thread panicked");
+            }
+        });
+        drop(hold);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back

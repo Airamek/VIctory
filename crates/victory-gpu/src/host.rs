@@ -2350,9 +2350,11 @@ impl Batch {
         let mut total = 0;
         for (shadow, from, to) in refreshes {
             let (copied, us) = Self::refresh_one(&shadow, from, to);
+            total += copied;
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
-            total += copied;
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = us;
         }
         total
     }
