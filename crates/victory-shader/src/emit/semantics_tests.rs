@@ -886,6 +886,30 @@ fn mad_legacy(a: u32, b: u32, c: u32) -> u32 {
     add(mul_legacy(a, b), c)
 }
 
+/// `v_fma_legacy_f32` (RDNA2): fused like `fma`, but a zero factor (a
+/// denormal read as one) gives a zero product against anything, infinity
+/// and NaN included, so the result is the addend bit-exact (the D3D9
+/// rule; the hardware passes it through, not `0 + addend`, which would
+/// turn -0 into +0 and flush a denormal).
+fn fma_legacy(a: u32, b: u32, c: u32) -> u32 {
+    let (a, b) = (ftz(a), ftz(b));
+    if a & 0x7FFF_FFFF == 0 || b & 0x7FFF_FFFF == 0 {
+        c
+    } else {
+        fma(a, b, c)
+    }
+}
+
+/// Whether `fma_legacy`'s zero-factor path meets an addend the two
+/// backends compute differently: -0 or a denormal. The strict backend
+/// evaluates the lowering's `0 + addend` (+0, flushed); the folding one
+/// passes the addend through bit-exact. The product is the same zero
+/// either way; the sum is what differs, so these inputs show the open
+/// fused-multiply-add defect.
+fn legacy_zero_addend(a: u32, b: u32, c: u32) -> bool {
+    (a & 0x7F80_0000 == 0 || b & 0x7F80_0000 == 0) && (c == 0x8000_0000 || denormal(c))
+}
+
 /// Minimum or maximum: one NaN operand gives the other, two give the
 /// first; -0 orders below +0 (measured on RDNA2, RX 6800, by the Leonida
 /// project with the AnyPS5 hardware oracle).
@@ -1183,13 +1207,15 @@ fn arithmetic_probes() -> Vec<Probe> {
         probe([vop2(0x05, 5, v(1), 2)], ab, F32, |i| {
             vec![add(i[1], i[0] ^ 0x8000_0000)]
         }),
-        // v_fmac_f32, v_mac_f32 and v_mac_legacy_f32 accumulate into v5 = c.
+        // v_fmac_f32, v_mac_f32 and v_fmac_legacy_f32 accumulate into v5 = c.
         accumulate(0x2B, fma, mad),
         accumulate(0x1F, mad, mad),
-        accumulate(0x06, mad_legacy, mad_legacy),
+        accumulate(0x06, fma_legacy, mad_legacy)
+            .shows(FMA, |i| legacy_zero_addend(i[0], i[1], i[2])),
         vop3_f3(0x14B, NONE, fma, mad, abc.clone(), fused),
         vop3_f3(0x141, NONE, mad, mad, abc.clone(), fused),
-        vop3_f3(0x140, NONE, mad_legacy, mad_legacy, abc, fused),
+        vop3_f3(0x140, NONE, fma_legacy, mad_legacy, abc, fused)
+            .shows(FMA, |i| legacy_zero_addend(i[0], i[1], i[2])),
     ];
     let small = pairs(F32_EDGES, &F32_EDGES[..16]);
     let abc_small = triples(&F32_EDGES[..16], &F32_EDGES[..16], F32_THIRD);
@@ -1244,14 +1270,20 @@ fn arithmetic_probes() -> Vec<Probe> {
             abc_small.clone(),
             tolerant(1, m),
         ));
-        p.push(vop3_f3(
-            0x140,
-            m,
-            mad_legacy,
-            mad_legacy,
-            abc_small.clone(),
-            tolerant(1, m),
-        ));
+        p.push(
+            vop3_f3(
+                0x140,
+                m,
+                fma_legacy,
+                mad_legacy,
+                abc_small.clone(),
+                tolerant(1, m),
+            )
+            .shows(FMA, move |i| {
+                let s = |k| mods_in(i[k], k, m);
+                legacy_zero_addend(s(0), s(1), s(2))
+            }),
+        );
         p.push(vop3_f2(0x108, m, mul, small.clone(), tolerant(0, m)));
         p.push(vop3_f2(
             0x104,
@@ -2749,7 +2781,10 @@ fn defect(probes: Vec<Probe>, which: &str) {
 /// on a host that does not. DXIL has no f32 fused multiply-add, so fixing
 /// it means computing the 6.6 M instances in f64 (`Fma` on doubles, where
 /// the host has them: exact product, one rounding to f64, then to f32) or
-/// with an error-free product in f32.
+/// with an error-free product in f32. The legacy `v_fma_legacy_f32` zero
+/// rule shows here too: a zero factor passes the addend through bit-exact
+/// on the folding host, while the strict one computes `0 + addend` (+0
+/// for -0, flushed for a denormal).
 #[test]
 #[ignore = "defect: multiply-adds are fused only where the host fuses"]
 fn defect_multiply_adds_fused_only_where_the_host_fuses() {
