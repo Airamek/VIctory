@@ -313,11 +313,13 @@ impl Uploads {
 ///
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
-pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+/// `add` also takes each range's change-tracker bit, so the submission's
+/// batch can tell a repeat (same generation, same dirtiness) from new work.
+pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize, Option<u32>)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
     for (shadow, address, len, _, bit) in inner.hulls.values() {
         if !crate::watch::clean_bit(*bit) {
-            add(shadow, *address as usize, *len as usize);
+            add(shadow, *address as usize, *len as usize, *bit);
         }
     }
 }
