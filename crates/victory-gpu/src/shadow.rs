@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -66,18 +66,28 @@ struct Snapshots {
     parts: usize,
 }
 
-static SNAPSHOTS: Mutex<Snapshots> = Mutex::new(Snapshots {
+static SNAPSHOTS: RwLock<Snapshots> = RwLock::new(Snapshots {
     bytes: Vec::new(),
     parts: 0,
 });
 
-fn snapshots() -> std::sync::MutexGuard<'static, Snapshots> {
-    SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner())
+/// The running submission's snapshots, for comparing what its shaders
+/// wrote: many threads hold this while copying back, each its own copy's
+/// bytes (disjoint parts of one block).
+fn snapshots() -> std::sync::RwLockReadGuard<'static, Snapshots> {
+    SNAPSHOTS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The snapshots, to keep more bytes or give them up: one thread at a
+/// time, never while another copies back (preparation and copy-back are
+/// separate phases of a submission).
+fn snapshots_mut() -> std::sync::RwLockWriteGuard<'static, Snapshots> {
+    SNAPSHOTS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Gives up the snapshots of `parts`.
 fn forget(parts: &mut Vec<Part>) {
-    let mut snapshots = snapshots();
+    let mut snapshots = snapshots_mut();
     snapshots.parts -= parts.len();
     parts.clear();
     if snapshots.parts == 0 {
@@ -138,7 +148,9 @@ fn kept<'a>(
 }
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+// whose disjoint ranges different submission threads refresh and compare
+// (one thread per host copy in a parallel batch, one range at a time per
+// copy), and title memory is read through the kernel.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
@@ -309,7 +321,7 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::SnapshotBytes, bytes);
             crate::copystat::snapshot(self.start, self.len, bytes);
         }
-        let mut snapshots = snapshots();
+        let mut snapshots = snapshots_mut();
         for (from, to) in gaps {
             // SAFETY: inside the mapping.
             let host = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
@@ -483,7 +495,7 @@ impl Shadow {
         for (a, b) in runs {
             copied += self.copy(a, b);
             let (a, b) = (a - start, b - start);
-            let mut snapshots = snapshots();
+            let mut snapshots = snapshots_mut();
             for p in before.0.iter() {
                 let (s, e) = (p.from.max(a), p.to.min(b));
                 if s < e {

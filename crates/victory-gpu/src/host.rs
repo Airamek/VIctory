@@ -1160,16 +1160,7 @@ impl Host {
                 }
             }
         }
-        for (shadow, address, len, goes_back) in &back {
-            let (address, len) = (*address, *len);
-            if *goes_back {
-                let written = shadow.copy_back(address, len);
-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-            } else {
-                shadow.keep_writes(address, len);
-                crate::memory::note_withheld(len as u64);
-            }
-        }
+        run_back(&back);
         for list in runs {
             for work in &list.deferred().after {
                 work();
@@ -2182,6 +2173,93 @@ impl HostList {
     }
 }
 
+/// One host copy's copy-back ranges (address, length, whether each goes
+/// back), in declaration order.
+type BackGroup = (
+    std::sync::Arc<crate::shadow::Shadow>,
+    Vec<(usize, usize, bool)>,
+);
+
+/// Copies back what the submission's shaders wrote (each range once per
+/// submission, however many dispatches declared it). One thread per host
+/// copy where there are enough ranges: entries of one copy run in
+/// declaration order on one thread (their ranges may overlap); entries of
+/// different copies touch disjoint copy mappings, sharing only locks and
+/// atomic counters.
+fn run_back(back: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)]) {
+    if back.len() < PARALLEL_ENTRIES {
+        for (shadow, address, len, goes_back) in back {
+            run_one_back(shadow, *address, *len, *goes_back);
+        }
+        return;
+    }
+    // Group by host copy, keeping declaration order (first appearance,
+    // then each copy's ranges in order).
+    let mut groups: Vec<BackGroup> = Vec::new();
+    let mut at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (shadow, address, len, goes_back) in back {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        match at.get(&key) {
+            Some(&i) => groups[i].1.push((*address, *len, *goes_back)),
+            None => {
+                at.insert(key, groups.len());
+                groups.push((shadow.clone(), vec![(*address, *len, *goes_back)]));
+            }
+        }
+    }
+    if copy_threads(groups.len()) <= 1 {
+        for (shadow, ranges) in &groups {
+            for &(address, len, goes_back) in ranges {
+                run_one_back(shadow, address, len, goes_back);
+            }
+        }
+        return;
+    }
+    let chunk = groups.len().div_ceil(copy_threads(groups.len()));
+    std::thread::scope(|s| {
+        let mut parts = groups.chunks(chunk);
+        // The submitting thread takes the first chunk itself.
+        let mine = parts.next();
+        let mut handles = Vec::new();
+        for part in parts {
+            handles.push(s.spawn(move || {
+                for (shadow, ranges) in part {
+                    for &(address, len, goes_back) in ranges {
+                        run_one_back(shadow, address, len, goes_back);
+                    }
+                }
+            }));
+        }
+        if let Some(part) = mine {
+            for (shadow, ranges) in part {
+                for &(address, len, goes_back) in ranges {
+                    run_one_back(shadow, address, len, goes_back);
+                }
+            }
+        }
+        for h in handles {
+            h.join().expect("a copy-back thread panicked");
+        }
+    });
+}
+
+/// One copy-back entry: what shaders wrote in the range goes back into
+/// title memory, or is kept where shaders read with no copy.
+fn run_one_back(
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    address: usize,
+    len: usize,
+    goes_back: bool,
+) {
+    if goes_back {
+        let written = shadow.copy_back(address, len);
+        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+    } else {
+        shadow.keep_writes(address, len);
+        crate::memory::note_withheld(len as u64);
+    }
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -2206,6 +2284,22 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+}
+
+/// Entries that pay back data-parallel copies: at least this many ranges
+/// in one batch before threads are worth their spawning.
+const PARALLEL_ENTRIES: usize = 16;
+
+/// Threads for a data-parallel batch of copies: half the logical
+/// processors, as the pipeline workers, so the title's threads still have
+/// cores (one thread per host copy at most).
+fn copy_threads(entries: usize) -> usize {
+    if entries < PARALLEL_ENTRIES {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map_or(2, |n| (n.get() / 2).clamp(2, 8))
+        .min(entries)
 }
 
 impl Batch {
@@ -2240,32 +2334,108 @@ impl Batch {
         self.current.clear();
     }
 
-    /// Does the refreshes; returns the bytes copied.
+    /// Does the refreshes; returns the bytes copied. One thread per host
+    /// copy where there are enough of them: entries name distinct copies
+    /// (`pending` merged each copy's), so their updates touch disjoint
+    /// title ranges and copy mappings.
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
+        let refreshes = std::mem::take(&mut self.refreshes);
+        for (shadow, from, to) in &refreshes {
+            self.note_current(shadow, *from, *to);
+        }
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        let mut ranges: Vec<(usize, usize, u64)> = Vec::new();
+        let mut subs = Vec::new();
+        if copy_threads(refreshes.len()) <= 1 {
+            subs.push(Self::refresh_many(&refreshes));
+        } else {
+            let chunk = refreshes
+                .len()
+                .div_ceil(copy_threads(refreshes.len()));
+            std::thread::scope(|s| {
+                let mut parts = refreshes.chunks(chunk);
+                // The submitting thread takes the first chunk itself.
+                let mine = parts.next();
+                let mut handles = Vec::new();
+                for part in parts {
+                    handles.push(s.spawn(move || Self::refresh_many(part)));
+                }
+                if let Some(part) = mine {
+                    subs.push(Self::refresh_many(part));
+                }
+                for h in handles {
+                    subs.push(h.join().expect("a refresh thread panicked"));
+                }
+            });
+        }
+        for (sub, local) in subs {
+            total += sub;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
-            }
+            ranges.extend(local);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = local;
+        }
+        #[cfg(feature = "diagnostics")]
+        for (from, len, us) in ranges {
+            crate::copystat::range(from, len, us, 0);
         }
         total
+    }
+
+    /// One refresh: the copy's changed pages, and how long it took.
+    fn refresh_one(
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        from: usize,
+        to: usize,
+    ) -> (usize, u64) {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        (copied, us)
+    }
+
+    /// The refreshes of `part` (one thread's chunk): bytes copied, and per
+    /// range (start, length, microseconds) for diagnostics.
+    fn refresh_many(
+        part: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+    ) -> (usize, Vec<(usize, usize, u64)>) {
+        let mut total = 0;
+        #[cfg(feature = "diagnostics")]
+        let mut ranges = Vec::with_capacity(part.len());
+        #[cfg(not(feature = "diagnostics"))]
+        let ranges = Vec::new();
+        for (shadow, from, to) in part {
+            let (copied, us) = Self::refresh_one(shadow, *from, *to);
+            total += copied;
+            #[cfg(feature = "diagnostics")]
+            ranges.push((*from, *to - *from, us));
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = us;
+        }
+        (total, ranges)
+    }
+
+    /// Remembers a flushed refresh as the copy's range brought up to date:
+    /// the union with what was current if they touch, else the larger.
+    fn note_current(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        from: usize,
+        to: usize,
+    ) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let (_, a, b) = self.current.entry(key).or_insert((shadow.clone(), from, to));
+        if from <= *b && *a <= to {
+            (*a, *b) = ((*a).min(from), (*b).max(to));
+        } else if to - from > *b - *a {
+            (*a, *b) = (from, to);
+        }
     }
 }
 
@@ -3371,6 +3541,7 @@ fn pump() {
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
+    use super::{PARALLEL_ENTRIES, copy_threads, run_back};
     use std::sync::Arc;
 
     #[test]
@@ -3436,6 +3607,129 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// Enough host copies flush their refreshes on threads: disjoint copies
+    /// copy what the title wrote, each once, as in one thread.
+    #[test]
+    fn parallel_flush_copies_each_copy_once() {
+        use crate::watch::PAGE;
+        const COPIES: usize = 20;
+        let mut pools = Vec::with_capacity(COPIES);
+        let mut shadows = Vec::with_capacity(COPIES);
+        for _ in 0..COPIES {
+            let p = crate::watch::tests::pool(1);
+            crate::shadow::register(p, p as u64, PAGE as u64);
+            let Some(copy) = crate::shadow::find(p as u64, PAGE as u64) else {
+                crate::shadow::unregister(p, p as u64);
+                crate::watch::tests::free(p);
+                for (p, copy) in pools {
+                    crate::shadow::unregister(p, p as u64);
+                    drop(copy);
+                    crate::watch::tests::free(p);
+                }
+                return; // no host GPU here
+            };
+            pools.push((p, copy.clone()));
+            shadows.push(copy);
+        }
+        // The title writes one page's byte in every pool.
+        for (i, &(p, _)) in pools.iter().enumerate() {
+            // SAFETY: our pools, guarded since the copies took them.
+            unsafe { ((p + 8) as *mut u8).write_volatile(i as u8) };
+        }
+        let mut batch = Batch::default();
+        for (p, copy) in &pools {
+            batch.add(copy, *p, PAGE);
+        }
+        assert_eq!(batch.flush(), COPIES * PAGE, "every copy once");
+        for (i, (p, copy)) in pools.iter().enumerate() {
+            assert_eq!(copy.read_host((*p + 8) as u64, 1)[0].to_le_bytes()[0], i as u8);
+        }
+        // Only three pools change before the next submission.
+        for &(p, _) in pools.iter().take(3) {
+            // SAFETY: as above.
+            unsafe { ((p + 16) as *mut u8).write_volatile(0x5a) };
+        }
+        let mut batch = Batch::default();
+        for (p, copy) in &pools {
+            batch.add(copy, *p, PAGE);
+        }
+        assert_eq!(batch.flush(), 3 * PAGE, "only the pages written");
+        for (p, copy) in pools {
+            crate::shadow::unregister(p, p as u64);
+            drop(copy);
+            crate::watch::tests::free(p);
+        }
+    }
+
+    /// Enough declared ranges copy back on threads: what the GPU wrote goes
+    /// back in every range, overlapping ranges of one copy in order.
+    #[test]
+    fn parallel_copy_back_goes_back_in_every_range() {
+        use crate::watch::PAGE;
+        const COPIES: usize = 16;
+        let mut pools = Vec::with_capacity(COPIES);
+        for _ in 0..COPIES {
+            let p = crate::watch::tests::pool(1);
+            crate::shadow::register(p, p as u64, PAGE as u64);
+            let Some(copy) = crate::shadow::find(p as u64, PAGE as u64) else {
+                crate::shadow::unregister(p, p as u64);
+                crate::watch::tests::free(p);
+                for (p, copy) in pools {
+                    crate::shadow::unregister(p, p as u64);
+                    drop(copy);
+                    crate::watch::tests::free(p);
+                }
+                return; // no host GPU here
+            };
+            pools.push((p, copy));
+        }
+        let mut back = Vec::new();
+        for (i, &(p, ref copy)) in pools.iter().enumerate() {
+            assert_eq!(copy.update(p, PAGE), PAGE);
+            // Two ranges (overlapping on the first copy), each twice: the
+            // run dedupes exact repeats and keeps declaration order.
+            let (a, b) = if i == 0 { ((0, 100), (50, 150)) } else { ((0, 64), (PAGE - 64, 64)) };
+            copy.writing(p + a.0, a.1);
+            copy.writing(p + b.0, b.1);
+            // The shaders write one byte in each range.
+            copy.write_host((p + a.0) as u64, &[i as u8]);
+            copy.write_host((p + b.0) as u64, &[(i as u8).wrapping_add(1)]);
+            back.push((copy.clone(), p + a.0, a.1, true));
+            back.push((copy.clone(), p + a.0, a.1, true));
+            back.push((copy.clone(), p + b.0, b.1, true));
+            back.push((copy.clone(), p + b.0, b.1, true));
+        }
+        // More entries than one thread takes, over enough copies.
+        assert!(back.len() >= PARALLEL_ENTRIES);
+        run_back(&back);
+        for (i, &(p, _)) in pools.iter().enumerate() {
+            // SAFETY: our pools.
+            unsafe {
+                if i == 0 {
+                    assert_eq!((p as *const u8).read_volatile(), 0);
+                    assert_eq!(((p + 50) as *const u8).read_volatile(), 1);
+                } else {
+                    assert_eq!((p as *const u8).read_volatile(), i as u8);
+                    assert_eq!(((p + PAGE - 64) as *const u8).read_volatile(), (i as u8).wrapping_add(1));
+                }
+            }
+        }
+        for (p, copy) in pools {
+            crate::shadow::unregister(p, p as u64);
+            drop(copy);
+            crate::watch::tests::free(p);
+        }
+    }
+
+    /// Copy threads stay serial under the threshold and fan out above it.
+    #[test]
+    fn copy_threads_fan_out_above_the_threshold() {
+        assert_eq!(copy_threads(0), 1);
+        assert_eq!(copy_threads(PARALLEL_ENTRIES - 1), 1);
+        assert!(copy_threads(PARALLEL_ENTRIES) >= 2);
+        assert!(copy_threads(1 << 20) <= 8);
     }
 
     /// The hashing a submission does for textures in physical-page memory,
