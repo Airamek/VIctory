@@ -197,7 +197,16 @@ fn pump(held: &mut Holding, why: Why) {
         return;
     }
     let Some(host) = crate::host::host() else { return };
-    let read = read_value;
+    // A wait reads title memory: finish the submissions in flight whose
+    // GPU work writes the word first, so that a piece this pump ran (its
+    // bottom-of-pipe writes included) is visible to the next segment's
+    // waits, as our async submissions run after they are made. Scoped to
+    // the word (the timeline tracks those writes as labels): wait-free
+    // batching still submits without waiting.
+    let read = |address: u64, bytes: u8| {
+        host.settle_range(address as usize, usize::from(bytes), false);
+        read_value(address, bytes)
+    };
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");

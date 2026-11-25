@@ -3043,6 +3043,20 @@ impl Host {
             .conflict(address, address.saturating_add(len), writing)
     }
 
+    /// Before title memory `[address, address + len)` is read outside a
+    /// submission (or, with `writing`, written): finishes the submissions in
+    /// flight whose GPU work writes it (or reads it). The held-work pump
+    /// reads wait words here: a piece this pump ran (its bottom-of-pipe
+    /// writes included) must be visible to the next segment's waits.
+    pub(crate) fn settle_range(&self, address: usize, len: usize, writing: bool) {
+        if let Some(value) = self.conflict_range(address, len, writing) {
+            #[cfg(feature = "diagnostics")]
+            self.settle_noted(value, starve::CONFLICT);
+            #[cfg(not(feature = "diagnostics"))]
+            self.settle(value);
+        }
+    }
+
     /// Finishes the submissions in flight a conflict answer names, noting
     /// a real wait for the diagnostics timing.
     #[cfg(feature = "diagnostics")]
