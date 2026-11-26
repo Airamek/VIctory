@@ -5112,7 +5112,7 @@ unsafe extern "C" {
 #[cfg(target_arch = "x86_64")]
 fn ensure_safe_copy_veh() {
     use windows_sys::Win32::Foundation::{
-        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
+        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
     };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -5123,6 +5123,7 @@ fn ensure_safe_copy_veh() {
         let r = unsafe { &*(*info).ExceptionRecord };
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && r.ExceptionCode != EXCEPTION_IN_PAGE_ERROR as NTSTATUS
+            && r.ExceptionCode != EXCEPTION_GUARD_PAGE as NTSTATUS
         {
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -5140,6 +5141,9 @@ fn ensure_safe_copy_veh() {
             {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+            if r.ExceptionCode == EXCEPTION_GUARD_PAGE as NTSTATUS {
+                guard_again(r.ExceptionInformation[1]);
+            }
             ctx.Rip = (&raw const victory_safe_copy_fault) as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -5150,6 +5154,34 @@ fn ensure_safe_copy_veh() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(handler));
     });
+}
+
+/// Makes the page of `at`, whose guard our copy just spent, a guard page
+/// again: a read that touches a title guard must report it (the piece reads
+/// as zeros) without disarming it. Mirrors `title_copy::guard_again`, which
+/// takes over this once the tiersmalls merge brings that module in.
+#[cfg(target_arch = "x86_64")]
+fn guard_again(at: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT {
+        return;
+    }
+    let protect = |protection: u32| {
+        let mut old = 0;
+        // SAFETY: only the page's protection changes; fails if it is gone.
+        (unsafe { VirtualProtect(at as *const _, 1, protection, &mut old) } != 0).then_some(old)
+    };
+    if let Some(old) = protect(info.Protect | PAGE_GUARD)
+        && old & !PAGE_GUARD != info.Protect & !PAGE_GUARD
+    {
+        protect(old);
+    }
 }
 
 /// Zero-syscall user-mode copy for non-overlapping ranges; returns `false` if
@@ -5181,8 +5213,8 @@ fn try_user_copy(dst: *mut u8, src: *const u8, len: usize) -> Option<bool> {
 mod title_copies {
     use super::{copy_mapped, read_into, write_mapped};
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
-        VirtualAlloc, VirtualFree, VirtualProtect,
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS,
+        PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
     };
 
     const BLOCK: usize = 64 << 10;
@@ -5310,6 +5342,94 @@ mod title_copies {
 
         // SAFETY: our reservation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The page's protection, `PAGE_GUARD` included.
+    fn guarded_protection(at: *mut u8, page: usize) -> u32 {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a page of ours and a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at.add(page * PAGE).cast(), &mut info, size_of_val(&info)) };
+        assert_ne!(n, 0);
+        info.Protect
+    }
+
+    const PAGE: usize = 4096;
+
+    /// A fallback copy (`read()`/`write_mapped` through `try_user_copy`)
+    /// over an armed guard page fails cleanly instead of ending the
+    /// process, reads zeros for the guarded bytes, and leaves the guard
+    /// armed: a second copy still fails, and the protection still carries
+    /// `PAGE_GUARD`. Mirrors `title_copy`'s `guard_pages_stay_guarded`.
+    #[test]
+    fn safe_copy_keeps_armed_guard_pages_armed() {
+        for (start, len) in [
+            (PAGE, 1),
+            (PAGE + 2000, 100),
+            (PAGE - 1, 2),
+            (PAGE - 500, 1000),
+            (0, 3 * PAGE),
+        ] {
+            // SAFETY: a fresh allocation, filled within its size.
+            let at = unsafe {
+                let at = VirtualAlloc(
+                    std::ptr::null(),
+                    3 * PAGE,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+                .cast::<u8>();
+                assert!(!at.is_null());
+                for i in 0..3 * PAGE {
+                    at.add(i).write((i * 31 + i / 256 + 1) as u8);
+                }
+                at
+            };
+            let mut old = 0;
+            // SAFETY: the middle page of ours.
+            let armed = unsafe {
+                VirtualProtect(at.add(PAGE).cast(), PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old)
+            };
+            assert_ne!(armed, 0);
+            let mut got = vec![0xeeu8; len];
+            // SAFETY: an address in our allocation.
+            let src = unsafe { at.add(start) };
+            // A guarded byte fails the whole fallback read, without ending
+            // the process; `copy_mapped` still copies around it.
+            assert!(!read_into(src, &mut got), "{start} {len}");
+            copy_mapped(got.as_mut_ptr(), src, len, false);
+            assert_eq!(guarded_protection(at, 1), PAGE_READWRITE | PAGE_GUARD, "{start} {len}");
+            for (i, &b) in got.iter().enumerate() {
+                let i = start + i;
+                let want = if (PAGE..2 * PAGE).contains(&i) {
+                    0
+                } else {
+                    (i * 31 + i / 256 + 1) as u8
+                };
+                assert_eq!(b, want, "byte {i} of {start} {len}");
+            }
+            // The guard survived the copy above (not spent by the touch):
+            // a second copy still reports the page, with zeros for it.
+            got.fill(0xee);
+            assert!(!read_into(src, &mut got), "second read {start} {len}");
+            copy_mapped(got.as_mut_ptr(), src, len, false);
+            assert_eq!(guarded_protection(at, 1), PAGE_READWRITE | PAGE_GUARD, "{start} {len}");
+            for (i, &b) in got.iter().enumerate() {
+                let i = start + i;
+                let want = if (PAGE..2 * PAGE).contains(&i) {
+                    0
+                } else {
+                    (i * 31 + i / 256 + 1) as u8
+                };
+                assert_eq!(b, want, "byte {i} of second {start} {len}");
+            }
+            // A copy-back over the armed guard leaves it armed too.
+            let over = vec![0x3cu8; len];
+            write_mapped(src, over.as_ptr(), len);
+            assert_eq!(guarded_protection(at, 1), PAGE_READWRITE | PAGE_GUARD, "{start} {len}");
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(at.cast(), 0, MEM_RELEASE) };
+        }
     }
 }
 
