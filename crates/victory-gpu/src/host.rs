@@ -3162,7 +3162,7 @@ impl Host {
             // every list alive and unmoved for this live dereference.
             // Owned clones: `each_work` only lends each submission for the
             // call, so the report holds its own pins.
-            let mut held: Vec<std::sync::Arc<HostList>> = p.lists.iter().cloned().collect();
+            let mut held: Vec<std::sync::Arc<HostList>> = p.lists.to_vec();
             self.timeline
                 .each_work(|w| held.extend(w.lists.iter().cloned()));
             let runs: Vec<&HostList> = held.iter().map(|l| l.as_ref()).collect();
@@ -3800,17 +3800,6 @@ impl HostList {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
-        }
-    }
-
-    /// Waits for the list's last submission and finishes it (and those
-    /// before it).
-    pub(crate) fn settle(&self) {
-        let last = self.last.load(Ordering::Acquire);
-        if last != 0
-            && let Some(host) = made()
-        {
-            host.settle(last);
         }
     }
 
@@ -8508,7 +8497,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
         fn contract(of: fn(&[&Arc<HostList>]) -> (Pending, Touches)) {
             let _ = of;
         }
-        let _ = contract(Pending::of);
+        contract(Pending::of);
         fn lists_are_arcs(p: &Pending) {
             let _: &Vec<Arc<HostList>> = &p.lists;
             let _: &std::collections::BTreeSet<String> = &p.pipelines;
