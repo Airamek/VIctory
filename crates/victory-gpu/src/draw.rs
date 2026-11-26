@@ -3551,6 +3551,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let write = |byte: u8| unsafe { std::ptr::write_bytes(address as *mut u8, byte, 64 * 64 * 4) };
         write(0x40);
         host.execute(&[&reading()]);
+        // Submissions run async: the temporary list's drop no longer
+        // settles (an `Arc` drop only releases), so drain explicitly
+        // before reading the output back (as the sibling tests do).
+        host.drain();
         assert!((texel() - 64.0 / 255.0).abs() < 1e-6, "uploaded: {}", texel());
         // The title writes the memory again and a list reading the texture
         // is recorded: its upload is due.
