@@ -1287,8 +1287,55 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
+    // Same 16-byte rule as make-time (`buffer_srv`/`buffer_uav`): when make
+    // re-resolved a RAW view to an exact copy, use-time must resolve to
+    // that same copy. Otherwise the slot's kept copy is never refreshed
+    // and shaders read zeros (black screen with no device removal).
+    if view_needs_align(view) {
+        let (first, _) = crate::shadow::for_view(address, len, 0)?;
+        if first.offset(address) % 16 != 0 {
+            let (shadow, _) = crate::shadow::for_view(address, len, 16)?;
+            return Some((shadow, address, len));
+        }
+    }
     let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
     Some((shadow, address, len))
+}
+
+/// Whether `make` emits this view as RAW (and so may have re-resolved it
+/// to a 16-aligned exact copy): structured strides that are 16-byte
+/// multiples, or the RAW flag. Mirrors `buffer_srv`/`buffer_uav`.
+fn view_needs_align(view: &View) -> bool {
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+            Ok(words) => (*unordered, words),
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    // Buffers only (dimension 1), as in `view_stride`.
+    if words[1] != 1 {
+        return false;
+    }
+    if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        if buffer.StructureByteStride > 0 {
+            return raw_stride(buffer.StructureByteStride);
+        }
+        buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+    } else {
+        let desc = srv_desc(words);
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        if buffer.StructureByteStride > 0 {
+            return raw_stride(buffer.StructureByteStride);
+        }
+        buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
+    }
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
