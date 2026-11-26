@@ -532,7 +532,11 @@ impl Shared {
         // for `TABLE_DWORDS` dwords; no submission runs.
         let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
         let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
-        tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
+        tracing::debug!(
+            copies = ranges.len(),
+            blocks = blocks.len() - 1,
+            "title memory page table"
+        );
         self.layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
@@ -705,7 +709,12 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         has_missed(marks, &l)
     });
     list.defer_after(move || {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+        let Layout {
+            copies,
+            blocks,
+            owner,
+            ..
+        } = &*layout(key);
         // Freeze the declared ranges for this readback.
         let declared = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         let mut precise = AdaptiveRanges::new(&declared);

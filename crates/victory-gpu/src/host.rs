@@ -6331,7 +6331,10 @@ mod batch {   // `mod tests` is already taken at the top of this file
     #[test]
     fn only_a_redirecting_repeat_splits_the_call() {
         assert!(!needs_cut(false, false), "a first run never splits");
-        assert!(!needs_cut(false, true), "from before the last cut: no split");
+        assert!(
+            !needs_cut(false, true),
+            "from before the last cut: no split"
+        );
         assert!(!needs_cut(true, false), "a clean repeat shares the call");
         assert!(needs_cut(true, true), "a redirecting repeat splits it");
     }
@@ -6356,7 +6359,10 @@ mod batch {   // `mod tests` is already taken at the top of this file
         );
         assert_eq!(
             rs,
-            [(0x1_0000, 0x1_2000 + crate::watch::PAGE), (0x40_0000, 0x40_1000),]
+            [
+                (0x1_0000, 0x1_2000 + crate::watch::PAGE),
+                (0x40_0000, 0x40_1000),
+            ]
         );
         // ... a page and one byte more stays apart.
         push_range(
@@ -6390,7 +6396,11 @@ mod batch {   // `mod tests` is already taken at the top of this file
         push_copied(&mut copied, 0x1_1000, 0x2_1000);
         assert_eq!(
             copied,
-            [(0x1_0000, 0x1_1000), (0x1_1000, 0x2_1000), (0x2_1000, 0x2_2000)]
+            [
+                (0x1_0000, 0x1_1000),
+                (0x1_1000, 0x2_1000),
+                (0x2_1000, 0x2_2000)
+            ]
         );
         assert!(!covered(&copied, 0x1_1000 - 4, 0x1_1000 + 4));
         // Overlapping without a whole page between them: not joined either,

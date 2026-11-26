@@ -938,7 +938,11 @@ pub(crate) mod tests {
         let first = writing(p + PAGE, 3 * PAGE);
         let second = writing(p + 2 * PAGE, 3 * PAGE);
         let duplicate = writing(p + 2 * PAGE, 3 * PAGE);
-        let extra = [writing(p, 1), writing(p + 5 * PAGE, 1), writing(p + 5 * PAGE, 1)];
+        let extra = [
+            writing(p, 1),
+            writing(p + 5 * PAGE, 1),
+            writing(p + 5 * PAGE, 1),
+        ];
         t.take(p, p + 6 * PAGE);
         assert!((0..6).all(|i| t.changed(p / PAGE + i)));
         drop(first);
