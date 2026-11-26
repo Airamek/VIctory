@@ -964,6 +964,10 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        debug_assert!(
+            !list.is_copy(),
+            "resolve on a COPY list: copies resolve on DIRECT lists only"
+        );
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
@@ -1170,6 +1174,10 @@ fn mark(this: This, heap: This, kind: u32, index: u32, begin: bool) {
         && let Some(list) = host_list(this)
         && let Some((host, query)) = crate::query::host(heap)
     {
+        debug_assert!(
+            !list.is_copy(),
+            "queries on a COPY list: occlusion marks run on DIRECT lists only"
+        );
         // SAFETY: an open list and the quarter the heap was made with.
         unsafe {
             if begin {
@@ -1221,6 +1229,10 @@ pub(crate) extern "system" fn resolve_queries(
         && let Some(readback) =
             crate::host::host().and_then(|h| h.readback_buffer(u64::from(count.max(1)) * 8))
     {
+        debug_assert!(
+            !list.is_copy(),
+            "query resolve on a COPY list: resolves run on DIRECT lists only"
+        );
         // SAFETY: an open list, our heap and a buffer made for exactly
         // these results, in the state a resolve needs.
         unsafe {

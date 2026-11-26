@@ -86,6 +86,10 @@ pub fn record<R>(
 ) -> Option<R> {
     let mut out = None;
     crate::list::with_state(list, |host, state| {
+        debug_assert!(
+            !host.is_copy(),
+            "external recording on a COPY list: draws and dispatches run on DIRECT lists only"
+        );
         state.flush_indirect(host);
         out = Some(f(&host.list));
         state.host_state_lost();
