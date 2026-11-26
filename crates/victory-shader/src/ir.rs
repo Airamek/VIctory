@@ -746,8 +746,8 @@ const DROPPED: &[&str] = &[
     "v_clrexcp",
 ];
 
-/// Registers read, registers written.
-/// Registers an instruction reads and writes, with placeholder [`NONE`] values before renaming.
+/// Registers read, registers written, each with a placeholder value the
+/// SSA pass fills in.
 type Effects = (Vec<(Reg, Value)>, Vec<(Reg, Value)>);
 
 /// Registers an instruction reads and writes, one per dword, or `None` if
@@ -1022,7 +1022,7 @@ fn effects(
     if vector {
         r.extend(mask(EXEC));
         // Lanes disabled in EXEC keep the old value.
-        r.extend(w.iter().filter(|&&(reg, _)| matches!(reg, Reg::V(_))).copied());
+        r.extend(w.iter().filter(|(w, _)| matches!(w, Reg::V(_))).cloned());
     }
     let mut seen: RegSet = [0; REGS.div_ceil(64)];
     r.retain(|&(reg, _)| {
@@ -1104,7 +1104,7 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<(Reg, Value)>) -> Result<(), 
             if end > 128 {
                 return Err(());
             }
-            out.extend((code..end as u8).map(|r| (Reg::S(r), NONE)));
+            out.extend((code..end as u8).map(|c| (Reg::S(c), NONE)));
         }
         Operand::Vector { reg, dwords } => {
             if u16::from(reg) + u16::from(dwords) > 256 {

@@ -200,19 +200,48 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
         }
     }
     // Only converted routes need the buffer; D32 twins copy directly and
-    // take no extra GPU memory.
+    // take no extra GPU memory. Converted routes share one buffer per
+    // power-of-two size class (#2162).
     let scratch = if at > 0 {
-        let Some(buffer) = scratch_buffer(at) else {
+        let Some(buffer) = shared_scratch(at) else {
             tracing::warn!(at, "no buffer for a depth twin's converted copies: no writable twin");
             return None;
         };
-        crate::host::name(&buffer, || format!("depth twin copies {at:#x}"));
         Some(buffer)
     } else {
         None
     };
     tracing::debug!(console, width = dd.Width, height = dd.Height, planes = planes.len(), "a writable twin for a depth texture");
     Some(Twin { planes, newer: AtomicU8::new(DEPTH), routes, scratch })
+}
+
+/// Scratch buffers shared by the twins, one per power-of-two size: a
+/// buffer each held as much video memory as its twin's planes for good
+/// (about 325 MB for Grand Theft Auto VI's 315 twins in the menu).
+/// Sharing is safe: every copy through one ([`Twin::copy`]) starts in the
+/// common state and returns the buffer to it, so copies in one list are
+/// ordered by those transitions, and lists run one after another on the
+/// host's single queue.
+struct Scratch(Vec<(u64, ID3D12Resource)>);
+
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for Scratch {}
+
+static SCRATCH: std::sync::Mutex<Scratch> = std::sync::Mutex::new(Scratch(Vec::new()));
+
+/// The shared scratch buffer of at least `size` bytes: the one of `size`'s
+/// power-of-two class, made on first use. All of them together hold at
+/// most twice the largest.
+fn shared_scratch(size: u64) -> Option<ID3D12Resource> {
+    let class = size.max(1 << 16).next_power_of_two();
+    let mut all = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, buffer)) = all.0.iter().find(|(c, _)| *c == class) {
+        return Some(buffer.clone());
+    }
+    let buffer = scratch_buffer(class)?;
+    crate::host::name(&buffer, || format!("depth twin copies {class:#x}"));
+    all.0.push((class, buffer.clone()));
+    Some(buffer)
 }
 
 /// A default-heap buffer of `size` bytes shaders may write, in the common
@@ -324,7 +353,7 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
     let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
     if let Some(to_depth) = list.twin_use(depth, side, writes)
-        && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w), list)
+        && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
     {
         list.need_rebind();
     }
@@ -406,17 +435,8 @@ impl Twin {
     /// the twin into `depth` (`to_depth`) or back. `mv` moves textures to
     /// the copy states (tracked by the list, or from their real states in
     /// a prelude). True if it ran our conversion, which replaces the
-    /// list's compute root signature and pipeline. DIRECT lists only (the
-    /// conversion dispatches compute): `host` guards the entry.
-    pub(crate) fn copy(
-        &self,
-        l: &ID3D12GraphicsCommandList,
-        depth: &Arc<HostTexture>,
-        to_depth: bool,
-        mv: &mut Mover,
-        host: &HostList,
-    ) -> bool {
-        host.assert_direct("Twin::copy");
+    /// list's compute root signature and pipeline.
+    pub(crate) fn copy(&self, l: &ID3D12GraphicsCommandList, depth: &Arc<HostTexture>, to_depth: bool, mv: &mut Mover) -> bool {
         let (src, dst) = if to_depth { (COPY_SOURCE, COPY_DEST) } else { (COPY_DEST, COPY_SOURCE) };
         let mut barriers: Vec<_> = self.planes.iter().filter_map(|p| mv(p, src)).collect();
         barriers.extend(mv(depth, dst));
@@ -743,7 +763,7 @@ mod tests {
         // SAFETY: an open list and live textures; the copies below move
         // only subresources between their named states.
         unsafe { list.list.ResourceBarrier(&barriers) };
-        assert!(!twin.copy(&list.list, &depth, false, &mut |_, _| None, &list), "no conversion");
+        assert!(!twin.copy(&list.list, &depth, false, &mut |_, _| None), "no conversion");
 
         // Read the twin plane back.
         let plane = &twin.planes[0];

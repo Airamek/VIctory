@@ -387,9 +387,16 @@ impl Uploads {
 /// batch can tell a repeat (same generation, same dirtiness) from new work.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize, Option<u32>)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, _, bit) in inner.hulls.values() {
+    for (shadow, address, len, uav, bit) in inner.hulls.values() {
         if !crate::watch::clean_bit(*bit) {
-            add(shadow, *address as usize, *len as usize, *bit);
+            // Marked unordered views refresh whole 64 KiB pages (#2172):
+            // the title may have written any byte of one.
+            let (address, len) = if *uav && shadow.marked() {
+                shadow.page_range(*address, *len)
+            } else {
+                (*address, *len)
+            };
+            add(shadow, address as usize, len as usize, *bit);
         }
     }
 }

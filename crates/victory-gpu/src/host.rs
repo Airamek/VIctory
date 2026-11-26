@@ -16,14 +16,17 @@ use std::time::{Duration, Instant};
 use crate::timeline::{Timeline, Touches};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::{
+    D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
+};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -45,6 +48,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) depth_bounds_supported: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -357,6 +361,15 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+        let depth_bounds_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS2,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .is_ok()
+            && options.DepthBoundsTestSupported.as_bool();
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -425,10 +438,7 @@ fn create() -> windows::core::Result<Host> {
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
-        match (victory_shader::emit::host::Host {
-            device: device.clone(),
-        })
-        .fuses_fmad()
+        match victory_shader::emit::host::Host::from_device(device.clone()).fuses_fmad()
         {
             Ok(true) => {}
             Ok(false) => tracing::warn!(
@@ -438,6 +448,7 @@ fn create() -> windows::core::Result<Host> {
         }
         Ok(Host {
             device,
+            depth_bounds_supported,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -1094,6 +1105,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn present_compositor_builds_both_pipeline_states() {
+        let Some(host) = host() else {
+            eprintln!("skipping compositor initialization: no D3D12 device");
+            return;
+        };
+        Compositor::new(&host.device, DXGI_FORMAT_R8G8B8A8_UNORM)
+            .expect("create compositor root signature and both pipeline states");
+        eprintln!("PresentX compositor initialized");
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -1274,6 +1296,7 @@ pub(crate) struct HostList {
     /// Swapped for a fresh one when the list is reset while it runs.
     allocator: Mutex<ID3D12CommandAllocator>,
     pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1354,6 +1377,11 @@ impl Drop for HostList {
 unsafe impl Send for HostList {}
 // SAFETY: as above.
 unsafe impl Sync for HostList {}
+
+pub(crate) fn warn_depth_bounds() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!("the host GPU has no depth bounds test; depth bounds are ignored"));
+}
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 /// The last two slots are the list's busy pair (start at open, end at
@@ -2069,6 +2097,7 @@ impl Host {
             let made = HostList {
                 kind,
                 allocator: Mutex::new(allocator),
+                depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -3866,9 +3895,6 @@ impl HostList {
     /// SHADER_RESOURCE barrier. Used at submission, before preludes run.
     pub(crate) fn ensure_shader_resource(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) {
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-        // Textures move to shader-readable on the DIRECT side only (as
-        // buffers in `ensure_buffer_readable` below).
-        self.assert_direct("ensure_shader_resource");
         let wanted = legal_state(&copy.texture, SHADER_RESOURCE);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -4041,13 +4067,7 @@ impl HostList {
                 .collect();
             barriers.extend(buffer_states.values().filter_map(|(first, _, shadow)| {
                 let real = shadow.state.load(Ordering::Relaxed);
-                // As textures above: a COPY-kind prelude moves only between
-                // copy states (buffers never name one; no producer moves
-                // them there today).
-                (real != *first
-                    && (!self.is_copy()
-                        || (copy_buffer_state_legal(real) && copy_buffer_state_legal(*first))))
-                .then(|| {
+                (real != *first).then(|| {
                     transition(
                         &shadow.buffer,
                         D3D12_RESOURCE_STATES(real as i32),
@@ -4102,7 +4122,7 @@ impl HostList {
                                 ));
                                 there
                             })
-                        }, self);
+                        });
                         if !back.is_empty() {
                             list.ResourceBarrier(&back);
                         }
@@ -5571,11 +5591,7 @@ impl Batch<'_> {
     /// share a buffer (one barrier cannot move both ends), or a queued copy
     /// already uses one of the buffers in the other role (the prelude merges
     /// each buffer's needs with OR, so COPY_SOURCE | COPY_DEST is no valid
-    /// state), or the submission already declared shader writes over them,
-    /// or either buffer is outside the copy states (the copy engine barriers
-    /// only between COMMON, COPY_SOURCE and COPY_DEST: a buffer the DIRECT
-    /// side left readable or writable records no valid barrier on a COPY
-    /// list).
+    /// state), or the submission already declared shader writes over them.
     fn queue_gpu_copy(&mut self, list: &HostList, src: usize, dst: usize, len: usize) {
         if len == 0 {
             return;
@@ -5587,24 +5603,6 @@ impl Batch<'_> {
             return;
         };
         if !src_shadow.covers(src, len) || !dst_shadow.covers(dst, len) {
-            return;
-        }
-        // The copy engine moves only between copy states: a buffer the
-        // DIRECT side left readable or writable (VERTEX, SHADER_RESOURCE,
-        // UAV, ...) records no valid barrier on a COPY list, so its copies
-        // keep their CPU result (already in title memory). Before any side
-        // effect below (the refresh, the current mark), so a refused copy
-        // changes nothing.
-        let (src_state, dst_state) = (
-            src_shadow.state.load(Ordering::Relaxed),
-            dst_shadow.state.load(Ordering::Relaxed),
-        );
-        if !copy_buffer_state_legal(src_state) || !copy_buffer_state_legal(dst_state) {
-            tracing::debug!(
-                src_state,
-                dst_state,
-                "buffer-to-buffer copy stays on the CPU: a buffer state the copy engine cannot barrier"
-            );
             return;
         }
         // One buffer cannot be both ends of one barrier pair without an
@@ -6478,6 +6476,198 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 }
 
 const BUFFERS: u32 = 2;
+const MAX_PLANES: u32 = 8;
+
+/// Built-in fullscreen-triangle compositor for multi-plane `PresentX` calls
+/// (e.g. Series S presenting a 1080p scene plane with a 4K UI overlay plane).
+struct Compositor {
+    format: DXGI_FORMAT,
+    root: ID3D12RootSignature,
+    opaque: ID3D12PipelineState,
+    overlay: ID3D12PipelineState,
+    rtv_heap: ID3D12DescriptorHeap,
+    srv_heap: ID3D12DescriptorHeap,
+    srv_stride: u32,
+}
+
+impl Compositor {
+    fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+        const SOURCE: &str = r#"
+            Texture2D tex : register(t0);
+            SamplerState smp : register(s0);
+            void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
+                uv = float2((id << 1) & 2, id & 2);
+                pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+            }
+            float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+                return tex.Sample(smp, uv);
+            }
+        "#;
+        let compile = |entry: PCSTR, target: PCSTR| -> windows::core::Result<ID3DBlob> {
+            let mut code: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            // SAFETY: static source and entry/target strings; out pointers ours.
+            let res = unsafe {
+                D3DCompile(
+                    SOURCE.as_ptr().cast(),
+                    SOURCE.len(),
+                    s!("present_composite"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                )
+            };
+            if let Err(e) = res {
+                if let Some(errors) = errors {
+                    // SAFETY: the blob's own bytes.
+                    let text = unsafe {
+                        std::slice::from_raw_parts(
+                            errors.GetBufferPointer().cast::<u8>(),
+                            errors.GetBufferSize(),
+                        )
+                    };
+                    tracing::warn!("present compositor: {}", String::from_utf8_lossy(text));
+                }
+                return Err(e);
+            }
+            code.ok_or_else(windows::core::Error::empty)
+        };
+        let vs = compile(s!("vs"), s!("vs_5_1"))?;
+        let ps = compile(s!("ps"), s!("ps_5_1"))?;
+        // SAFETY: compiled shader blobs live through PSO creation.
+        unsafe {
+            let vs_bytes =
+                std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize());
+            let ps_bytes =
+                std::slice::from_raw_parts(ps.GetBufferPointer().cast::<u8>(), ps.GetBufferSize());
+            // Wine's D3DCompile does not embed a root signature in the shader blobs.
+            let range = D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+                ..Default::default()
+            };
+            let parameter = D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let sampler = D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                MaxAnisotropy: 16,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+                BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+                MaxLOD: f32::MAX,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                ..Default::default()
+            };
+            let desc = D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: 1,
+                pParameters: &parameter,
+                NumStaticSamplers: 1,
+                pStaticSamplers: &sampler,
+                ..Default::default()
+            };
+            let mut signature = None;
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut signature, None)?;
+            let signature = signature.ok_or_else(windows::core::Error::empty)?;
+            let signature = std::slice::from_raw_parts(
+                signature.GetBufferPointer().cast::<u8>(),
+                signature.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, signature)?;
+            let make_pso = |blend: bool| -> windows::core::Result<ID3D12PipelineState> {
+                let mut rt_blend = D3D12_RENDER_TARGET_BLEND_DESC {
+                    RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                    ..Default::default()
+                };
+                if blend {
+                    rt_blend.BlendEnable = true.into();
+                    rt_blend.SrcBlend = D3D12_BLEND_ONE;
+                    rt_blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+                    rt_blend.BlendOp = D3D12_BLEND_OP_ADD;
+                    rt_blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+                    rt_blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+                    rt_blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+                }
+                let mut blend_desc = D3D12_BLEND_DESC::default();
+                blend_desc.RenderTarget[0] = rt_blend;
+                let mut rtv_formats = [DXGI_FORMAT_UNKNOWN; 8];
+                rtv_formats[0] = format;
+                let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+                    VS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: vs_bytes.as_ptr().cast(),
+                        BytecodeLength: vs_bytes.len(),
+                    },
+                    PS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: ps_bytes.as_ptr().cast(),
+                        BytecodeLength: ps_bytes.len(),
+                    },
+                    BlendState: blend_desc,
+                    SampleMask: u32::MAX,
+                    RasterizerState: D3D12_RASTERIZER_DESC {
+                        FillMode: D3D12_FILL_MODE_SOLID,
+                        CullMode: D3D12_CULL_MODE_NONE,
+                        DepthClipEnable: false.into(),
+                        ..Default::default()
+                    },
+                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    NumRenderTargets: 1,
+                    RTVFormats: rtv_formats,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    ..Default::default()
+                };
+                let pso = device.CreateGraphicsPipelineState(&desc);
+                let _ = std::mem::ManuallyDrop::into_inner(desc.pRootSignature);
+                pso
+            };
+            let opaque = make_pso(false)?;
+            let overlay = make_pso(true)?;
+            let rtv_heap: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })?;
+            let srv_heap: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: MAX_PLANES,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })?;
+            let srv_stride =
+                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            Ok(Compositor {
+                format,
+                root,
+                opaque,
+                overlay,
+                rtv_heap,
+                srv_heap,
+                srv_stride,
+            })
+        }
+    }
+}
 
 #[derive(Default)]
 struct Presentation {
@@ -6491,6 +6681,10 @@ struct SwapChainRetry {
 }
 
 impl SwapChainRetry {
+    fn ready(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|next| now >= next)
+    }
+
     /// A desktop can become presentable again. Keep retrying while limiting
     /// the DXGI calls and warnings during the outage.
     fn attempt<T, E>(
@@ -6498,7 +6692,7 @@ impl SwapChainRetry {
         now: Instant,
         operation: impl FnOnce() -> Result<T, E>,
     ) -> Option<Result<T, E>> {
-        if self.next_attempt.is_some_and(|next| now < next) {
+        if !self.ready(now) {
             return None;
         }
         let result = operation();
@@ -6523,6 +6717,7 @@ struct Presenter {
     /// next present once that frame's GPU work has finished.
     #[cfg(feature = "diagnostics")]
     probed: Option<(u64, ID3D12Resource)>,
+    compositor: Option<Compositor>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -6530,8 +6725,7 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
-    #[cfg(feature = "diagnostics")]
-    copy_stats_frames: u64,
+    report_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -6544,8 +6738,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
-            #[cfg(feature = "diagnostics")]
-            copy_stats_frames: 0,
+            report_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -6560,10 +6753,7 @@ impl Meter {
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
-        #[cfg(feature = "diagnostics")]
-        {
-            self.copy_stats_frames += 1;
-        }
+        self.report_frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -6585,21 +6775,19 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
-        let dropped = crate::draw::take_dropped() as f64 / frames;
-        // Outside the submissions: in none of the times above.
-        let waited = crate::pipeline::take_waited_ms() / frames;
-        let indirect = crate::list::take_indirect() as f64 / frames;
-        let root_views = crate::draw::take_root_view_slots() as f64 / frames;
-        // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            let report_frames = std::mem::take(&mut self.report_frames) as f64;
+            let dropped = crate::draw::take_dropped() as f64 / report_frames;
+            // Outside the submissions: in none of the times above.
+            let waited = crate::pipeline::take_waited_ms() / report_frames;
+            let indirect = crate::list::take_indirect() as f64 / report_frames;
+            let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
             // Copy-queue counters (diagnostics, gate on): appended to the
             // fps line so wall vs busy reconciles from the log alone.
             // Otherwise empty, leaving the line as before.
             #[cfg(feature = "diagnostics")]
-            let copy_note = copy_log_note(self.copy_stats_frames as f64);
+            let copy_note = copy_log_note(report_frames);
             #[cfg(not(feature = "diagnostics"))]
             let copy_note = String::new();
             tracing::info!(
@@ -6627,8 +6815,8 @@ impl Meter {
                 freed_bytes as f64 / 1e6 / frames,
                 heap_used as f64 / 1e6,
                 heap_free as f64 / 1e6,
-                crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
-                crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
+                crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
+                crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
             #[cfg(feature = "diagnostics")]
             {
@@ -6652,25 +6840,26 @@ impl Meter {
                      from title memory {:.0} {:.0} {:.0}",
                     gpu[0], gpu[1], gpu[2], title[0], title[1], title[2]
                 );
-                let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
+                // Window caption updates leave the report counters intact.
+                let drops = crate::pipeline::take_drops();
                 crate::frame::log();
-                log_gpu_times(copy_frames);
-                crate::copystat::log(copy_frames);
-                crate::bindless::log(copy_frames);
-                crate::shadow::log_views(copy_frames);
-                costs::log(copy_frames);
+                log_gpu_times(report_frames);
+                crate::copystat::log(report_frames);
+                crate::bindless::log(report_frames);
+                crate::shadow::log_views(report_frames);
+                costs::log(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(
                         "texture read backs: {:.1}/frame, {:.1} KB/frame",
-                        n as f64 / frames,
-                        bytes as f64 / frames / 1e3
+                        n as f64 / report_frames,
+                        bytes as f64 / report_frames / 1e3
                     );
                 }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / frames
+                        *n as f64 / report_frames
                     );
                 }
             }
@@ -6713,26 +6902,71 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). Waits for the previous
-    /// frame's submissions, not this one's. In diagnostics builds: the
-    /// previous probed frame and whether it was black (read once its GPU
-    /// work has finished); else `None`.
-    pub(crate) fn present(
+    /// Shows one or more `planes` (each a live host texture and its current
+    /// host state, kept in that state), compositing planes 1.. on top of
+    /// plane 0 when multiple planes are presented, as frame `frame` (saved if
+    /// captures are on). `None` if nothing was shown; else, in diagnostics
+    /// builds, whether the frame was black. Waits for the previous frame's
+    /// submissions, not this one's (the title's submission thread calls
+    /// PresentX before it hands its ring slots back).
+    pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+        self.present_with_compositor(
+            planes,
+            frame,
+            Compositor::new,
+            #[cfg(all(test, feature = "diagnostics"))]
+            |_, _| {},
+        )
+    }
+
+    fn present_with_compositor(
         &self,
-        texture: &ID3D12Resource,
-        state: u32,
+        planes: &[(&ID3D12Resource, u32)],
         frame: u64,
-    ) -> Option<(u64, bool)> {
-        // SAFETY: a live resource.
-        let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
-            tracing::warn!(format = desc.Format.0, "cannot present this format");
+        create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
+        #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
+            &ID3D12Resource,
+            &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        ),
+    ) -> Option<bool> {
+        let &(primary, _) = planes.first()?;
+        // SAFETY: live resources.
+        let primary_desc = unsafe { primary.GetDesc() };
+        let Some(format) = swap_format(primary_desc.Format) else {
+            tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let Presentation { presenter, retry } = &mut *presentation;
+        if presenter.is_none() && !retry.ready(Instant::now()) {
+            return None;
+        }
+        let cached_format = presenter
+            .as_ref()
+            .and_then(|p| p.compositor.as_ref())
+            .map(|c| c.format);
+        let mut new_compositor = None;
+        let planes = if planes.len() > 1 && cached_format != Some(format) {
+            match create_compositor(&self.device, format) {
+                Ok(c) => {
+                    new_compositor = Some(c);
+                    planes
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
+                    &planes[..1]
+                }
+            }
+        } else {
+            planes
+        };
+        let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
+        for &(tex, _) in &planes[1..] {
+            // SAFETY: live resource.
+            let d = unsafe { tex.GetDesc() };
+            width = width.max(d.Width as u32);
+            height = height.max(d.Height);
+        }
         if presenter.is_none() {
             *presenter = match retry
                 .attempt(Instant::now(), || self.presenter(width, height, format))?
@@ -6745,6 +6979,9 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        if let Some(c) = new_compositor {
+            p.compositor = Some(c);
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // The back buffers may not be in use.
             self.drain();
@@ -6770,9 +7007,8 @@ impl Host {
         // presents holds that thread for the frame's whole GPU time.
         self.previous_frame(p.presented.take());
         #[cfg(feature = "diagnostics")]
-        let shown = p.probed.take().map(|(f, b)| (f, crate::capture::black(&b)));
-        let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        let shown = p.probed.take().map(|(_, b)| crate::capture::black(&b));
+        // SAFETY: our swap chain, list and live source textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
@@ -6780,34 +7016,193 @@ impl Host {
             };
             p.copy.reset();
             // The copy may still run after this returns: it holds the
-            // texture, which the title may release before the next present.
-            p.copy.keep(texture);
+            // textures, which the title may release before the next present.
+            for &(texture, _) in planes {
+                p.copy.keep(texture);
+            }
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
+            let (capture, probe) = if planes.len() == 1 {
+                let (texture, state) = planes[0];
+                let state = D3D12_RESOURCE_STATES(state as i32);
+                let mut before = Vec::with_capacity(2);
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    before.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                }
+                before.push(transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
-            #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+                ));
+                list.ResourceBarrier(&before);
+                list.CopyResource(&back, texture);
+                #[cfg(all(test, feature = "diagnostics"))]
+                let capture = {
+                    // Inspect what reached the swap chain, before Present.
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let readback = crate::capture::read_back(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    readback
+                };
+                #[cfg(all(not(test), feature = "diagnostics"))]
+                let capture = crate::capture::wanted(frame)
+                    .then(|| crate::capture::read_back(&self.device, list, texture))
+                    .flatten();
+                #[cfg(feature = "diagnostics")]
+                let probe = crate::capture::probe(&self.device, list, texture);
+                #[cfg(not(feature = "diagnostics"))]
+                let (capture, probe) = {
+                    let _ = frame;
+                    (None::<()>, None::<()>)
+                };
+                let mut after = Vec::with_capacity(2);
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    after.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+                }
+                after.push(transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                ));
+                list.ResourceBarrier(&after);
+                (capture, probe)
+            } else {
+                let comp = p.compositor.as_ref().expect("compositor was prepared for multiple planes");
+                let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+                self.device.CreateRenderTargetView(
+                    &back,
+                    Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                        Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_RTV {
+                                MipSlice: 0,
+                                PlaneSlice: 0,
+                            },
+                        },
+                    }),
+                    rtv,
+                );
+                let srv_cpu_base = comp.srv_heap.GetCPUDescriptorHandleForHeapStart();
+                let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
+                let count = planes.len().min(MAX_PLANES as usize);
+                let mut before = Vec::with_capacity(count + 1);
+                let mut after = Vec::with_capacity(count);
+                for (i, &(tex, state)) in planes[..count].iter().enumerate() {
+                    let d = tex.GetDesc();
+                    let srv_fmt = swap_format(d.Format).unwrap_or(d.Format);
+                    let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: srv_cpu_base.ptr + i * comp.srv_stride as usize,
+                    };
+                    self.device.CreateShaderResourceView(
+                        tex,
+                        Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: srv_fmt,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D12_TEX2D_SRV {
+                                    MostDetailedMip: 0,
+                                    MipLevels: 1,
+                                    PlaneSlice: 0,
+                                    ResourceMinLODClamp: 0.0,
+                                },
+                            },
+                        }),
+                        handle,
+                    );
+                    let state = D3D12_RESOURCE_STATES(state as i32);
+                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                        && planes[..i]
+                            .iter()
+                            .all(|(earlier, _)| earlier.as_raw() != tex.as_raw())
+                    {
+                        before.push(transition(
+                            tex,
+                            state,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        ));
+                        after.push(transition(
+                            tex,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            state,
+                        ));
+                    }
+                }
+                before.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                ));
+                list.ResourceBarrier(&before);
+                list.SetDescriptorHeaps(&[Some(comp.srv_heap.clone())]);
+                list.SetGraphicsRootSignature(&comp.root);
+                list.RSSetViewports(&[D3D12_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: width as f32,
+                    Height: height as f32,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                }]);
+                list.RSSetScissorRects(&[RECT {
+                    left: 0,
+                    top: 0,
+                    right: width as i32,
+                    bottom: height as i32,
+                }]);
+                list.OMSetRenderTargets(1, Some(&rtv), false, None);
+                list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                for i in 0..count {
+                    list.SetPipelineState(if i == 0 { &comp.opaque } else { &comp.overlay });
+                    list.SetGraphicsRootDescriptorTable(
+                        0,
+                        D3D12_GPU_DESCRIPTOR_HANDLE {
+                            ptr: srv_gpu_base.ptr + (i as u64) * u64::from(comp.srv_stride),
+                        },
+                    );
+                    list.DrawInstanced(3, 1, 0, 0);
+                }
+                #[cfg(feature = "diagnostics")]
+                let (capture, probe) = {
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let capture = (cfg!(test) || crate::capture::wanted(frame))
+                        .then(|| crate::capture::read_back(&self.device, list, &back))
+                        .flatten();
+                    let probe = crate::capture::probe(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    )]);
+                    (capture, probe)
+                };
+                #[cfg(not(feature = "diagnostics"))]
+                let (capture, probe) = {
+                    let _ = frame;
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    )]);
+                    (None::<()>, None::<()>)
+                };
+                if !after.is_empty() {
+                    list.ResourceBarrier(&after);
+                }
+                (capture, probe)
+            };
             p.copy.close();
             self.execute(&[&p.copy]);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
@@ -6816,6 +7211,10 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 // A saved frame is read back now: its copy has to be done.
                 self.drain();
+                // Tests inspect the completed copy before flip-discard Present
+                // can invalidate the back buffer, with the presenter still locked.
+                #[cfg(test)]
+                inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             p.meter.frame(p.hwnd);
@@ -6825,7 +7224,10 @@ impl Host {
                 shown
             }
             #[cfg(not(feature = "diagnostics"))]
-            None
+            {
+                let _ = (capture, probe);
+                Some(false)
+            }
         }
     }
 
@@ -6874,6 +7276,7 @@ impl Host {
                 presented: None,
                 #[cfg(feature = "diagnostics")]
                 probed: None,
+                compositor: None,
             })
         }
     }
@@ -6943,19 +7346,6 @@ pub(crate) fn copy_uploadable(state: u32) -> bool {
 /// ever recorded into a COPY list.
 pub(crate) fn copy_prelude_keep(real: u32, first: u32) -> bool {
     copy_uploadable(real) && copy_uploadable(first)
-}
-
-/// Whether a buffer in `state` may move on the copy engine: only between
-/// the common state and the copy states. A buffer the DIRECT side left in
-/// a shader-readable or writable state (VERTEX, SHADER_RESOURCE, UAV,
-/// ...) records no valid barrier on a COPY list (retail diag18: 0xC1
-/// VERTEX|SHADER_RESOURCE died in `record_copy_prelude`); its copies stay
-/// on the CPU (already in title memory). GENERIC_READ is refused with the
-/// rest: it carries SHADER_RESOURCE-side bits no COPY list may barrier.
-pub(crate) fn copy_buffer_state_legal(state: u32) -> bool {
-    state == D3D12_RESOURCE_STATE_COMMON.0 as u32
-        || state == D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32
-        || state == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32
 }
 
 /// Whether a list of `kind` emits GPU-timing timestamp queries
@@ -7606,11 +7996,10 @@ fn record_gpu_copies(list: &ID3D12GraphicsCommandList, copies: &[GpuCopy]) {
 /// Wait on the copy fence). The prelude runs on the copy queue and is
 /// recycled with the submission; the buffers stay alive in their owning
 /// lists (`keep`), whose last submission (both queues) outlives them.
-/// `None` where no prelude could be made, or where a buffer sits outside
-/// the copy states: the caller falls back to the lists' DIRECT preludes
-/// (whole batch, never split: what the COPY side would leave behind decides
-/// what the DIRECT side's copy-to-readable moves expect).
+/// `None` where no prelude could be made: the caller falls back to the
+/// lists' DIRECT preludes.
 fn record_copy_prelude(host: &Host, copies: &[GpuCopy]) -> Option<Prelude> {
+    let prelude = host.fresh_prelude(ListKind::Copy)?;
     // One barrier per buffer (a buffer may feed several copies): from its
     // real state to the union of what the copies need.
     let mut ends: Vec<(ID3D12Resource, u32, u32)> = Vec::new();
@@ -7632,19 +8021,6 @@ fn record_copy_prelude(host: &Host, copies: &[GpuCopy]) -> Option<Prelude> {
             D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
         );
     }
-    // Whole-batch fallback: a buffer outside the copy states refuses the
-    // batch to the DIRECT preludes (which barrier any state), rather than
-    // recording a COPY prelude for the rest and leaving the DIRECT side to
-    // guess what ran where. The queue already refuses these
-    // (`queue_gpu_copy`), so this fires only for states changed meanwhile;
-    // the CPU copies are done either way.
-    if !ends.iter().all(|(_, real, _)| copy_buffer_state_legal(*real)) {
-        tracing::debug!(
-            "copy-engine buffer copies fall back to DIRECT: a buffer state the copy engine cannot barrier"
-        );
-        return None;
-    }
-    let prelude = host.fresh_prelude(ListKind::Copy)?;
     // SAFETY: a fresh prelude nothing pending or running uses, and live
     // shadow buffers (kept by their lists).
     let recorded = unsafe {
@@ -8578,219 +8954,6 @@ mod batch {   // `mod tests` is already taken at the top of this file
         }
     }
 
-    /// A buffer-to-buffer copy whose buffer the DIRECT side left outside
-    /// the copy states is refused: a COPY list records only copy-state
-    /// barriers, so the prelude would die recording e.g. 0xC1 (VERTEX and
-    /// CONSTANT BUFFER | PIXEL | NON PIXEL SHADER RESOURCE, the retail
-    /// diag18 value) to COPY_SOURCE on a COPY list. Refused copies keep
-    /// their CPU result (already in title memory); buffers in COMMON or
-    /// the copy states queue normally. Needs a host GPU; passes by
-    /// without one.
-    #[test]
-    fn buffer_copies_from_non_copy_states_stay_on_the_cpu() {
-        use crate::watch::PAGE;
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
-        let (p, q) = (crate::watch::tests::pool(1), crate::watch::tests::pool(1));
-        crate::shadow::register(p, p as u64, PAGE as u64);
-        crate::shadow::register(q, q as u64, PAGE as u64);
-        let (Some(src), Some(dst)) = (
-            crate::shadow::find(p as u64, PAGE as u64),
-            crate::shadow::find(q as u64, PAGE as u64),
-        ) else {
-            crate::shadow::unregister(q, q as u64);
-            crate::shadow::unregister(p, p as u64);
-            return; // no host GPU here
-        };
-        assert_ne!(
-            src.buffer.as_raw(),
-            dst.buffer.as_raw(),
-            "each pool in its own buffer"
-        );
-        let list = host.new_list().expect("a host list");
-        let mut batch = Batch {
-            host: Some(host),
-            submission_gen: crate::shadow::generation(),
-            ..Batch::default()
-        };
-        const COMMON: u32 = D3D12_RESOURCE_STATE_COMMON.0 as u32;
-        const COPY_SOURCE: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
-        const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
-        // Positive control: COMMON buffers queue for the GPU, and the COPY
-        // prelude then moves only between copy states.
-        src.state.store(COMMON, Ordering::Relaxed);
-        dst.state.store(COMMON, Ordering::Relaxed);
-        batch.queue_gpu_copy(&list, p, q, PAGE);
-        assert_eq!(batch.gpu_copies.len(), 1, "COMMON buffers queue");
-        let mine = batch.take_gpu_copies(&list);
-        assert_eq!(mine.len(), 1, "the owning list takes its copy");
-        let Some(prelude) = record_copy_prelude(host, &mine) else {
-            drop(mine);
-            drop(src);
-            drop(dst);
-            crate::shadow::unregister(q, q as u64);
-            crate::shadow::unregister(p, p as u64);
-            crate::watch::tests::free(p);
-            crate::watch::tests::free(q);
-            return; // no COPY prelude could be made here
-        };
-        for (_, before, after) in crate::host::tests::issued() {
-            for &state in &[before, after] {
-                assert!(
-                    state == COMMON || state == COPY_SOURCE || state == COPY_DEST,
-                    "a COPY prelude moves only between copy states, not {state:#x}"
-                );
-            }
-        }
-        drop(prelude);
-        drop(mine);
-        // The retail failure: a source the DIRECT side left readable
-        // (VERTEX | SHADER_RESOURCE, 0xC1) records no valid COPY-list
-        // barrier, so it stays on the CPU.
-        src.state
-            .store(BUFFER_VERTEX | BUFFER_SHADER_RESOURCE, Ordering::Relaxed);
-        dst.state.store(COMMON, Ordering::Relaxed);
-        batch.queue_gpu_copy(&list, p, q, PAGE);
-        assert!(
-            batch.gpu_copies.is_empty(),
-            "a source outside the copy states stays on the CPU"
-        );
-        // The destination side too: a UAV destination stays on the CPU.
-        src.state.store(COMMON, Ordering::Relaxed);
-        dst.state.store(BUFFER_UNORDERED_ACCESS, Ordering::Relaxed);
-        batch.queue_gpu_copy(&list, p, q, PAGE);
-        assert!(
-            batch.gpu_copies.is_empty(),
-            "a destination outside the copy states stays on the CPU"
-        );
-        assert!(
-            batch.take_gpu_copies(&list).is_empty(),
-            "refused copies record no COPY prelude"
-        );
-        // Positive control: the states the copy engine leaves queue again
-        // (queue only: re-recording them would barrier a state to itself).
-        src.state.store(COPY_SOURCE, Ordering::Relaxed);
-        dst.state.store(COPY_DEST, Ordering::Relaxed);
-        batch.queue_gpu_copy(&list, p, q, PAGE);
-        assert_eq!(batch.gpu_copies.len(), 1, "copy states queue");
-        let mine = batch.take_gpu_copies(&list);
-        assert_eq!(mine.len(), 1, "the owning list takes its copy");
-        drop(mine);
-        drop(list);
-        drop(src);
-        drop(dst);
-        crate::shadow::unregister(q, q as u64);
-        crate::shadow::unregister(p, p as u64);
-        crate::watch::tests::free(p);
-        crate::watch::tests::free(q);
-    }
-
-    /// A COPY-engine batch touching a buffer outside the copy states falls
-    /// back whole to the DIRECT preludes: `record_copy_prelude` refuses it
-    /// (rather than splitting some copies onto COPY and the rest onto
-    /// DIRECT), recording no barrier carrying the illegal bits. Asserts at
-    /// the issued-transition level, mirroring the texture `copy_prelude`
-    /// test. Without the fallback the illegal record aborts the run
-    /// (`fail`, as retail diag18); without validation it returns `Some`
-    /// carrying the illegal barriers: either way the pre-fix code fails
-    /// here. Needs a host GPU; passes by without one.
-    #[test]
-    fn buffer_copies_with_non_copy_states_fall_back_whole_batch_to_direct() {
-        use crate::watch::PAGE;
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
-        let (p, q) = (crate::watch::tests::pool(1), crate::watch::tests::pool(1));
-        crate::shadow::register(p, p as u64, PAGE as u64);
-        crate::shadow::register(q, q as u64, PAGE as u64);
-        let (Some(src), Some(dst)) = (
-            crate::shadow::find(p as u64, PAGE as u64),
-            crate::shadow::find(q as u64, PAGE as u64),
-        ) else {
-            crate::shadow::unregister(q, q as u64);
-            crate::shadow::unregister(p, p as u64);
-            return; // no host GPU here
-        };
-        assert_ne!(
-            src.buffer.as_raw(),
-            dst.buffer.as_raw(),
-            "each pool in its own buffer"
-        );
-        let list = host.new_list().expect("a host list");
-        let mut batch = Batch {
-            host: Some(host),
-            submission_gen: crate::shadow::generation(),
-            ..Batch::default()
-        };
-        const COMMON: u32 = D3D12_RESOURCE_STATE_COMMON.0 as u32;
-        // A legal batch records: the COPY prelude moves only between copy
-        // states (asserted at the issued-transition level, below).
-        src.state.store(COMMON, Ordering::Relaxed);
-        dst.state.store(COMMON, Ordering::Relaxed);
-        batch.queue_gpu_copy(&list, p, q, PAGE);
-        let mine = batch.take_gpu_copies(&list);
-        assert_eq!(mine.len(), 1, "COMMON buffers queue");
-        // A batch whose buffer the DIRECT side left outside the copy states
-        // is refused whole (either end): no COPY prelude, no barrier
-        // carrying the illegal bits. 0xC1 is the retail diag18 value
-        // (VERTEX | SHADER_RESOURCE); 0xC0 a resident readable buffer; the
-        // rest the other non-copy buffer states.
-        for &bad in &[
-            BUFFER_VERTEX | BUFFER_SHADER_RESOURCE,
-            BUFFER_SHADER_RESOURCE,
-            BUFFER_UNORDERED_ACCESS,
-            BUFFER_INDEX,
-            BUFFER_INDIRECT_ARGUMENT,
-        ] {
-            for &(src_bad, dst_bad) in &[(bad, COMMON), (COMMON, bad)] {
-                src.state.store(src_bad, Ordering::Relaxed);
-                dst.state.store(dst_bad, Ordering::Relaxed);
-                let _ = crate::host::tests::issued();
-                assert!(
-                    record_copy_prelude(host, &mine).is_none(),
-                    "a batch outside the copy states falls back to DIRECT ({src_bad:#x} to {dst_bad:#x})"
-                );
-                assert!(
-                    crate::host::tests::issued().is_empty(),
-                    "no COPY barrier carries {bad:#x}"
-                );
-            }
-        }
-        // Restored to copy states the batch records again.
-        src.state.store(COMMON, Ordering::Relaxed);
-        dst.state.store(COMMON, Ordering::Relaxed);
-        let Some(prelude) = record_copy_prelude(host, &mine) else {
-            drop(mine);
-            drop(src);
-            drop(dst);
-            crate::shadow::unregister(q, q as u64);
-            crate::shadow::unregister(p, p as u64);
-            crate::watch::tests::free(p);
-            crate::watch::tests::free(q);
-            return; // no COPY prelude could be made here
-        };
-        for (_, before, after) in crate::host::tests::issued() {
-            for &state in &[before, after] {
-                assert!(
-                    state == COMMON
-                        || state == D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32
-                        || state == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
-                    "a COPY prelude moves only between copy states, not {state:#x}"
-                );
-            }
-        }
-        drop(prelude);
-        drop(mine);
-        drop(list);
-        drop(src);
-        drop(dst);
-        crate::shadow::unregister(q, q as u64);
-        crate::shadow::unregister(p, p as u64);
-        crate::watch::tests::free(p);
-        crate::watch::tests::free(q);
-    }
-
 
 #[cfg(test)]
 mod withholding {
@@ -9432,5 +9595,119 @@ mod copy_order {
         for &p in &pools {
             crate::watch::tests::free(p);
         }
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod present_plane_tests {
+    use super::*;
+
+    #[test]
+    fn compositor_failure_presents_primary_in_the_same_frame() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX recovery: no D3D12 device");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let make_plane = |width, height, color: &[f32; 4]| {
+            let mut texture = None;
+            // SAFETY: live device, valid render target description, and an open list.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: width,
+                            Height: height,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let texture = texture.unwrap();
+                list.list
+                    .ClearRenderTargetView(host.rtv(&texture, None), color, None);
+                texture
+            }
+        };
+        let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
+        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        list.close();
+        host.execute(&[&list]);
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        assert!(
+            host.present(&[(&scene, state)], 1).is_some(),
+            "single-plane control"
+        );
+        let first_pixel =
+            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy has completed. The footprint names
+                // a live RGBA pixel inside the readback buffer.
+                let rgba = unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                };
+                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+            };
+
+        let mut attempted = false;
+        let mut fallback = None;
+        let shown = host.present_with_compositor(
+            &[(&scene, state), (&overlay, state)],
+            2,
+            |_, _| {
+                attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |buffer, footprint| fallback = Some(first_pixel(buffer, footprint)),
+        );
+        assert!(attempted);
+        assert!(
+            shown.is_some(),
+            "the primary plane must still be shown in this frame"
+        );
+        assert_eq!(fallback, Some((32, 32, [255, 0, 0, 255])));
+        let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let swap_chain = presentation.presenter.as_ref().unwrap();
+        assert_eq!((swap_chain.width, swap_chain.height), (32, 32));
+        drop(presentation);
+
+        let mut composite = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&scene, state), (&overlay, state)],
+                3,
+                Compositor::new,
+                |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some(),
+            "compositor initialization can be retried after failure"
+        );
+        // Premultiplied half-blue over opaque red.
+        assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
 }
