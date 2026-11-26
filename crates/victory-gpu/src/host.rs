@@ -784,6 +784,63 @@ pub(crate) mod tests {
         let _ = taken;
     }
 
+    /// COPY-kind lists emit no GPU-timing timestamp queries: a copy command
+    /// list cannot issue them against the standard timestamp heap (retail
+    /// `Close` fails `0x80070057`; WARP tolerates it). DIRECT-kind lists
+    /// stamp exactly as before. No GPU required: the recorded operations
+    /// mirror the stamp sites (`emit_busy_start`, `note`, `close`), each of
+    /// which emits exactly when `stamps` serves the list, i.e. exactly when
+    /// `timing_stamps_kind` holds for its kind. Note labels (markers) are
+    /// unaffected: they are recorded for both kinds.
+    #[test]
+    fn copy_lists_emit_no_gpu_timing_queries() {
+        // One list's query-heap operations for `notes` noted commands, in
+        // order: the busy-pair start stamp, one timestamp per noted
+        // command, and `close`'s end stamp, its resolve, and the busy-pair
+        // end stamp with its resolve.
+        fn recorded(kind: super::ListKind, notes: usize) -> Vec<&'static str> {
+            let mut ops = Vec::new();
+            if super::timing_stamps_kind(kind) {
+                ops.push("busy start stamp");
+                ops.extend(std::iter::repeat_n("note stamp", notes));
+                ops.push("end stamp");
+                ops.push("end resolve");
+                ops.push("busy end stamp");
+                ops.push("busy end resolve");
+            }
+            ops
+        }
+        assert!(
+            !super::timing_stamps_kind(super::ListKind::Copy),
+            "COPY-kind lists never stamp"
+        );
+        assert!(
+            super::timing_stamps_kind(super::ListKind::Direct),
+            "DIRECT-kind lists stamp as before"
+        );
+        // A COPY-kind list with noted commands records no query-heap
+        // operations at all.
+        assert!(
+            recorded(super::ListKind::Copy, 3).is_empty(),
+            "no timestamp queries on a COPY-kind list"
+        );
+        // A DIRECT-kind list stamps every note plus the busy pair.
+        assert_eq!(
+            recorded(super::ListKind::Direct, 3),
+            [
+                "busy start stamp",
+                "note stamp",
+                "note stamp",
+                "note stamp",
+                "end stamp",
+                "end resolve",
+                "busy end stamp",
+                "busy end resolve",
+            ],
+            "DIRECT-kind lists stamp every note"
+        );
+    }
+
     /// The copy-queue rollout switch defaults off, the timeline waits for
     /// both queues, and staging retires on both completeds. No GPU required
     /// except for the list-kind checks (early-return without one, as the
@@ -3368,7 +3425,12 @@ impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
-        if !timing() {
+        // COPY-kind command lists cannot issue timestamp queries against
+        // the standard heap below (only COPY_QUEUE_TIMESTAMP heaps; retail
+        // `Close` fails `0x80070057`), so they never stamp: no heap is even
+        // created for them. Their note labels are still recorded in `note`,
+        // and copy work stays visible via wall time.
+        if !timing() || !timing_stamps_kind(self.kind) {
             return None;
         }
         self.stamps
@@ -6853,6 +6915,18 @@ pub(crate) fn copy_uploadable(state: u32) -> bool {
 /// ever recorded into a COPY list.
 pub(crate) fn copy_prelude_keep(real: u32, first: u32) -> bool {
     copy_uploadable(real) && copy_uploadable(first)
+}
+
+/// Whether a list of `kind` emits GPU-timing timestamp queries
+/// (diagnostics, `VICTORY_GPU_TIMING`): DIRECT lists stamp each noted
+/// command against the standard timestamp heap, but a COPY-kind command
+/// list cannot issue timestamp queries against a standard heap (only
+/// `COPY_QUEUE_TIMESTAMP` heaps; retail `Close` fails `0x80070057`), so
+/// COPY-kind lists emit none. Their note labels (markers) are still
+/// recorded, and copy work stays visible via wall time.
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) fn timing_stamps_kind(kind: ListKind) -> bool {
+    kind != ListKind::Copy
 }
 
 impl Host {
