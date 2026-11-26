@@ -3729,6 +3729,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             list.close();
             let before = crate::texture::copied(object);
             host.execute(&[&list]);
+            // Submissions run async: the temporary list's drop no longer
+            // settles (an `Arc` drop only releases), so drain explicitly
+            // before reading the output back (as the sibling tests do).
+            host.drain();
             // SAFETY: inside the mapped output.
             let texel = unsafe { (data as *const [f32; 4]).read() };
             (crate::texture::copied(object) - before, texel[0])
