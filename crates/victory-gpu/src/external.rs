@@ -641,6 +641,11 @@ mod tests {
         host.drain();
         assert_eq!(readback_value::<[u32; 2]>(&readback), [0x07e0_07e0, 0xffff_ffff]);
         reset_list(list, allocator);
+        // The reset may have swapped the title list's shells (a held shell
+        // is left to its in-flight submission, never reset under it): resolve
+        // the current one again instead of recording into the stale shell
+        // (its first-use set would skip the upload below).
+        let hl = crate::list::segments(list).pop().unwrap();
 
         // 2. Upload path: capture `old_copy` of a read-only texture, evict its
         //    cached slot (`made_copy` becomes `None`), and verify `upload_copy`
