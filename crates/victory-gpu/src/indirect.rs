@@ -294,9 +294,10 @@ pub(crate) fn bound_chunk(list: &HostList, reqs: &[ClampReq]) -> Option<Vec<(ID3
         )]);
         // The card's copy of the budget goes back to common: the next
         // recording zeroes it again. The mapped word never leaves common.
-        // No clamp ran in a later chunk with no records: nothing promoted
-        // it, so nothing reverts it.
-        if card && (first || reqs.iter().any(|r| r.records > 0)) {
+        // Only the first chunk promotes the word (its zeroing leaves it
+        // unordered access); later chunks reach it by implicit promotion
+        // from common, like the mapped word, so only the first reverts it.
+        if card && first {
             l.ResourceBarrier(&[transition(
                 &budget_res,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -349,7 +350,8 @@ pub(crate) fn done_chunk(list: &HostList, clamped: &[ID3D12Resource]) {
 // per-list tracked buffer states if a driver or that validation minds.
 #[cfg(test)]
 pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
-    let (Some(c), Some((_, budget, _))) = (clamp(), list.budget()) else {
+    let was_zeroed = list.budget_zeroed();
+    let (Some(c), Some((budget_res, budget, card))) = (clamp(), list.budget()) else {
         return None;
     };
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
@@ -378,6 +380,16 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
             uav_barrier(),
             transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
         ]);
+        // As in [`bound_chunk`]: only the recording's first clamp promotes
+        // the card's budget, so only it reverts it (later lists reusing one
+        // find it common).
+        if card && !was_zeroed {
+            l.ResourceBarrier(&[transition(
+                &budget_res,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
     }
     Some(out)
 }
@@ -603,7 +615,9 @@ mod tests {
     /// its clamps read (each argument copy once, any distinct count buffer
     /// once, the list's budget once per clamping request) and never flushes
     /// globally; requests with no records move their buffers straight to
-    /// indirect arguments, still paired with `done_chunk`.
+    /// indirect arguments, still paired with `done_chunk`. A second chunk
+    /// leaves the card's budget as it found it: only the first chunk
+    /// promotes (zeroes) and reverts it.
     #[test]
     fn chunk_scopes_uav_barriers_and_skips_zero_records() {
         use crate::host::tests::{issued, replay};
@@ -620,27 +634,26 @@ mod tests {
         };
         let key = |r: &super::ID3D12Resource| r.as_raw() as usize;
         let list = host.new_list().unwrap();
-        let budget_key = key(&list.budget().unwrap().0);
+        let req =
+            |(kind, stride, records, counter): (u32, u32, u32, Option<super::ID3D12Resource>)| {
+                super::ClampReq {
+                    gpu,
+                    kind,
+                    stride,
+                    records,
+                    args: args.clone(),
+                    count: counter,
+                }
+            };
 
         // Two clamping requests sharing one argument copy, one with a
         // distinct count buffer, one with none, one with no records.
         let reqs = [
-            (2u32, 12u32, 1u32, Some(count.clone())),
-            (0, 16, 1, None),
-            (1, 20, 1, None),
-            (2, 12, 0, None),
+            req((2, 12, 1, Some(count.clone()))),
+            req((0, 16, 1, None)),
+            req((1, 20, 1, None)),
+            req((2, 12, 0, None)),
         ];
-        let reqs: Vec<super::ClampReq> = reqs
-            .iter()
-            .map(|&(kind, stride, records, ref count)| super::ClampReq {
-                gpu,
-                kind,
-                stride,
-                records,
-                args: args.clone(),
-                count: count.clone(),
-            })
-            .collect();
         take_uav_barriers();
         issued();
         let outs = super::bound_chunk(&list, &reqs).unwrap();
@@ -653,16 +666,40 @@ mod tests {
         );
         let buffers = [outs[0].0.clone()];
         super::done_chunk(&list, &buffers);
+        // A second chunk, with records: it finds the card's budget common
+        // and leaves it so (only the first chunk reverts it).
+        let more = [req((2, 12, 1, None))];
+        let outs2 = super::bound_chunk(&list, &more).unwrap();
+        assert_eq!(outs2.len(), 1);
+        let buffers2 = [outs2[0].0.clone()];
+        super::done_chunk(&list, &buffers2);
+        // The budget's key only after the chunks: asking before would spend
+        // this recording's first (its zeroing) ahead of them.
+        let budget_key = key(&list.budget().unwrap().0);
         // Scoped barriers only: the argument copy, the distinct count
         // buffer, then the budget once per clamping request (three clamping
-        // requests; the zero-record one clamps nothing).
+        // requests in the first chunk, one in the second; the zero-record
+        // one clamps nothing).
         assert_eq!(
             take_uav_barriers(),
-            [key(&args), key(&count), budget_key, budget_key, budget_key]
+            [
+                key(&args),
+                key(&count),
+                budget_key,
+                budget_key,
+                budget_key,
+                key(&args),
+                budget_key,
+            ]
         );
         // Every transition starts from the buffer's current state, and the
-        // chunk's buffer ends common again after `done_chunk`.
-        let mut states: std::collections::HashMap<usize, u32> = [(key(&outs[0].0), 0)].into_iter().collect();
+        // chunks' buffers and the budget all end common again: had the
+        // second chunk reverted unordered access to common on a common
+        // buffer, replay would fail as the debug layer does.
+        let mut states: std::collections::HashMap<usize, u32> =
+            [(key(&outs[0].0), 0), (key(&outs2[0].0), 0), (budget_key, 0)]
+                .into_iter()
+                .collect();
         replay(&issued(), &mut states).unwrap();
         assert!(states.values().all(|&s| s == 0));
         // SAFETY: a plain query.

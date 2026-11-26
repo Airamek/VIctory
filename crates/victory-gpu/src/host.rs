@@ -4146,7 +4146,8 @@ impl HostList {
         // SAFETY: plain interface query.
         let list2 = self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
         let mut card = self.card_budget.lock().unwrap_or_else(|e| e.into_inner());
-        if card.is_none() {
+        let fresh = card.is_none();
+        if fresh {
             *card = Some(self.make_card_buffer()?);
         }
         let card = card.clone()?;
@@ -4155,6 +4156,21 @@ impl HostList {
             deferred.budget_zeroed = true;
             drop(deferred);
             self.zero_card_budget(&list2, &card);
+        } else if fresh {
+            // A transient allocation failure earlier in this recording fell
+            // back to the mapped word and claimed the flag: this card is
+            // uninitialized. Zero it and leave it common, as later chunks
+            // leave it, so the chunk's elided revert stays valid.
+            drop(deferred);
+            self.zero_card_budget(&list2, &card);
+            // SAFETY: an open list; our buffer, just promoted above.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    &card,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
         }
         Some(card)
     }
@@ -4198,7 +4214,8 @@ impl HostList {
 
     /// Records, before the list's first clamp of the recording, the zeroing
     /// of the card's copy of the budget: common, written as a copy, then
-    /// left for unordered access until the chunk reverts it.
+    /// left for unordered access until the chunk reverts it (the transient
+    /// re-creation edge reverts it itself, leaving it common instead).
     fn zero_card_budget(&self, list2: &ID3D12GraphicsCommandList2, card: &ID3D12Resource) {
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
@@ -6717,6 +6734,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
             buffer_states: Default::default(),
             twins: Default::default(),
             budget: None,
+            card_budget: None,
         }
         .retire();
         // An upload after the retire must not reuse the readback buffer.
