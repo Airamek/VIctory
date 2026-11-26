@@ -1400,16 +1400,53 @@ static SPARE_ALLOCATORS_COPY: Mutex<Vec<ID3D12CommandAllocator>> = Mutex::new(Ve
 static SPARE_PRELUDES: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
 static SPARE_PRELUDES_COPY: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
 static SPARE_SCRATCH: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
+/// Mapped list upload buffers whose submissions finished, for lists reset
+/// while they run (upload() makes one committed resource per copy).
+static SPARE_UPLOADS: Mutex<Vec<(ID3D12Resource, usize, usize)>> = Mutex::new(Vec::new());
 /// Spares kept of each kind at most.
 const SPARES: usize = 256;
+/// Spared upload buffers kept at most, and their bytes (they are whole
+/// committed resources each).
+const SPARE_UPLOADS_MAX: usize = 64;
+const SPARE_UPLOADS_BYTES: u64 = 64 << 20;
 
 fn pool<T>(spares: &'static Mutex<Vec<T>>) -> std::sync::MutexGuard<'static, Vec<T>> {
     spares.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A spared mapped upload buffer of at least `size` bytes (capacity within
+/// twice that, best fit): committed resources are queue-agnostic, so one
+/// pool serves DIRECT lists (COPY lists never take list uploads).
+fn take_spare_upload(size: u64) -> Option<(ID3D12Resource, *mut u8, usize)> {
+    let size = size.max(1);
+    let max_fit = size.saturating_mul(2);
+    let mut pool = pool(&SPARE_UPLOADS);
+    let idx = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, cap))| *cap as u64 >= size && *cap as u64 <= max_fit)
+        .min_by_key(|(_, (_, _, cap))| *cap)
+        .map(|(i, _)| i)?;
+    let (buffer, data, cap) = pool.swap_remove(idx);
+    Some((buffer, data as *mut u8, cap))
+}
+
+/// Keeps finished upload buffers for reuse, bounded in count and bytes;
+/// the rest drop (their committed resources are freed).
+fn return_spare_uploads(uploads: Vec<(ID3D12Resource, usize, usize)>) {
+    let mut pool = pool(&SPARE_UPLOADS);
+    for (buffer, data, cap) in uploads {
+        let total: u64 = pool.iter().map(|(_, _, c)| *c as u64).sum();
+        if pool.len() >= SPARE_UPLOADS_MAX || total.saturating_add(cap as u64) > SPARE_UPLOADS_BYTES {
+            continue;
+        }
+        pool.push((buffer, data, cap));
+    }
+}
+
 impl Retired {
     /// Once the submission that used them has finished.
-    fn retire(self) {
+    fn retire(mut self) {
         // DIRECT and COPY pools stay apart: an allocator resets only its own kind.
         let (alloc_pool, prelude_pool) = match self.kind {
             ListKind::Direct => (&SPARE_ALLOCATORS, &SPARE_PRELUDES),
@@ -1427,6 +1464,11 @@ impl Retired {
         let mut spare = pool(&SPARE_SCRATCH);
         let room = SPARES.saturating_sub(spare.len());
         spare.extend(self.scratch.chunks.into_iter().take(room));
+        drop(spare);
+        // The submission finished: its upload buffers are free for reuse.
+        // Readbacks are not pooled (READBACK heap, never upload memory):
+        // they drop with `deferred` here.
+        return_spare_uploads(std::mem::take(&mut self.deferred.uploads));
         drop((self.deferred, self.states, self.buffer_states, self.twins, self.budget));
     }
 }
@@ -1502,6 +1544,11 @@ struct Deferred {
     copies: Vec<Step>,
     /// The list's upload buffers: buffer, mapped pointer, bytes.
     uploads: Vec<(ID3D12Resource, usize, usize)>,
+    /// The list's readback buffers: buffer, mapped pointer, bytes. Kept
+    /// apart from `uploads`: READBACK-heap COPY_DEST buffers are never
+    /// valid upload (copy-source) memory, so they must not reach the
+    /// upload pool behind `take_spare_upload`.
+    readbacks: Vec<(ID3D12Resource, usize, usize)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -3227,7 +3274,11 @@ impl HostList {
                 self.fresh_after
                     .store(self.last.load(Ordering::Acquire), Ordering::Release);
             } else {
-                *self.deferred() = Deferred::default();
+                // Nothing running uses the list: its finished upload buffers
+                // go back to the pool with the takes below (readbacks drop
+                // with `old`: never pooled, never upload memory).
+                let old = std::mem::take(&mut *self.deferred());
+                return_spare_uploads(old.uploads);
                 self.states
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -3871,7 +3922,7 @@ impl HostList {
     /// over).
     pub(crate) fn is_empty(&self) -> bool {
         let d = self.deferred();
-        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
+        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.readbacks.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
         drop(d);
         deferred_empty
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
@@ -3880,19 +3931,24 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset. DIRECT only (COPY uses staging space).
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset (and returned to the host pool for reuse). DIRECT only (COPY
+    /// uses staging space).
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         if self.is_copy() {
             debug_assert!(false, "upload on a COPY list: staging_space only");
             return None;
         }
-        let (buffer, data) = host.list_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
+        let (buffer, data, cap) = match take_spare_upload(size) {
+            Some(spare) => spare,
+            None => {
+                let (buffer, data) = host.list_buffer(size)?;
+                (buffer, data, size.max(1) as usize)
+            }
+        };
+        name(&buffer, || format!("list upload {cap:#x}"));
         self.deferred()
             .uploads
-            .push((buffer.clone(), data as usize, size as usize));
+            .push((buffer.clone(), data as usize, cap));
         Some((buffer, data))
     }
 
@@ -3901,7 +3957,9 @@ impl HostList {
     pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.mapped_buffer(size, true)?;
         name(&buffer, || format!("list readback {size:#x}"));
-        self.deferred().uploads.push((buffer.clone(), data as usize, size as usize));
+        // A readback of its own: READBACK-heap COPY_DEST memory is never
+        // pooled as an upload (wrong heap, never a valid copy source).
+        self.deferred().readbacks.push((buffer.clone(), data as usize, size as usize));
         Some((buffer, data))
     }
 
@@ -3918,13 +3976,19 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.list_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
+            let (buffer, data, cap) = match take_spare_upload(len) {
+                Some(spare) => spare,
+                None => {
+                    let (buffer, data) = host.list_buffer(len)?;
+                    (buffer, data, len as usize)
+                }
+            };
+            name(&buffer, || format!("list scratch {cap:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             self.deferred()
                 .uploads
-                .push((buffer, data as usize, len as usize));
+                .push((buffer, data as usize, cap));
             return Some((gpu, data));
         }
         while s.chunks.get(s.current).is_some() && len > SCRATCH_CHUNK - s.used {
@@ -4129,7 +4193,18 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // Counter updates batched once per list: per-step atomics on every
+        // copy cost more than the small copies they count.
+        let mut copy_us = 0u64;
+        let mut copy_bytes = 0u64;
+        #[cfg(feature = "diagnostics")]
+        let mut copy_count = 0u64;
+        #[cfg(feature = "diagnostics")]
+        let mut refresh_count = 0u64;
+        #[cfg(feature = "diagnostics")]
+        let mut refresh_bytes = 0u64;
         for step in &self.deferred().copies {
+            #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
@@ -4144,26 +4219,28 @@ impl HostList {
                     Step::Memory(_) => C::StepMemoryUs,
                 },
             );
-            let copied = match step {
+            match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        copy_count += 1;
                     }
                     batch.settle(src, len, false);
                     batch.settle(dst, len, true);
                     batch.title_written();
+                    let copying = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    copy_us += copying.elapsed().as_micros() as u64;
+                    copy_bytes += len as u64;
                     len
                 }
                 &Step::Fill(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        copy_count += 1;
                     }
                     batch.settle(src, len, false);
+                    let copying = std::time::Instant::now();
                     match &mut batch.redirect {
                         Some(redirect) => {
                             let mut bytes = vec![0; len];
@@ -4174,13 +4251,15 @@ impl HostList {
                             copy_mapped(dst as *mut u8, src as *const u8, len, false);
                         }
                     }
+                    copy_us += copying.elapsed().as_micros() as u64;
+                    copy_bytes += len as u64;
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Refreshes, 1);
-                        add(C::RefreshBytes, *len as u64);
+                        refresh_count += 1;
+                        refresh_bytes += *len as u64;
                     }
                     // Title memory an earlier submission's shaders write is
                     // current only once that one is copied back, if the
@@ -4275,8 +4354,20 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        if copy_bytes > 0 || copy_us > 0 {
+            PREPARING[0].fetch_add(copy_us, Ordering::Relaxed);
+            PREPARING[1].fetch_add(copy_bytes, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                add(C::Copies, copy_count);
+                add(C::CopyBytes, copy_bytes);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        if refresh_count > 0 {
+            add(C::Refreshes, refresh_count);
+            add(C::RefreshBytes, refresh_bytes);
         }
     }
 }
@@ -4705,6 +4796,10 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(ok) = try_user_copy(dst, src, len) {
+        return ok;
+    }
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -4723,7 +4818,14 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 /// [`copy_mapped`]): 0.35 ms for each piece of the world's copy-back, 39 ms
 /// per frame.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
+    let write = |at: usize, n: usize| {
+        let from = src.wrapping_add(at - dst as usize);
+        #[cfg(target_arch = "x86_64")]
+        if let Some(ok) = try_user_copy(at as *mut u8, from, n) {
+            return ok;
+        }
+        read(from, at as *mut u8, n)
+    };
     if len == 0 || write(dst as usize, len) {
         return;
     }
@@ -4748,9 +4850,147 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".globl victory_safe_copy",
+    ".globl victory_safe_copy_start",
+    ".globl victory_safe_copy_end",
+    ".globl victory_safe_copy_fault",
+    "victory_safe_copy:",
+    "victory_safe_copy_start:",
+    "cmp r8, 64",
+    "jb 2f",
+    "1:",
+    "movdqu xmm0, xmmword ptr [rdx]",
+    "movdqu xmm1, xmmword ptr [rdx + 16]",
+    "movdqu xmm2, xmmword ptr [rdx + 32]",
+    "movdqu xmm3, xmmword ptr [rdx + 48]",
+    "movdqu xmmword ptr [rcx], xmm0",
+    "movdqu xmmword ptr [rcx + 16], xmm1",
+    "movdqu xmmword ptr [rcx + 32], xmm2",
+    "movdqu xmmword ptr [rcx + 48], xmm3",
+    "add rdx, 64",
+    "add rcx, 64",
+    "sub r8, 64",
+    "cmp r8, 64",
+    "jae 1b",
+    "2:",
+    "cmp r8, 16",
+    "jb 3f",
+    "movdqu xmm0, xmmword ptr [rdx]",
+    "movdqu xmmword ptr [rcx], xmm0",
+    "add rdx, 16",
+    "add rcx, 16",
+    "sub r8, 16",
+    "jmp 2b",
+    "3:",
+    "cmp r8, 8",
+    "jb 4f",
+    "mov rax, qword ptr [rdx]",
+    "mov qword ptr [rcx], rax",
+    "add rdx, 8",
+    "add rcx, 8",
+    "sub r8, 8",
+    "4:",
+    "test r8, r8",
+    "jz 5f",
+    "mov al, byte ptr [rdx]",
+    "mov byte ptr [rcx], al",
+    "inc rdx",
+    "inc rcx",
+    "dec r8",
+    "jnz 4b",
+    "5:",
+    "victory_safe_copy_end:",
+    "mov eax, 1",
+    "ret",
+    "victory_safe_copy_fault:",
+    "xor eax, eax",
+    "ret",
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn victory_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    static victory_safe_copy_start: u8;
+    static victory_safe_copy_end: u8;
+    static victory_safe_copy_fault: u8;
+}
+
+/// Installs our Vectored Exception Handler once, ahead of the crash reporter,
+/// so `safe_copy` can copy mapped memory in pure user mode without kernel
+/// syscalls and recover cleanly if a page is unmapped.
+#[cfg(target_arch = "x86_64")]
+fn ensure_safe_copy_veh() {
+    use windows_sys::Win32::Foundation::{
+        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        EXCEPTION_POINTERS,
+    };
+    unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: Windows passes valid exception and context pointers.
+        let r = unsafe { &*(*info).ExceptionRecord };
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.ExceptionCode != EXCEPTION_IN_PAGE_ERROR as NTSTATUS
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // SAFETY: `ContextRecord` is valid for x86_64 exceptions.
+        let ctx = unsafe { &mut *(*info).ContextRecord };
+        let rip = ctx.Rip as usize;
+        let start = (&raw const victory_safe_copy_start) as usize;
+        let end = (&raw const victory_safe_copy_end) as usize;
+        if rip >= start && rip < end {
+            const WRITE: usize = 1;
+            if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+                && r.NumberParameters >= 2
+                && r.ExceptionInformation[0] == WRITE
+                && crate::watch::try_open_guarded(r.ExceptionInformation[1])
+            {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            ctx.Rip = (&raw const victory_safe_copy_fault) as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: registers a read-only IP-range check handler ahead of crash reporting.
+    ONCE.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, Some(handler));
+    });
+}
+
+/// Zero-syscall user-mode copy for non-overlapping ranges; returns `false` if
+/// either side hits an unmapped or inaccessible page.
+#[cfg(target_arch = "x86_64")]
+fn try_user_copy(dst: *mut u8, src: *const u8, len: usize) -> Option<bool> {
+    let (d, s) = (dst as usize, src as usize);
+    if len == 0 {
+        return Some(true);
+    }
+    // Reject obviously invalid low addresses without even taking a fault.
+    if d < 0x10000 || s < 0x10000 {
+        return Some(false);
+    }
+    let (Some(d_end), Some(s_end)) = (d.checked_add(len), s.checked_add(len)) else {
+        return Some(false);
+    };
+    // Overlapping ranges fall back to the kernel copy (memmove semantics).
+    if d < s_end && s < d_end {
+        return None;
+    }
+    ensure_safe_copy_veh();
+    // SAFETY: leaf assembly uses only volatile registers and recovers via VEH
+    // if `src` or `dst` hits an unmapped page.
+    Some(unsafe { victory_safe_copy(dst, src, len) != 0 })
+}
+
 #[cfg(test)]
 mod title_copies {
-    use super::{copy_mapped, write_mapped};
+    use super::{copy_mapped, read_into, write_mapped};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
         VirtualAlloc, VirtualFree, VirtualProtect,
@@ -4840,6 +5080,47 @@ mod title_copies {
         write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
         assert!(block(to, 2).iter().all(|&b| b == 0xee));
         release(to);
+    }
+
+    #[test]
+    fn safe_copy_handles_valid_unaligned_and_unmapped_memory() {
+        for len in [0usize, 1, 7, 8, 15, 16, 31, 63, 64, 65, 129, 4096, 70_000] {
+            let src: Vec<u8> = (0..len).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+            let mut dst = vec![0xAAu8; len];
+            assert!(read_into(src.as_ptr(), &mut dst), "valid read len={len}");
+            assert_eq!(dst, src, "mismatch len={len}");
+        }
+        // Reserve 2 pages: page 0 committed RW, page 1 uncommitted (faults on access).
+        // SAFETY: fresh reservation, freed below.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * 4096, MEM_RESERVE, PAGE_NOACCESS) as usize
+        };
+        assert_ne!(base, 0);
+        // SAFETY: commit only page 0.
+        let committed = unsafe {
+            VirtualAlloc(base as *mut _, 4096, MEM_COMMIT, PAGE_READWRITE) as usize
+        };
+        assert_eq!(committed, base);
+        // SAFETY: page 0 is committed RW.
+        unsafe { std::ptr::write_bytes(base as *mut u8, 0x5A, 4096) };
+
+        let mut buf = vec![0u8; 2 * 4096];
+        // Reading across into uncommitted page 1 must fail cleanly without crashing.
+        assert!(!read_into(base as *const u8, &mut buf));
+        // copy_mapped fills page 0 with 0x5A and zeroes uncommitted page 1.
+        copy_mapped(buf.as_mut_ptr(), base as *const u8, 2 * 4096, false);
+        assert!(buf[..4096].iter().all(|&b| b == 0x5A));
+        assert!(buf[4096..].iter().all(|&b| b == 0));
+
+        // write_mapped writes page 0 and safely skips uncommitted page 1.
+        let src = vec![0x3Cu8; 2 * 4096];
+        write_mapped(base as *mut u8, src.as_ptr(), 2 * 4096);
+        // SAFETY: page 0 is committed RW.
+        let page0 = unsafe { std::slice::from_raw_parts(base as *const u8, 4096) };
+        assert!(page0.iter().all(|&b| b == 0x3C));
+
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }
 
@@ -6147,6 +6428,115 @@ mod batch {   // `mod tests` is already taken at the top of this file
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// List upload buffers are pooled across resets: the same committed
+    /// resource and mapping serve the next upload. Needs a host GPU;
+    /// passes by without one.
+    #[test]
+    fn upload_buffers_are_pooled_across_list_resets() {
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let (first, first_ptr) = list.upload(host, 4096).expect("first upload");
+        let first_raw = first.as_raw();
+        // SAFETY: `list` is open from `new_list`; close it before `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        list.reset();
+        let (second, second_ptr) = list.upload(host, 4096).expect("second upload");
+        let second_raw = second.as_raw();
+        assert_eq!(first_raw, second_raw, "the pooled resource is reused");
+        assert_eq!(first_ptr, second_ptr, "the pooled mapping is reused");
+        drop((first, second));
+        // SAFETY: `list` is open again after `reset()`; close it before the final `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        list.reset();
+    }
+
+    /// Readback buffers are never pooled as uploads: a readback buffer
+    /// that went through `reset` is not handed back out by `upload`
+    /// (READBACK-heap COPY_DEST memory is never a valid copy source).
+    /// Needs a host GPU; passes by without one. The 16 KiB size keeps
+    /// its pool window clear of the 4 KiB upload-pool test's.
+    #[test]
+    fn readback_buffers_are_never_pooled_as_uploads() {
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let (readback, _) = list.readback(host, 16384).expect("readback");
+        let readback_raw = readback.as_raw();
+        // SAFETY: `list` is open from `new_list`; close it before `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        list.reset();
+        // The readback went through `reset`: an upload must not reuse it.
+        let (upload, _) = list.upload(host, 16384).expect("upload after readback");
+        assert_ne!(
+            upload.as_raw(),
+            readback_raw,
+            "a readback buffer is never reused as an upload"
+        );
+        drop((readback, upload));
+        // SAFETY: `list` is open again after `reset()`; close it before the final `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        list.reset();
+    }
+
+    /// Readback buffers are never retired into the upload pool either:
+    /// a `Deferred` holding only a readback retires nothing
+    /// `take_spare_upload` can hand out. Needs a host GPU; passes by
+    /// without one.
+    #[test]
+    fn readback_buffers_are_not_retired_into_the_upload_pool() {
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let (readback, data) = list.readback(host, 16384).expect("readback");
+        let readback_raw = readback.as_raw();
+        // SAFETY: `list` is open from `new_list`; close it before `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        // Retire the readback as `reset` does while the list runs: it must
+        // not reach the upload pool.
+        let mut deferred = super::Deferred::default();
+        deferred.readbacks.push((readback, data as usize, 16384));
+        let (Some(allocator), Some(prelude)) = (
+            host.fresh_allocator(super::ListKind::Direct),
+            host.fresh_prelude(super::ListKind::Direct),
+        ) else {
+            return;
+        };
+        super::Retired {
+            kind: super::ListKind::Direct,
+            allocator,
+            prelude,
+            deferred,
+            scratch: super::Scratch::default(),
+            states: Default::default(),
+            buffer_states: Default::default(),
+            twins: Default::default(),
+            budget: None,
+        }
+        .retire();
+        // An upload after the retire must not reuse the readback buffer.
+        let (upload, _) = list.upload(host, 16384).expect("upload after retire");
+        assert_ne!(
+            upload.as_raw(),
+            readback_raw,
+            "a retired readback buffer is never handed out as an upload"
+        );
+        drop(upload);
+        list.reset();
     }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
