@@ -458,9 +458,13 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
     /// unordered access (`uav`), of `bytes` of `buffer` from byte `first`
-    /// (both multiples of 4), which it holds; a null one for no buffer, or
+    /// (`bytes` a multiple of 4, `first` a multiple of 16: RAW views count
+    /// FirstElement in dwords and the host removes the device unless
+    /// FirstElement % 4 == 0), which it holds; a null one for no buffer, or
     /// for unordered access to a buffer shaders cannot write.
     pub(crate) fn raw_view_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool) {
+        debug_assert!(first % 16 == 0, "raw view offset must be 16-byte aligned");
+        debug_assert!(bytes % 4 == 0, "raw view length must be a multiple of 4");
         let Some(host) = host() else { return };
         let writable = |b: &ID3D12Resource| {
             // SAFETY: a live buffer.
@@ -1339,6 +1343,22 @@ fn buffer_srv(
             }
             return None;
         };
+        // RAW views need FirstElement % 4 == 0 (byte offset % 16 == 0). The
+        // innermost copy is only base-aligned, so re-resolve: the exact copy
+        // starts at the view address on an aligned run, making FirstElement
+        // a multiple of 4 at least (retail removes the device otherwise).
+        let (shadow, own) = if shadow.offset(start) % 16 != 0 {
+            let Some((exact, _)) = crate::shadow::for_view(start, bytes, 16) else {
+                #[cfg(feature = "diagnostics")]
+                if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                    tracing::info!(start = format_args!("{start:#x}"), len, stride, count = buffer.NumElements, "refused buffer view: no 16-aligned host copy");
+                }
+                return None;
+            };
+            (exact, true)
+        } else {
+            (shadow, own)
+        };
         let first = shadow.offset(start) / 4;
         let dwords = bytes / 4;
         let Ok(dwords) = u32::try_from(dwords) else {
@@ -1378,15 +1398,35 @@ fn buffer_srv(
         return None;
     }
     // The copy its own bytes are in, its first element counted from there.
+    // Whether the title asked for a raw view: only those need FirstElement
+    // % 4 == 0 (byte offset % 16 == 0); typed views have no such rule.
+    // SAFETY: a buffer view's union member (read through the live borrow).
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+    let bytes = u64::from(buffer.NumElements) * element;
+    let Some((shadow, own)) = crate::shadow::for_view(start, bytes, element)
     else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
         }
         return None;
+    };
+    // A title FirstElement of 1-2 dwords would otherwise sail through to
+    // CreateSRV and remove the device (diag26): re-resolve so the exact copy
+    // starts at the view address on an aligned run.
+    let (shadow, own) = if raw && shadow.offset(start) % 16 != 0 {
+        let Some((exact, _)) = crate::shadow::for_view(start, bytes, 16)
+        else {
+            #[cfg(feature = "diagnostics")]
+            if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no 16-aligned host copy");
+            }
+            return None;
+        };
+        (exact, true)
+    } else {
+        (shadow, own)
     };
     buffer.FirstElement = shadow.offset(start) / element;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
@@ -1439,6 +1479,14 @@ fn buffer_uav(
         let start = address + buffer.FirstElement * stride;
         let bytes = u64::from(buffer.NumElements) * stride;
         let (shadow, own) = crate::shadow::for_view(start, bytes, 0)?;
+        // As for shader views: RAW needs FirstElement % 4 == 0. Re-resolve
+        // first, so the writability check below runs on the final buffer.
+        let (shadow, own) = if shadow.offset(start) % 16 != 0 {
+            let (exact, _) = crate::shadow::for_view(start, bytes, 16)?;
+            (exact, true)
+        } else {
+            (shadow, own)
+        };
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -1491,7 +1539,18 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let bytes = u64::from(buffer.NumElements) * element;
+    let (shadow, own) = crate::shadow::for_view(start, bytes, element)?;
+    // As for shader views: RAW needs FirstElement % 4 == 0. Re-resolve
+    // first, so the writability check below runs on the final buffer.
+    // SAFETY: same union member as above.
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    let (shadow, own) = if raw && shadow.offset(start) % 16 != 0 {
+        let (exact, _) = crate::shadow::for_view(start, bytes, 16)?;
+        (exact, true)
+    } else {
+        (shadow, own)
+    };
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
