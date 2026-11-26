@@ -5148,8 +5148,10 @@ impl Batch<'_> {
     /// and a later step touching either range drops the copy
     /// ([`Batch::title_written`], [`Batch::gpu_wrote`]). Falls back to the
     /// CPU copy (already done) when the shadows do not cover the ranges, or
-    /// share a buffer (one barrier cannot move both ends), or the submission
-    /// already declared shader writes over them.
+    /// share a buffer (one barrier cannot move both ends), or a queued copy
+    /// already uses one of the buffers in the other role (the prelude merges
+    /// each buffer's needs with OR, so COPY_SOURCE | COPY_DEST is no valid
+    /// state), or the submission already declared shader writes over them.
     fn queue_gpu_copy(&mut self, list: &HostList, src: usize, dst: usize, len: usize) {
         if len == 0 {
             return;
@@ -5168,6 +5170,17 @@ impl Batch<'_> {
         // between view copies, and the same title range may sit in two
         // copies at once.
         if src_shadow.buffer.as_raw() == dst_shadow.buffer.as_raw() {
+            return;
+        }
+        // Nor may it change roles across queued copies: a buffer one copy
+        // reads and another writes would merge to COPY_SOURCE | COPY_DEST
+        // (invalid) in the prelude's barriers, and mistrack its state after.
+        // Sharing one role (read twice, or written twice) merges to that one
+        // state and stays queued.
+        let (src_raw, dst_raw) = (src_shadow.buffer.as_raw(), dst_shadow.buffer.as_raw());
+        if self.gpu_copies.iter().any(|(_, c)| {
+            c.dst.buffer.as_raw() == src_raw || c.src.buffer.as_raw() == dst_raw
+        }) {
             return;
         }
         let (src_key, dst_key) = (
@@ -7621,6 +7634,93 @@ mod batch {   // `mod tests` is already taken at the top of this file
         crate::shadow::unregister(p, p as u64);
         crate::watch::tests::free(p);
         crate::watch::tests::free(q);
+    }
+
+    /// A buffer two queued copies use in opposite roles is refused: the
+    /// prelude merges each buffer's barrier states with OR, so COPY_SOURCE |
+    /// COPY_DEST is no valid state (and the state stored after is whichever
+    /// copy ran last). Sharing one role still queues: a buffer read twice,
+    /// or written twice, merges to that one state. Needs a host GPU; passes
+    /// by without one.
+    #[test]
+    fn buffer_copies_sharing_a_buffer_in_opposite_roles_are_refused() {
+        use crate::watch::PAGE;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (p, q, r, s) = (
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+        );
+        for &pool in &[p, q, r, s] {
+            crate::shadow::register(pool, pool as u64, PAGE as u64);
+        }
+        let found = (
+            crate::shadow::find(p as u64, PAGE as u64),
+            crate::shadow::find(q as u64, PAGE as u64),
+            crate::shadow::find(r as u64, PAGE as u64),
+            crate::shadow::find(s as u64, PAGE as u64),
+        );
+        let (Some(first), Some(second), Some(third), Some(fourth)) = found else {
+            for &pool in &[p, q, r, s] {
+                crate::shadow::unregister(pool, pool as u64);
+                crate::watch::tests::free(pool);
+            }
+            return; // no host GPU here
+        };
+        // Four buffers: the role check below means something only then.
+        let raws = [
+            first.buffer.as_raw(),
+            second.buffer.as_raw(),
+            third.buffer.as_raw(),
+            fourth.buffer.as_raw(),
+        ];
+        for (i, &a) in raws.iter().enumerate() {
+            for &b in &raws[i + 1..] {
+                assert_ne!(a, b, "each pool in its own buffer");
+            }
+        }
+        let list = host.new_list().expect("a host list");
+        let mut batch = Batch {
+            host: Some(host),
+            submission_gen: crate::shadow::generation(),
+            ..Batch::default()
+        };
+        batch.queue_gpu_copy(&list, p, q, PAGE);
+        assert_eq!(batch.gpu_copies.len(), 1, "the first copy queues");
+        // Either end flipping to the other role refuses: a reversed copy,
+        // a queued destination read, a queued source written.
+        batch.queue_gpu_copy(&list, q, p, PAGE);
+        assert_eq!(batch.gpu_copies.len(), 1, "a reversed copy refuses");
+        batch.queue_gpu_copy(&list, q, r, PAGE);
+        assert_eq!(batch.gpu_copies.len(), 1, "reading a queued destination refuses");
+        batch.queue_gpu_copy(&list, r, p, PAGE);
+        assert_eq!(batch.gpu_copies.len(), 1, "writing a queued source refuses");
+        // One role shared stays queued: `q` written twice, `p` read twice.
+        batch.queue_gpu_copy(&list, r, q, PAGE);
+        assert_eq!(batch.gpu_copies.len(), 2, "a second writer of one buffer queues");
+        batch.queue_gpu_copy(&list, p, s, PAGE);
+        assert_eq!(batch.gpu_copies.len(), 3, "a second reader of one buffer queues");
+        // The check is submission-wide, not per list: another list's copy
+        // flipping a queued buffer's role refuses too, and takes nothing.
+        let other = host.new_list().expect("another host list");
+        batch.queue_gpu_copy(&other, s, p, PAGE);
+        assert_eq!(batch.gpu_copies.len(), 3, "another list flips no queued role");
+        assert!(batch.take_gpu_copies(&other).is_empty(), "another list takes nothing");
+        let mine = batch.take_gpu_copies(&list);
+        assert_eq!(mine.len(), 3, "the owning list takes its copies");
+        drop(mine);
+        drop(other);
+        drop(first);
+        drop(second);
+        drop(third);
+        drop(fourth);
+        for &pool in &[p, q, r, s] {
+            crate::shadow::unregister(pool, pool as u64);
+            crate::watch::tests::free(pool);
+        }
     }
 
 
