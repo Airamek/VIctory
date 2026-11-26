@@ -109,6 +109,15 @@ Notes:
 
 ## Explicitly NOT flakes (do not adjudicate as census)
 
+Rule #0 (freeze-class exclusion, §137-138): process aborts
+(`0xC0000409`, `0xC0000005`, `0x80000001`), `host::fail()` device-removed
+aborts, and any run that wedges the display driver / needs a reboot are
+STOP-THE-LINE incidents, never census material. A solo-green rerun after an
+abort proves nothing about the abort ("fails parallel, passes solo" applies
+to assertion failures only). Each census entry must record abort-vs-assert;
+any entry whose evidence includes an abort stays UNCONFIRMED until the
+abort's own mechanism is proven.
+
 - `resource::tests::a_null_view_has_no_alias_source` abort (§74): hard
   `0xC0000409` fast-fail under resync bisect, prime suspect upstream
   `219878a` × tiersmalls `#2129`-area alias-source port. Deterministic crash
@@ -122,3 +131,4 @@ Notes:
 
 - `cargo xtask policy` must pass (doc-only change).
 - No code changes, so no test gate is claimed or needed (stated, not run).
+| 24 | `watch::tests::a_busy_alias_leaves_the_page_changed_and_keeps_saved_bytes` (`crates/victory-gpu/src/watch.rs`) | Busy alias leaves page changed and keeps saved bytes (watch tracker) | **Full-run shared-state**: solo-green on fix and base tips, module group 22/22 green on fix; fails intermittently ONLY in full workspace serial runs. Same family as #18 (serial-only flake). Revisit as interaction if it recurs deterministically or outside full runs | S138: fix-solo + base-solo + watch-group green, gate3 full-workspace fail 1x - census-listed, MERGE ACCEPTED |
