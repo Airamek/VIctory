@@ -463,8 +463,8 @@ impl HostHeap {
     /// FirstElement % 4 == 0), which it holds; a null one for no buffer, or
     /// for unordered access to a buffer shaders cannot write.
     pub(crate) fn raw_view_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool) {
-        debug_assert!(first % 16 == 0, "raw view offset must be 16-byte aligned");
-        debug_assert!(bytes % 4 == 0, "raw view length must be a multiple of 4");
+        debug_assert!(first.is_multiple_of(16), "raw view offset must be 16-byte aligned");
+        debug_assert!(bytes.is_multiple_of(4), "raw view length must be a multiple of 4");
         let Some(host) = host() else { return };
         let writable = |b: &ID3D12Resource| {
             // SAFETY: a live buffer.
