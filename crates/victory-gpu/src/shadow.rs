@@ -55,6 +55,11 @@ pub(crate) struct Shadow {
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
+    /// Device-local VRAM mirror (`DEFAULT`) + Wave64 GPU hash state
+    /// (`crate::card`), when the buffer is card-resident: shaders read and
+    /// write `buffer` directly in VRAM, `data` maps `card.staging`, and no
+    /// snapshot or CPU compare ever runs for it.
+    card: Option<Arc<crate::card::CardState>>,
     /// Where it starts in `buffer` (0 but for copies sharing a buffer), and
     /// the run of the shared buffer it holds ([`Arena`]), given back when it
     /// goes.
@@ -309,15 +314,37 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
-        Shadow::new_at(buffer, data, gpu, start, len, None)
+    fn new(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        card: Option<Arc<crate::card::CardState>>,
+    ) -> Arc<Shadow> {
+        Shadow::new_at(buffer, data, gpu, start, len, None, card)
     }
 
     /// [`Shadow::new`] of a copy in a run of a shared buffer (`data` and
     /// `gpu` are the run's).
-    fn new_at(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, slice: Option<Slice>) -> Arc<Shadow> {
+    fn new_at(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        slice: Option<Slice>,
+        card: Option<Arc<crate::card::CardState>>,
+    ) -> Arc<Shadow> {
         let tracked = crate::watch::track_copy(start as usize, len as usize, true);
-        let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
+        // Card-resident shadows never take the marked-pages path (their
+        // writes are declared ranges, compared by GPU hashes), so they
+        // hold no view-bitmap bits.
+        let marks = if card.is_some() {
+            None
+        } else {
+            tracked.as_ref().and_then(|_| marks().take(pages(start, len)))
+        };
         let shadow = Arc::new(Shadow {
             buffer,
             state: AtomicU32::new(0),
@@ -331,6 +358,7 @@ impl Shadow {
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            card,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -354,8 +382,18 @@ impl Shadow {
         self.marks.is_some()
     }
 
+    /// Whether the buffer lives in device-local VRAM (`crate::card`).
+    pub(crate) fn is_card(&self) -> bool {
+        self.card.is_some()
+    }
+
+    /// Its VRAM state, when card-resident.
+    pub(crate) fn card_state(&self) -> Option<Arc<crate::card::CardState>> {
+        self.card.clone()
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
-    fn inside(&self, address: usize, len: usize) -> (usize, usize) {
+    pub(crate) fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
         (from - start, (address + len).clamp(from, end) - start)
@@ -396,6 +434,12 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert((address, address + len));
+        if self.card.is_some() {
+            // Card-resident: `staging` is the exact pre-submission
+            // snapshot (zero snapshot `memcpy`); the card engine uploads
+            // it and hashes VRAM around the submission instead.
+            return;
+        }
         if marked && let Some(t) = &self.tracked {
             t.arm(address, address + len);
             return;
@@ -551,6 +595,12 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        if self.card.is_some() {
+            // Card-resident: the card engine merges GPU writes
+            // (`merge_card_pieces`), not the snapshot compare.
+            self.finish_card_pending(&[(address, len)]);
+            return 0;
+        }
         self.copy_back_or_not(address, len, true)
     }
 
@@ -885,8 +935,192 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         let _ = crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if let Some(card) = &self.card {
+            card.mark_dirty(from - start, to - start);
+        }
         to - from
     }
+
+    /// Merges GPU-modified 64 KiB pieces (fetched from VRAM into `runs`:
+    /// `(first_piece, count, readback_ptr)`) into title memory and
+    /// `card.staging`. Returns bytes written to title memory.
+    pub(crate) fn merge_card_pieces(
+        &self,
+        card: &Arc<crate::card::CardState>,
+        runs: &[(u32, u32, usize)],
+    ) -> usize {
+        let start = self.start as usize;
+        let shadow_len = self.len as usize;
+        let mut written = 0usize;
+        let mut title_buf = vec![0u8; PAGE];
+        let mut synced: Vec<usize> = Vec::new();
+
+        for &(first_piece, count, rb_ptr) in runs {
+            for k in 0..count {
+                let piece = (first_piece + k) as usize;
+                let off = piece * PAGE;
+                if off >= shadow_len {
+                    break;
+                }
+                let n = PAGE.min(shadow_len - off);
+                let title_addr = start + off;
+                // SAFETY: `rb_ptr` holds `count * PAGE` bytes fetched from
+                // VRAM; `self.data` maps `card.staging` of at least
+                // `shadow_len` bytes.
+                let gpu_new = unsafe {
+                    std::slice::from_raw_parts((rb_ptr + (k as usize) * PAGE) as *const u8, n)
+                };
+                // SAFETY: `self.data` maps `card.staging` of at least
+                // `shadow_len` bytes; `off + n` is inside the buffer.
+                let staging_old =
+                    unsafe { std::slice::from_raw_parts_mut(self.data.add(off), n) };
+                if gpu_new == staging_old {
+                    continue;
+                }
+                let title_slice = &mut title_buf[..n];
+                if !crate::host::read_into(title_addr as *const u8, title_slice) {
+                    // Unmapped in title memory: still sync staging to VRAM
+                    // so future diffs compare against the latest GPU bytes.
+                    staging_old.copy_from_slice(gpu_new);
+                    continue;
+                }
+                let (dirty_span, cpu_modified) =
+                    merge_gpu_writes_card(title_slice, staging_old, gpu_new);
+                if let Some((dirty_start, dirty_end)) = dirty_span {
+                    let dirty_len = dirty_end - dirty_start;
+                    let _writing = crate::watch::writing(title_addr + dirty_start, dirty_len);
+                    crate::host::write_mapped(
+                        (title_addr + dirty_start) as *mut u8,
+                        title_slice[dirty_start..].as_ptr(),
+                        dirty_len,
+                    );
+                    written += dirty_len;
+                }
+                if cpu_modified {
+                    // Concurrent CPU write on the same page: upload the
+                    // merged `staging` back to VRAM before the next
+                    // submission.
+                    card.mark_dirty(off, off + n);
+                }
+                let page_lo = title_addr.div_ceil(PAGE);
+                let page_hi = (title_addr + n) / PAGE;
+                for p in page_lo..page_hi {
+                    synced.push(p);
+                }
+            }
+        }
+
+        // Pages made equal to title memory are current in the copy.
+        if let Some(t) = &self.tracked {
+            let (first, last) = (start.div_ceil(PAGE), (start + shadow_len) / PAGE);
+            let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
+            t.taken(&whole);
+        }
+        written
+    }
+
+    /// A submitted card range is done with: it no longer blocks refreshes.
+    pub(crate) fn finish_card_pending(&self, declared: &[(usize, usize)]) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        for &(address, len) in declared {
+            pending.retain(|&r| r != (address, address + len));
+        }
+    }
+
+    /// A card shadow for tests: `data` maps `card.staging`.
+    #[cfg(test)]
+    pub(crate) fn new_card_test(
+        card: Arc<crate::card::CardState>,
+        data: *mut u8,
+        start: u64,
+        len: u64,
+    ) -> Arc<Self> {
+        let buffer = card.vram.clone();
+        // SAFETY: live VRAM resource.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu, start, len, Some(card));
+        if let Some(t) = &shadow.tracked {
+            t.disarm();
+        }
+        shadow
+    }
+
+    /// Copies title memory into the copy (tests).
+    #[cfg(test)]
+    pub(crate) fn copy_for_test(&self, from: usize, to: usize) -> usize {
+        self.copy(from, to)
+    }
+}
+
+/// Merges GPU-modified bytes (`gpu_new` differs from `staging_old`) into
+/// `title` and syncs `staging_old` to the merged bytes. Returns the dirty
+/// span for the title and whether any byte unchanged by the GPU differed in
+/// `title` (a concurrent title CPU write that must be uploaded back to
+/// VRAM).
+fn merge_gpu_writes_card(
+    title: &mut [u8],
+    staging_old: &mut [u8],
+    gpu_new: &[u8],
+) -> (Option<(usize, usize)>, bool) {
+    let n = title.len().min(staging_old.len()).min(gpu_new.len());
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    let mut cpu_modified = false;
+    let mut i = 0;
+    while i + 8 <= n {
+        let gw = u64::from_ne_bytes(gpu_new[i..i + 8].try_into().unwrap());
+        let ow = u64::from_ne_bytes(staging_old[i..i + 8].try_into().unwrap());
+        if gw == ow {
+            let tw = u64::from_ne_bytes(title[i..i + 8].try_into().unwrap());
+            if tw != ow {
+                staging_old[i..i + 8].copy_from_slice(&title[i..i + 8]);
+                cpu_modified = true;
+            }
+        } else {
+            for k in i..i + 8 {
+                let g = gpu_new[k];
+                let o = staging_old[k];
+                if g != o {
+                    if title[k] != g {
+                        title[k] = g;
+                        first = first.min(k);
+                        last = k + 1;
+                    }
+                    staging_old[k] = g;
+                } else if title[k] != o {
+                    staging_old[k] = title[k];
+                    cpu_modified = true;
+                }
+            }
+        }
+        i += 8;
+    }
+    for k in i..n {
+        let g = gpu_new[k];
+        let o = staging_old[k];
+        if g != o {
+            if title[k] != g {
+                title[k] = g;
+                first = first.min(k);
+                last = k + 1;
+            }
+            staging_old[k] = g;
+        } else if title[k] != o {
+            staging_old[k] = title[k];
+            cpu_modified = true;
+        }
+    }
+    ((first < last).then_some((first, last)), cpu_modified)
+}
+
+/// [`merge_gpu_writes_card`], for the card engine's tests.
+#[cfg(test)]
+pub(crate) fn merge_gpu_writes_card_for_test(
+    title: &mut [u8],
+    staging_old: &mut [u8],
+    gpu_new: &[u8],
+) -> (Option<(usize, usize)>, bool) {
+    merge_gpu_writes_card(title, staging_old, gpu_new)
 }
 
 /// The 64 KiB title pages `[start, start + len)` touches.
@@ -1212,24 +1446,41 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        let size = len.next_multiple_of(1 << 16);
+        let h = host()?;
+        let (staging, data) = h.shared_buffer(size)?;
+        crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
+        let (buffer, card) = match crate::card::CardState::try_new(h, &staging, size) {
+            Some(card) => {
+                let vram = card.vram.clone();
+                crate::host::name(&vram, || format!("title buffer {:#x}+{len:#x} VRAM", key.0));
+                tracing::info!(
+                    start = format_args!("{:#x}", key.0),
+                    len,
+                    "large buffer placed in VRAM (card buffer)"
+                );
+                (vram, Some(card))
+            }
+            None => {
+                if len >= 16 << 20 {
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "large buffer copied to the host"
+                    );
+                } else {
+                    tracing::debug!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "buffer copied to the host"
+                    );
+                }
+                (staging, None)
+            }
+        };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
-            tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "large buffer copied to the host"
-            );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
-            );
-        }
-        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
+        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len, card));
         changed();
     }
     entry.shadow.clone()
@@ -1252,8 +1503,22 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+    let h = host()?;
+    let (staging, data) = h.shared_buffer(len)?;
+    crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
+    let (buffer, card) = match crate::card::CardState::try_new(h, &staging, len) {
+        Some(card) => {
+            let vram = card.vram.clone();
+            crate::host::name(&vram, || format!("title memory {start:#x}+{len:#x} VRAM"));
+            tracing::info!(
+                start = format_args!("{start:#x}"),
+                len,
+                "loose memory placed in VRAM (card buffer)"
+            );
+            (vram, Some(card))
+        }
+        None => (staging, None),
+    };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(
@@ -1261,7 +1526,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         len,
         "loose memory copied to the host"
     );
-    let shadow = Shadow::new(buffer, data, gpu, start, len);
+    let shadow = Shadow::new(buffer, data, gpu, start, len, card);
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -1344,7 +1609,7 @@ fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
     }
     // A run of a shared buffer, its start a whole number of elements in.
     let (buffer, data, gpu, slice) = arena().take(len, element)?;
-    let shadow = Shadow::new_at(buffer, data, gpu, address, len, Some(slice));
+    let shadow = Shadow::new_at(buffer, data, gpu, address, len, Some(slice), None);
     map.insert((address, len, element), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
     {
@@ -1672,7 +1937,7 @@ pub(crate) mod tests {
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        let shadow = Shadow::new(buffer, data, gpu, 0, 256);
+        let shadow = Shadow::new(buffer, data, gpu, 0, 256, None);
 
         let write = host.new_list().unwrap();
         write.buffer_state(&shadow, crate::host::BUFFER_UNORDERED_ACCESS);

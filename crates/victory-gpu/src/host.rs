@@ -78,6 +78,14 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    /// Device-local VRAM card buffer engine (Wave64 GPU page hashing),
+    /// lazily initialized on first card placement.
+    card: OnceLock<Option<Mutex<crate::card::CardEngine>>>,
+    /// The submission whose card compare runs unfinished yet, if any (at
+    /// most one: a submission with card writes settles the previous card
+    /// submission first, so the engine's reusable lists and differs
+    /// buffers are never reset or overwritten while in flight).
+    card_serial: Mutex<Option<u64>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -450,6 +458,8 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            card: OnceLock::new(),
+            card_serial: Mutex::new(None),
         })
     }
 }
@@ -1690,6 +1700,15 @@ type Back = (
     Vec<(usize, bool)>,
 );
 
+/// A VRAM-resident card copy shaders write (host copy, address, bytes):
+/// the card engine uploads and compares around the submission instead of
+/// the snapshot path, so these never enter [`Back`].
+type CardWrites = (
+    std::sync::Arc<crate::shadow::Shadow>,
+    usize,
+    usize,
+);
+
 /// What is left of a submission once the GPU has run it.
 struct Pending {
     lists: Vec<ListRef>,
@@ -1700,6 +1719,13 @@ struct Pending {
     /// The ranges its shaders write (host copy, address, bytes), each once,
     /// and the runs that declared each.
     back: Vec<Back>,
+    /// The VRAM-resident card ranges its shaders write (host copy,
+    /// address, bytes), each once: the card engine's plan instead of
+    /// [`Back`].
+    card_writes: Vec<CardWrites>,
+    /// The card engine's plan for `card_writes`, once recorded (it holds
+    /// the shadows and VRAM alive until both queues ran the submission).
+    card: Option<crate::card::CardPlan>,
     /// Its bottom-of-pipe writes, per run in list order: address, what,
     /// bytes. Query results go back before the writes of their own run.
     writes: Vec<Vec<(usize, crate::queue::Written, usize)>>,
@@ -1735,6 +1761,7 @@ impl Pending {
     /// reads (host copies and textures brought up to date for it).
     fn of(runs: &[&HostList]) -> (Pending, Touches) {
         let mut back: Vec<Back> = Vec::new();
+        let mut card_writes: Vec<CardWrites> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> =
             std::collections::HashMap::new();
         let (mut pending_writes, mut pending_resolves, mut touches) = (Vec::new(), Vec::new(), Touches::default());
@@ -1749,16 +1776,31 @@ impl Pending {
                     Step::GpuWrite(shadow, address, len, _, memory) => {
                         let copy = std::sync::Arc::as_ptr(shadow) as usize;
                         touches.shaders.push((copy, *address, address + len));
-                        match index.entry((copy, *address, *len)) {
-                            std::collections::hash_map::Entry::Occupied(o) => {
-                                let by = &mut back[*o.get()].3;
-                                if by.last() != Some(&(run, *memory)) {
-                                    by.push((run, *memory));
-                                }
+                        if shadow.is_card() {
+                            // VRAM-resident: the card engine uploads
+                            // CPU-written ranges and hash-compares declared
+                            // ranges around the submission, so this never
+                            // enters the snapshot copy-back. The range still
+                            // counts as shader-written (above), so later
+                            // submissions settle this one first.
+                            if !card_writes.iter().any(|(s, a, l)| {
+                                std::sync::Arc::ptr_eq(s, shadow)
+                                    && (*a, *l) == (*address, *len)
+                            }) {
+                                card_writes.push((shadow.clone(), *address, *len));
                             }
-                            std::collections::hash_map::Entry::Vacant(v) => {
-                                v.insert(back.len());
-                                back.push((shadow.clone(), *address, *len, vec![(run, *memory)]));
+                        } else {
+                            match index.entry((copy, *address, *len)) {
+                                std::collections::hash_map::Entry::Occupied(o) => {
+                                    let by = &mut back[*o.get()].3;
+                                    if by.last() != Some(&(run, *memory)) {
+                                        by.push((run, *memory));
+                                    }
+                                }
+                                std::collections::hash_map::Entry::Vacant(v) => {
+                                    v.insert(back.len());
+                                    back.push((shadow.clone(), *address, *len, vec![(run, *memory)]));
+                                }
                             }
                         }
                     }
@@ -1782,6 +1824,8 @@ impl Pending {
             value: 0,
             copy_value: 0,
             back,
+            card_writes,
+            card: None,
             writes: pending_writes,
             resolves: pending_resolves,
             preludes: Vec::new(),
@@ -1814,6 +1858,57 @@ thread_local! {
 }
 
 impl Host {
+    /// The VRAM card buffer engine, made on first use (compiles the Wave64
+    /// hash shader once). `None` where it cannot run: card buffers fall
+    /// back to host copies.
+    fn card_engine(&self) -> Option<&Mutex<crate::card::CardEngine>> {
+        self.card
+            .get_or_init(|| match crate::card::CardEngine::new(self) {
+                Ok(engine) => {
+                    tracing::info!("VRAM card buffer engine ready (Wave64 GPU hashing)");
+                    Some(Mutex::new(engine))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "VRAM card buffer engine unavailable; falling back to host RAM"
+                    );
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    pub(crate) fn card_ready(&self) -> bool {
+        self.card_engine().is_some()
+    }
+
+    /// The direct queue, for the card engine's completion-time fetch (which
+    /// runs outside any submission and never touches the submission lock).
+    pub(crate) fn direct_queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
+    /// Runs one command list at once and waits for it (tests): the card
+    /// engine's probes run outside submissions.
+    #[cfg(test)]
+    pub(crate) fn execute_and_wait_for_test(&self, cmd: ID3D12CommandList) {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        *submitted += 1;
+        let value = *submitted;
+        // SAFETY: a closed list; our fence.
+        let signalled = unsafe {
+            self.queue.ExecuteCommandLists(&[Some(cmd)]);
+            self.queue.Signal(&self.fence, value)
+        };
+        drop(submitted);
+        if let Err(e) = signalled {
+            tracing::warn!(error = %e, "test submission was not signalled");
+            return;
+        }
+        self.wait_gpu(value, false);
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
@@ -2399,6 +2494,59 @@ impl Host {
         touches.reads.append(&mut batch.reads);
         touches.shaders.append(&mut batch.shaders);
         touches.tables.extend(batch.tables.drain());
+        // Card buffers (`VICTORY_CARD_BUFFERS`): VRAM-resident copies
+        // upload CPU-written ranges and hash-compare declared ranges
+        // around the direct runs (the before list first, the after list
+        // last, both under this submission's fences). With the gate off
+        // this is one cached flag check; nothing is recorded or inserted.
+        let mut card_after_ran = false;
+        if crate::card::card_enabled() {
+            let card_writes = std::mem::take(&mut pending.card_writes);
+            if !card_writes.is_empty() || crate::card::CardState::has_dirty() {
+                let dirty_cards = crate::card::CardState::take_dirty_cards();
+                // At most one card submission in flight: the engine's
+                // reusable lists and differs buffers are never reset or
+                // overwritten while an earlier card submission still runs.
+                // The wait is the documented cost of the safer side (see
+                // `crate::card`); it only ever triggers with the gate on.
+                if let Some(value) = *self.card_serial.lock().unwrap_or_else(|e| e.into_inner())
+                {
+                    self.settle(value);
+                }
+                if let Some(engine_lock) = self.card_engine() {
+                    let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let (before, mut plan) = engine.record_before(self, &card_writes, dirty_cards);
+                    if let Some(before) = before {
+                        lists.insert(0, Some(before));
+                        for f in firsts.iter_mut().skip(1) {
+                            *f += 1;
+                        }
+                        for c in cuts.iter_mut().skip(1) {
+                            *c += 1;
+                        }
+                        debug_assert!(firsts.first().is_none_or(|&f| f == 0));
+                    }
+                    if plan.has_writes() {
+                        match engine.record_after(self, &mut plan) {
+                            Some(after) => {
+                                lists.push(Some(after));
+                                pending.card = Some(plan);
+                                card_after_ran = true;
+                            }
+                            None => plan.clear_pending(),
+                        }
+                    } else {
+                        plan.clear_pending();
+                    }
+                } else {
+                    // The engine never initialized: no card shadow exists
+                    // (placement needs it), so there is nothing to finish.
+                    for (shadow, address, len) in &card_writes {
+                        shadow.finish_card_pending(&[(*address, *len)]);
+                    }
+                }
+            }
+        }
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -2518,12 +2666,18 @@ impl Host {
         // Resources retired since the last submission go once this one has
         // run, and with it every one before.
         pending.retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+        let card_value = card_after_ran.then_some(pending.value);
         self.timeline.push(*submitted, copy_value, touches, pending);
         // Staging buffers and chunks this submission's uploads took are
         // its submission's: recyclable once it has run (`texture::recycle`
         // frees only finished ones; submissions run async here). With copy
         // offload both queues must have run them.
         crate::texture::submitted(*submitted, copy_value);
+        // A card compare runs with this submission: the next submission
+        // with card writes settles it first (at most one in flight).
+        if let Some(value) = card_value {
+            *self.card_serial.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+        }
         #[cfg(feature = "diagnostics")]
         if timed {
             starve::note_depth(self.timeline.len());
@@ -2866,6 +3020,12 @@ impl Host {
                 copies.push(shadow);
             }
         }
+        // Card shadows never snapshot, but their ranges are done with too.
+        for (shadow, _, _) in &p.card_writes {
+            if !copies.iter().any(|c| std::sync::Arc::ptr_eq(c, shadow)) {
+                copies.push(shadow);
+            }
+        }
         // A range overlapping a withheld one of the same copy is withheld
         // too: its copy-back would take the other's bytes along (pages a
         // program using title memory and another both wrote).
@@ -2895,6 +3055,29 @@ impl Host {
         }
         run_back(&back);
         copies.iter().for_each(|c| c.submission_done());
+        // Card buffers (`VICTORY_CARD_BUFFERS`): what shaders wrote to
+        // VRAM-resident copies goes back into title memory and staging,
+        // once both queues ran the submission. Before the bottom-of-pipe
+        // writes and the late copies, like the host copy-back above. Card
+        // ranges bypass the withholding above on purpose: their shaders
+        // read the VRAM mirror (kept fresh by uploads), not title memory
+        // through views, and the merge already attributes every byte to
+        // the GPU or the title.
+        if let Some(plan) = p.card {
+            if let Some(engine_lock) = self.card_engine() {
+                let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
+                let written = engine.finish_back(self, plan);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            } else {
+                plan.clear_pending();
+            }
+            // This card submission finished: no newer one can be in flight
+            // (it would have settled this one first).
+            let mut serial = self.card_serial.lock().unwrap_or_else(|e| e.into_inner());
+            if serial.is_some_and(|v| v <= p.value) {
+                *serial = None;
+            }
+        }
         // Copies kept past the lists' run: what the shaders wrote reached
         // title memory in the copy-backs above, so a deferred copy's source
         // is new now (and its destination is not overwritten by them).
@@ -6754,6 +6937,50 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    /// A device-local buffer (`DEFAULT` heap, unordered-access, common
+    /// state): VRAM-resident card copies live in it, shaders reading and
+    /// writing it directly (`crate::card`).
+    pub(crate) fn device_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a device-local buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no device buffer");
                 None
             }
         }

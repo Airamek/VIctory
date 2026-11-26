@@ -51,7 +51,7 @@ fn big_snapshot_fills_in_parallel() {
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Shadow::new(buffer, data, gpu, start as u64, len as u64);
+    let shadow = Shadow::new(buffer, data, gpu, start as u64, len as u64, None);
     assert_eq!(shadow.update(start, len), len);
     assert!(len >= 1 << 20, "the keep takes the threaded path");
     shadow.writing(start, len, false);
@@ -146,7 +146,7 @@ fn copies_back_what_changed_in_declared_ranges() {
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Shadow::new(buffer, data, gpu, start as u64, LEN as u64);
+    let shadow = Shadow::new(buffer, data, gpu, start as u64, LEN as u64, None);
     let ranges = [(100, 2 * PAGE), (PAGE, 3 * PAGE), (6 * PAGE + 8, 64)];
     assert_eq!(shadow.update(start, LEN), LEN);
     for &(at, len) in &ranges {
@@ -187,6 +187,7 @@ fn copy_of(title: &[u8]) -> Option<Arc<Shadow>> {
         0,
         title.as_ptr() as u64,
         title.len() as u64,
+        None,
     ))
 }
 
