@@ -1716,6 +1716,10 @@ struct Pending {
     /// Work once it has run, before its bottom-of-pipe writes, in run
     /// order.
     after: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Deferred copies kept past the lists' run, in record order (they run
+    /// after the copy-backs): destination, source, bytes, whether the
+    /// destination is title memory.
+    late: Vec<(usize, usize, usize, bool)>,
     /// What the repeats of lists it names more than once copy into the
     /// lists' memory, past their first (`Repeat`), kept until it has run.
     repeats: Vec<Repeat>,
@@ -1784,6 +1788,7 @@ impl Pending {
             submitted: std::time::Instant::now(),
             missed,
             after,
+            late: Vec::new(),
             repeats: Vec::new(),
             removed_in: None,
             retired: Vec::new(),
@@ -2311,6 +2316,10 @@ impl Host {
             None => runs.to_vec(),
         };
         let (mut pending, mut touches) = Pending::of(&pending_runs);
+        // Deferred copies kept past the lists' run: they run at completion,
+        // after the copy-backs (see `complete`), when a source the shaders
+        // wrote has reached title memory.
+        pending.late = std::mem::take(&mut batch.late);
         pending.preludes = preludes;
         pending.repeats = repeats;
         // What steps brought up to date through view heaps and page tables.
@@ -2803,6 +2812,13 @@ impl Host {
         }
         run_back(&back);
         copies.iter().for_each(|c| c.submission_done());
+        // Copies kept past the lists' run: what the shaders wrote reached
+        // title memory in the copy-backs above, so a deferred copy's source
+        // is new now (and its destination is not overwritten by them).
+        // A range the copy-back withheld is still old.
+        for &(dst, src, len, title_dst) in &p.late {
+            copy_mapped(dst as *mut u8, src as *const u8, len, title_dst);
+        }
         for work in &p.after {
             work();
         }
@@ -4392,7 +4408,9 @@ impl HostList {
         let mut refresh_count = 0u64;
         #[cfg(feature = "diagnostics")]
         let mut refresh_bytes = 0u64;
-        for step in &self.deferred().copies {
+        let deferred = self.deferred();
+        let mut steps = deferred.copies.iter().peekable();
+        while let Some(step) = steps.next() {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -4417,32 +4435,63 @@ impl HostList {
                     batch.settle(src, len, false);
                     batch.settle(dst, len, true);
                     batch.title_written();
-                    let copying = std::time::Instant::now();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    copy_us += copying.elapsed().as_micros() as u64;
-                    copy_bytes += len as u64;
-                    len
+                    // The copy follows the recorded order: a source the
+                    // submission's shaders write is still old here (it
+                    // lands in title memory in the copy-back), and a
+                    // destination they write would lose their bytes to
+                    // it. Either way it runs after the copy-backs.
+                    if batch.gpu_written(src, len) || batch.gpu_written(dst, len) {
+                        batch.late.push((dst, src, len, true));
+                        0
+                    } else {
+                        let copying = std::time::Instant::now();
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                        copy_us += copying.elapsed().as_micros() as u64;
+                        copy_bytes += len as u64;
+                        len
+                    }
                 }
                 &Step::Fill(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        copy_count += 1;
-                    }
-                    batch.settle(src, len, false);
-                    let copying = std::time::Instant::now();
-                    match &mut batch.redirect {
-                        Some(redirect) => {
-                            let mut bytes = vec![0; len];
-                            copy_mapped(bytes.as_mut_ptr(), src as *const u8, len, false);
-                            redirect.push((dst, bytes));
+                    // A destination the submission's shaders write would
+                    // lose their bytes to the fill; a source they write is
+                    // still old here. Either way it runs after the
+                    // copy-backs (as a title copy above).
+                    if batch.gpu_written(src, len) {
+                        batch.late.push((dst, src, len, false));
+                        0
+                    } else {
+                        let mut fill = |dst: usize, src: usize, len: usize| {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                copy_count += 1;
+                            }
+                            batch.settle(src, len, false);
+                            let copying = std::time::Instant::now();
+                            match &mut batch.redirect {
+                                Some(redirect) => {
+                                    let mut bytes = vec![0; len];
+                                    copy_mapped(bytes.as_mut_ptr(), src as *const u8, len, false);
+                                    redirect.push((dst, bytes));
+                                }
+                                None => {
+                                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                                }
+                            }
+                            copy_us += copying.elapsed().as_micros() as u64;
+                            copy_bytes += len as u64;
+                            len
+                        };
+                        let mut copied = fill(dst, src, len);
+                        // A run of fills (a list's constant buffers, mostly a
+                        // few hundred bytes each) is timed as one: reading the
+                        // clock around each would cost as much as the copies.
+                        while let Some(&Step::Fill(dst, src, len)) =
+                            steps.next_if(|s| matches!(s, Step::Fill(..)))
+                        {
+                            copied += fill(dst, src, len);
                         }
-                        None => {
-                            copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                        }
+                        copied
                     }
-                    copy_us += copying.elapsed().as_micros() as u64;
-                    copy_bytes += len as u64;
-                    len
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -4504,6 +4553,7 @@ impl HostList {
                     if !marked {
                         batch.flush();
                     }
+                    batch.gpu_write(*address, *len);
                     shadow.writing(*address, *len, *marked);
 
                     continue;
@@ -4719,6 +4769,14 @@ struct Batch<'a> {
     /// The range of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Title ranges the submission's shaders are declared to write so far
+    /// (start, end): their results reach title memory in the copy-back
+    /// after the lists run, so a deferred copy touching one waits for it.
+    gpu_writes: Vec<(usize, usize)>,
+    /// Deferred copies kept past the lists' run, in record order (they run
+    /// after the copy-backs): destination, source, bytes, whether the
+    /// destination is title memory.
+    late: Vec<(usize, usize, usize, bool)>,
     /// The host, whose earlier submissions may still be in flight.
     host: Option<&'a Host>,
     /// For a repeat of a list in the submission: what its steps write into
@@ -4858,6 +4916,22 @@ impl Batch<'_> {
     /// handler, and one take is microseconds — threads convoyed on it for
     /// no wall-time win (diag7: guard waits 20×, per-take cost 4×), so the
     /// updates stay on the submitting thread.
+    /// A range the submission's shaders write (`Step::GpuWrite`), in
+    /// recorded order: a deferred copy touching it sees its bytes only in
+    /// the copy-back.
+    fn gpu_write(&mut self, at: usize, len: usize) {
+        self.gpu_writes.push((at, at + len));
+    }
+
+    /// Whether `len` title bytes at `at` touch a range this submission's
+    /// shaders write: the bytes are not in title memory until the
+    /// copy-back after the lists run.
+    fn gpu_written(&self, at: usize, len: usize) -> bool {
+        self.gpu_writes
+            .iter()
+            .any(|&(a, b)| a < at + len && at < b)
+    }
+
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
@@ -4916,13 +4990,14 @@ impl Batch<'_> {
 /// destination (`title_dst`) that is not all mapped takes nothing from its
 /// first unmapped page on.
 ///
-/// The copy runs in the kernel (`ReadProcessMemory`), which reports an
-/// unmapped page of the source, or of the destination it writes, instead of
-/// faulting. Asking `VirtualQuery` first cost about 2 ms per copy in the
-/// title's big pools (it walks the page tables to the region's end), which
-/// made copies run at 100-200 MB/s; a title destination is asked only once
-/// its copy has failed (asked before each, the world's 80 copies per frame
-/// cost 60 ms).
+/// Both ways of reading the source report an unmapped page instead of
+/// faulting: in user mode into host memory ([`crate::title_copy`]), through
+/// the kernel (`ReadProcessMemory`), which also reports an unmapped page of
+/// the destination it writes, into title memory. Asking `VirtualQuery` first
+/// cost about 2 ms per copy in the title's big pools (it walks the page
+/// tables to the region's end), which made copies run at 100-200 MB/s; a
+/// title destination is asked only once its copy has failed (asked before
+/// each, the world's 80 copies per frame cost 60 ms).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -4941,7 +5016,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    // A page that cannot be read fails either way and is found below.
+    let whole = if title_dst {
+        read(src, dst, len)
+    } else {
+        // SAFETY: the destination is host memory of `len` bytes.
+        unsafe { crate::title_copy::copy(dst, src, len) }
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -5142,7 +5223,7 @@ fn ensure_safe_copy_veh() {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
             if r.ExceptionCode == EXCEPTION_GUARD_PAGE as NTSTATUS {
-                guard_again(r.ExceptionInformation[1]);
+                crate::title_copy::guard_again(r.ExceptionInformation[1]);
             }
             ctx.Rip = (&raw const victory_safe_copy_fault) as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -5154,34 +5235,6 @@ fn ensure_safe_copy_veh() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(handler));
     });
-}
-
-/// Makes the page of `at`, whose guard our copy just spent, a guard page
-/// again: a read that touches a title guard must report it (the piece reads
-/// as zeros) without disarming it. Mirrors `title_copy::guard_again`, which
-/// takes over this once the tiersmalls merge brings that module in.
-#[cfg(target_arch = "x86_64")]
-fn guard_again(at: usize) {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
-    };
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    if n == 0 || info.State != MEM_COMMIT {
-        return;
-    }
-    let protect = |protection: u32| {
-        let mut old = 0;
-        // SAFETY: only the page's protection changes; fails if it is gone.
-        (unsafe { VirtualProtect(at as *const _, 1, protection, &mut old) } != 0).then_some(old)
-    };
-    if let Some(old) = protect(info.Protect | PAGE_GUARD)
-        && old & !PAGE_GUARD != info.Protect & !PAGE_GUARD
-    {
-        protect(old);
-    }
 }
 
 /// Zero-syscall user-mode copy for non-overlapping ranges; returns `false` if
@@ -5732,6 +5785,8 @@ impl Meter {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        // Outside the submissions: in none of the times above.
+        let waited = crate::pipeline::take_waited_ms() / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
         // Over the same frames as the counts above.
@@ -5751,7 +5806,8 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} ms host \
                  wait for submissions; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame{copy_note}",
+                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame; \
+                 {waited:.1} ms/frame of draws waiting for pipelines{copy_note}",
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
@@ -7473,5 +7529,151 @@ mod timing_report {
         assert_eq!(residual(2.0, 2.0), 0.0);
         assert_eq!(residual(1.0, 2.0), 0.0);
         assert_eq!(residual(0.0, 0.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod fills {
+    use super::{HostList, host};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    const PAGE: usize = 4096;
+
+    fn list() -> Option<HostList> {
+        host()?.new_list().ok()
+    }
+
+    /// Fills and copies run in recorded order, and a fill's unmapped pages
+    /// read as zeros while its mapped ones are copied.
+    #[test]
+    fn steps_run_in_order_and_unmapped_pages_read_as_zeros() {
+        let Some(list) = list() else {
+            return; // no host GPU
+        };
+        // Three reserved pages, the middle one not committed.
+        // SAFETY: a fresh reservation; the committed pages are ours to fill.
+        let holed = unsafe {
+            let at =
+                VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!at.is_null());
+            for page in [0, 2] {
+                let page = at.add(page * PAGE);
+                assert!(!VirtualAlloc(page.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                page.write_bytes(7, PAGE);
+            }
+            at
+        };
+        let old = [1u8; 256];
+        let new = [2u8; 256];
+        let mut title = old;
+        let (mut first, mut second) = ([0u8; 256], [0u8; 100]);
+        let mut whole = vec![9u8; 3 * PAGE];
+        let memory = title.as_mut_ptr();
+        list.defer_fill(first.as_mut_ptr(), memory, 256);
+        list.defer_fill(whole.as_mut_ptr(), holed, 3 * PAGE);
+        // The title's own copy: fills after it see its bytes.
+        list.defer_copy(memory, new.as_ptr(), 256);
+        list.defer_fill(second.as_mut_ptr(), memory, 100);
+        list.run_deferred(&mut super::Batch::default());
+        assert_eq!((first, second), (old, [2u8; 100]));
+        assert_eq!(title, new);
+        assert!(whole[..PAGE].iter().all(|&b| b == 7));
+        assert!(whole[PAGE..2 * PAGE].iter().all(|&b| b == 0));
+        assert!(whole[2 * PAGE..].iter().all(|&b| b == 7));
+        // SAFETY: the reservation above.
+        assert_ne!(unsafe { VirtualFree(holed.cast(), 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A list's constant buffer fills, as a submission runs them. Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture constant_fills`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn constant_fills_per_list() {
+        let Some(list) = list() else {
+            return; // no host GPU
+        };
+        const FILLS: usize = 4096;
+        let title: Vec<u8> = (0..FILLS * 512).map(|i| (i * 31 + i / 512) as u8).collect();
+        for len in [64usize, 256, 512] {
+            list.close();
+            list.reset();
+            let mut filled = Vec::new();
+            for i in 0..FILLS {
+                let (_, to) = list.scratch(len as u64).expect("scratch");
+                list.defer_fill(to, title[i * 512..].as_ptr(), len);
+                filled.push((to, i * 512));
+            }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..50 {
+                let started = std::time::Instant::now();
+                list.run_deferred(&mut super::Batch::default());
+                best = best.min(started.elapsed());
+            }
+            for (to, at) in filled {
+                // SAFETY: the list's scratch memory.
+                let got = unsafe { std::slice::from_raw_parts(to, len) };
+                assert_eq!(got, &title[at..at + len]);
+            }
+            let each = best.as_nanos() as f64 / FILLS as f64;
+            println!("{FILLS} fills of {len} B: {best:?} ({each:.1} ns each)");
+        }
+    }
+}
+
+#[cfg(test)]
+mod copy_order {
+    /// A deferred copy recorded behind work its shaders do reads what
+    /// they wrote: run after the copy-backs, it sees the GPU's bytes; one
+    /// touching nothing the GPU writes runs at once. Both the copy's source
+    /// and its destination order against the declared writes.
+    #[test]
+    fn a_copy_past_a_gpu_write_sees_what_it_wrote() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        // src of a GPU write, a destination behind it, a plain source, a
+        // plain destination.
+        let pools = [
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+            crate::watch::tests::pool(1),
+        ];
+        // SAFETY: our pools, not guarded yet.
+        unsafe {
+            (pools[0] as *mut u8).write_volatile(0xAA);
+            (pools[2] as *mut u8).write_volatile(0xCC);
+        }
+        crate::shadow::register(pools[0], pools[0] as u64, PAGE as u64);
+        let copy = crate::shadow::find(pools[0] as u64, PAGE as u64).unwrap();
+        let list = host.new_list().unwrap();
+        // The program writes the first page of pool 0: the declaration
+        // first (its snapshot keeps 0xAA), the shader's write after.
+        copy.refresh(&list, pools[0] as u64, PAGE as u64);
+        copy.gpu_writes(&list, pools[0] as u64, PAGE as u64, false);
+        let src_copy = copy.clone();
+        list.defer_host((0, 0), (0, 0), move || src_copy.write_host(pools[0] as u64, &[0xBB]));
+        // Pools 0 -> 1 reads the declared write; pools 2 -> 0 writes over
+        // it; pools 2 -> 3 touches nothing the GPU writes.
+        list.defer_copy(pools[1] as *mut u8, pools[0] as *const u8, PAGE);
+        list.defer_copy(pools[0] as *mut u8, pools[2] as *const u8, PAGE);
+        list.defer_copy(pools[3] as *mut u8, pools[2] as *const u8, PAGE);
+        list.close();
+        host.execute(&[&list]);
+        // Submissions run async: finish the GPU work before reading it back.
+        host.drain();
+        // SAFETY: bytes of our pools.
+        let at = |k: usize| unsafe { (pools[k] as *const u8).read_volatile() };
+        assert_eq!(at(1), 0xBB, "the copy sees what the shaders wrote");
+        assert_eq!(at(0), 0xCC, "a copy over the write lands after it");
+        assert_eq!(at(3), 0xCC, "an unrelated copy is copied at once");
+        crate::shadow::unregister(pools[0], pools[0] as u64);
+        drop(copy);
+        for &p in &pools {
+            crate::watch::tests::free(p);
+        }
     }
 }
