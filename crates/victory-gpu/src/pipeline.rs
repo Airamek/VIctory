@@ -692,6 +692,9 @@ impl Prebuild {
         // Without the run's log lines per shader and pipeline: tens of
         // thousands of them would bury the pre-build's own report.
         let quiet = tracing::Dispatch::none();
+        // The prebuild fans out over threads too: bound its driver compiles
+        // with the same permit as the runtime workers (see `CompileGuard`).
+        let _compile = make::CompileGuard::take();
         let made = tracing::dispatcher::with_default(&quiet, || {
             host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
         });

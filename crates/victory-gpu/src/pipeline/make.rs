@@ -104,6 +104,8 @@ impl Pending {
     fn make(&self) {
         // Not `get_or_init`: a worker lost in it would leave it locked.
         let (started, cpu) = (Instant::now(), super::thread_cpu());
+        // Driver compiles run at most a few at a time (see `CompileGuard`).
+        let _compile = CompileGuard::take();
         // Huge pipelines compile one at a time (see `HugeGuard`).
         let _huge = HugeGuard::take_if(self.is_huge());
         let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
@@ -139,6 +141,47 @@ impl Pending {
 /// (each takes seconds), stalling every worker behind them. The 256 KiB
 /// threshold is xcl's default huge-PSO size.
 const HUGE_BYTES: usize = 256 * 1024;
+
+/// At most this many driver compiles at once, huge or not: unbounded
+/// concurrent compiles exhaust the commit charge (diag27: 1196 queued,
+/// +2 GB commit in 20 s, then 0x8007000E) and contend inside the driver.
+/// Same pipelines, same order, same drops — only driver-side parallelism
+/// (and hence commit charge) is bounded. No env knob: the bound is a
+/// property of the driver, not the hardware.
+const COMPILE_PERMITS: usize = 3;
+
+/// Free driver-compile slots ([`COMPILE_PERMITS`] down to 0).
+static COMPILE_SLOTS: (Mutex<usize>, Condvar) = (Mutex::new(COMPILE_PERMITS), Condvar::new());
+
+/// One driver-compile slot, held while a pipeline is made.
+pub(crate) struct CompileGuard;
+
+impl CompileGuard {
+    /// Takes a slot now (waiting for one first).
+    pub(crate) fn take() -> Self {
+        let (lock, gate) = &COMPILE_SLOTS;
+        let mut free = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waited_ms = 0;
+        while *free == 0 {
+            let started = Instant::now();
+            free = gate.wait(free).unwrap_or_else(|e| e.into_inner());
+            waited_ms += started.elapsed().as_millis() as u64;
+        }
+        *free -= 1;
+        if waited_ms > 0 {
+            tracing::info!(waited_ms, "pipeline waited for a driver-compile slot");
+        }
+        CompileGuard
+    }
+}
+
+impl Drop for CompileGuard {
+    fn drop(&mut self) {
+        let (lock, gate) = &COMPILE_SLOTS;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        gate.notify_one();
+    }
+}
 
 /// Whether a byte count is a huge driver compile ([`HUGE_BYTES`]).
 fn huge(bytes: usize) -> bool {
