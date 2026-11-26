@@ -9940,10 +9940,11 @@ mod submissions {
         // reading it (~0x118 in the user crash).
         let mut saw = false;
         host.timeline.each_work(|p| {
-            assert!(
-                p.lists.iter().any(|l| Arc::ptr_eq(l, &list)),
-                "the in-flight submission names our shell"
-            );
+            // Sibling tests' submissions may be in flight too (parallel
+            // suite): only ours must name our shell and carry our snapshot.
+            if !p.lists.iter().any(|l| Arc::ptr_eq(l, &list)) {
+                return;
+            }
             assert_eq!(Arc::as_ptr(&list), addr, "stable while in flight");
             assert!(p.pipelines.contains("submit-time-pipe"));
             assert!(
