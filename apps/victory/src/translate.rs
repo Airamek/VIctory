@@ -391,11 +391,11 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                     continue;
                                 }
                                 let one = std::time::Instant::now();
-                                let (done, cached) =
+                                let warmed =
                                     victory_gpu::shader_cache::host_shader(container);
-                                let k = if cached {
+                                let k = if warmed.hit {
                                     0
-                                } else if done.is_ok() {
+                                } else if warmed.shader.is_ok() {
                                     1
                                 } else {
                                     2
@@ -404,8 +404,8 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 tracing::debug!(
                                     hash = %&hash.to_hex()[..16],
                                     ms = one.elapsed().as_millis() as u64,
-                                    cached,
-                                    ok = done.is_ok(),
+                                    cached = warmed.hit,
+                                    ok = warmed.shader.is_ok(),
                                     "warm-up"
                                 );
                             }

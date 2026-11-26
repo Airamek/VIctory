@@ -389,6 +389,16 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    translate_with_used(container, options).map(|(shader, _)| shader)
+}
+
+/// [`translate_with`], also returning the translated program's used
+/// resources (what the host binds): one container parse and native decode
+/// serves both, instead of decoding again for the resources.
+pub fn translate_with_used(
+    container: &[u8],
+    options: Options,
+) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -406,13 +416,14 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    let used = native.used.clone();
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_with(&c, &native, &p, &st, &io, &res, options).map(|shader| (shader, used))
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
