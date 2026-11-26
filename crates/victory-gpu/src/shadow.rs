@@ -608,10 +608,17 @@ impl Shadow {
     /// in the copy and does not go into title memory (they computed it
     /// from memory with no copy, `crate::memory`).
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
+        // Card-resident ranges never reach the snapshot path: `copy_back`
+        // diverts them to the card engine, and only snapshot `back` entries
+        // call this.
+        debug_assert!(!self.is_card());
         self.copy_back_or_not(address, len, false);
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        // As above: card shadows are diverted in `copy_back`, so reaching
+        // here with one would mix the card engine's ranges into snapshots.
+        debug_assert!(!self.is_card());
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (parts, compared) = &mut *before;
         let mut written = 0;

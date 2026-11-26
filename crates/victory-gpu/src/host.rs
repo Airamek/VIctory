@@ -3077,12 +3077,9 @@ impl Host {
                 copies.push(shadow);
             }
         }
-        // Card shadows never snapshot, but their ranges are done with too.
-        for (shadow, _, _) in &p.card_writes {
-            if !copies.iter().any(|c| std::sync::Arc::ptr_eq(c, shadow)) {
-                copies.push(shadow);
-            }
-        }
+        // Card shadows never enter `back` (shader-written card ranges go
+        // to the card engine's plan instead), so no card shadow needs its
+        // snapshot finished here. (`card_writes` was taken at submit.)
         // A range overlapping a withheld one of the same copy is withheld
         // too: its copy-back would take the other's bytes along (pages a
         // program using title memory and another both wrote).

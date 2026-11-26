@@ -94,10 +94,10 @@ void main(uint lane : SV_GroupIndex) {
         if (lane == 0) {
             for (uint i = 0; i < 64; i++) {
                 if (costs[i] > left) {
-                    // The first record that does not fit takes what is
-                    // left, so those after it run empty too.
+                    // A record that does not fit takes nothing, so the
+                    // records after it that fit still run (an oversized
+                    // record no longer ends its list's budget).
                     costs[i] = PAST;
-                    left = 0;
                 } else {
                     left -= costs[i];
                 }
@@ -532,18 +532,18 @@ mod tests {
         assert!(small.iter().all(|&count| count == 1));
     }
 
-    /// A record that does not fit ends the budget: after two draws of
-    /// 3 * 2^24 vertex instances a third takes what is left, and the small
-    /// ones after it run empty.
+    /// A record that does not fit takes nothing: after two draws of
+    /// 3 * 2^24 vertex instances a third runs empty but leaves the budget,
+    /// and the small ones after it run.
     #[test]
-    fn a_record_that_does_not_fit_ends_the_budget() {
+    fn a_record_that_does_not_fit_takes_nothing() {
         let mut words = [1 << 24, 3, 0, 0].repeat(3);
         words.extend([3, 1, 0, 0].repeat(6));
         let Some(draws) = clamped(0, &words, 8, 1) else {
             return; // no host GPU here
         };
         let ran: Vec<bool> = draws.iter().map(|&count| count != 0).collect();
-        assert_eq!(ran, [true, true, false, false, false, false, false, false]);
+        assert_eq!(ran, [true, true, false, true, true, true, true, true]);
     }
 
     /// Two lists clamping into their own argument buffers, run in either

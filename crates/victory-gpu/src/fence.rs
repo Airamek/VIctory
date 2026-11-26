@@ -6,7 +6,9 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
+use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
+#[cfg(not(windows))]
+use crate::object::E_NOTIMPL;
 use crate::resource::PAGEABLE_IIDS;
 
 pub(crate) const FENCE_IIDS: [Iid; 5] = [
@@ -108,10 +110,39 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
-        // shortcut: what is left to reach it is the title's own signal,
-        // which could come from this thread; fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
-        return E_NOTIMPL;
+        // A null event means "block until reached": wait in 250 ms slices
+        // so a missed wake only costs a slice, pumping the queues' held
+        // work between slices (a queue's signal waits for the submissions
+        // before it, so those finish first). Unconditional, no knob: an
+        // already-reached value returned above, so the steady state costs
+        // nothing. The waiters' lock is dropped first: the pump below
+        // signals through [`set`], which takes it.
+        drop(waiters);
+        #[cfg(windows)]
+        {
+            // SAFETY: the fence's own value (8-byte aligned); `undesired`
+            // the value it still holds. `WaitOnAddress` returns when the
+            // value changes (`set` wakes it below) or after 250 ms; either
+            // way the value is re-read, so a missed wake only costs a slice.
+            unsafe {
+                use windows_sys::Win32::System::Threading::WaitOnAddress;
+                let at = (&fence.value as *const AtomicU64).cast::<c_void>();
+                let mut undesired = fence.value.load(Ordering::Acquire);
+                while undesired < value {
+                    crate::queue::pump_held(crate::queue::Why::Fence);
+                    let _ = WaitOnAddress(at, (&raw mut undesired).cast::<c_void>(), 8, 250);
+                    undesired = fence.value.load(Ordering::Acquire);
+                }
+            }
+            return S_OK;
+        }
+        #[cfg(not(windows))]
+        {
+            // shortcut: what is left to reach it is the title's own signal,
+            // which could come from this thread; fail instead of hanging.
+            tracing::warn!(value, "blocking fence wait not implemented");
+            return E_NOTIMPL;
+        }
     }
     waiters.push((value, event as usize, std::time::Instant::now()));
     S_OK
@@ -130,6 +161,16 @@ pub(crate) fn set(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
+    // Wake guest threads waiting on the value itself: titles read it at
+    // the fence's address, and may wait on that address; our own blocking
+    // waits do. The store above is what they wait for.
+    #[cfg(windows)]
+    // SAFETY: the fence's own value; wakes waiters only.
+    unsafe {
+        windows_sys::Win32::System::Threading::WakeByAddressAll(
+            (&fence.value as *const AtomicU64).cast::<c_void>(),
+        )
+    };
     waiters.retain(|&(wanted, event, since)| {
         let reached = wanted <= value;
         if reached {
@@ -218,13 +259,36 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
         // Grand Theft Auto VI reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn blocking_waits_end_on_signal() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        assert!(!f.is_null());
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+        // A guest waiter blocking on the value (null event) is released by
+        // a signal: `set` wakes the value's own address, and each 250 ms
+        // slice pumps held work and re-reads the value, so even a missed
+        // wake only costs a slice.
+        let raw = f as usize;
+        let waited = std::thread::scope(|s| {
+            let waiter = s.spawn(move || wait(raw as This, 9, std::ptr::null_mut()));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert_eq!(signal(f, 9), S_OK);
+            waiter.join().expect("waiter thread")
+        });
+        assert_eq!(waited, S_OK);
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(f, 0x40)(f), 9);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 
