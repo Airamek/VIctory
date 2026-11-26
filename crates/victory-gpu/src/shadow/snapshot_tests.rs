@@ -43,6 +43,15 @@ fn snapshots_keep_each_declared_byte_once() {
 #[test]
 fn big_snapshot_fills_in_parallel() {
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    // The kept counts below are process-global (every submission's declared
+    // ranges keep parts too), so no submission runs meanwhile.
+    let Some(h) = crate::host::host() else {
+        return; // no host GPU here
+    };
+    let _sub = h.submitted_lock();
+    // Finish in-flight submissions first: their completions change the kept
+    // counts this test asserts on.
+    h.drain();
     let len: usize = 32 * PAGE;
     let mut title = vec![0x44u8; len + PAGE];
     let start = (title.as_mut_ptr() as usize).next_multiple_of(PAGE);
@@ -201,6 +210,13 @@ fn all_kept() -> (usize, usize) {
 #[test]
 fn a_dropped_copy_leaves_no_snapshot() {
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    // Global kept counts: no submission meanwhile (as above).
+    let Some(h) = crate::host::host() else {
+        return; // no host GPU here
+    };
+    let _sub = h.submitted_lock();
+    // Finish in-flight submissions first (as above).
+    h.drain();
     let title = vec![0x11u8; 2 * PAGE];
     let Some(a) = copy_of(&title) else {
         return; // no host GPU here
@@ -217,6 +233,13 @@ fn a_dropped_copy_leaves_no_snapshot() {
 #[test]
 fn two_copies_keep_their_snapshots_apart() {
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    // Global kept counts: no submission meanwhile (as above).
+    let Some(h) = crate::host::host() else {
+        return; // no host GPU here
+    };
+    let _sub = h.submitted_lock();
+    // Finish in-flight submissions first (as above).
+    h.drain();
     let (first, second) = (vec![0x11u8; 2 * PAGE], vec![0x22u8; 2 * PAGE]);
     let (Some(a), Some(b)) = (copy_of(&first), copy_of(&second)) else {
         return; // no host GPU here

@@ -3406,6 +3406,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
+        // Measures the process-global alias-copy counter around placed-view
+        // reads: no sibling alias copy may land in a round's window.
+        let _alias = crate::texture::ALIAS_ONE.lock().unwrap_or_else(|e| e.into_inner());
         let slots = Slots::new(4);
         let read = compile_cs(READ);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();

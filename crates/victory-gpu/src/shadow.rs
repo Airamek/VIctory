@@ -1811,6 +1811,12 @@ pub(crate) fn near(va: u64) -> String {
 pub(crate) mod tests {
     use super::*;
 
+    /// Serializes the tests that touch the process-global mark state (the
+    /// read-mark registry, the two mark bitmaps, and the mark owners): the
+    /// registry is drained by every submission, so these tests also hold
+    /// the submission lock (family lock first, submission lock second).
+    pub(crate) static MARKS_ONE: Mutex<()> = Mutex::new(());
+
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
     pub(crate) fn mark_read(memory: bool, slot: u32) {
@@ -1827,6 +1833,9 @@ pub(crate) mod tests {
     /// goes back, and a title write made after the refresh is not undone.
     #[test]
     fn title_writes_under_a_busy_range_are_copied() {
+        // Touches the process-global snapshot block (declared ranges keep
+        // parts): one snapshot test at a time.
+        let _one = snapshot_tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -2031,6 +2040,18 @@ pub(crate) mod tests {
     /// byte there (no mark) is not put back. The bits are cleared.
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
+        // The mark bitmaps and owner table are process-global (shared with
+        // every submission's mark copy-back), so no submission runs meanwhile.
+        // Lock order: the snapshot lock, the mark lock, the submission lock.
+        let _one = snapshot_tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _marks = MARKS_ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _sub = host.submitted_lock();
+        // Finish in-flight submissions first: their completions drain the
+        // same mark state this test asserts on.
+        host.drain();
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
@@ -2078,6 +2099,16 @@ pub(crate) mod tests {
     /// marks of the same submission go back.
     #[test]
     fn marks_of_shaders_using_title_memory_are_held_back() {
+        // As above: the mark bitmaps are process-global.
+        // Lock order: the snapshot lock, the mark lock, the submission lock.
+        let _one = snapshot_tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _marks = MARKS_ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _sub = host.submitted_lock();
+        // Finish in-flight submissions first (as above).
+        host.drain();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -2113,6 +2144,15 @@ pub(crate) mod tests {
     /// an inner buffer's copy of the same pages alike.
     #[test]
     fn what_a_frame_withholds_leaves_the_copies_at_its_end() {
+        // Declared ranges keep snapshot parts, and the withholding frame is
+        // moved by every submission's completion: one snapshot test at a
+        // time, and no submission meanwhile (drained first, as above).
+        let _one = snapshot_tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _sub = host.submitted_lock();
+        host.drain();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         // SAFETY: a byte of our pool.
