@@ -25,6 +25,8 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod merge;
+
 #[cfg(test)]
 pub(crate) mod snapshot_tests;
 
@@ -43,12 +45,12 @@ pub(crate) struct Shadow {
     tracked: Option<crate::watch::Tracked>,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<std::collections::HashSet<(usize, usize)>>,
+    pending: Mutex<crate::fx::Set<(usize, usize)>>,
     /// The copy's bytes before the submission ran, where its shaders write:
     /// what the GPU wrote differs. Parts of the copy that do not overlap, in
     /// order, with where each starts in [`SNAPSHOTS`], and the 64 KiB pieces
     /// (by title address) already compared.
-    before: Mutex<(Vec<Part>, std::collections::HashSet<usize>)>,
+    before: Mutex<(Vec<Part>, crate::fx::Set<usize>)>,
     /// Its first bit in the buffer views' written-pages bitmap, one per
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
@@ -601,14 +603,7 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter()) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
+                    let changed = merge::merge(&mut *title, &mut *host, old);
                     if changed {
                         let _writing = crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);

@@ -1635,9 +1635,9 @@ struct Deferred {
     dynamic: Vec<DynamicLease>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fx::Set<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fx::Set<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2281,6 +2281,7 @@ impl Host {
         if let Some(up) = upload_list {
             let mut copy_batch = Batch {
                 host: Some(self),
+                submission_gen: crate::shadow::generation(),
                 ..Batch::default()
             };
             up.run_deferred(&mut copy_batch);
@@ -2348,7 +2349,17 @@ impl Host {
         // on the GPU.
         for (i, list) in runs.iter().enumerate() {
             let id: *const HostList = *list;
-            if since_cut.contains(&id) {
+            // A repeat that wrote the list's own memory starts a new
+            // `ExecuteCommandLists` call (the queue runs them in order, so
+            // nothing waits): its prelude must not share the call with the
+            // earlier run's lists. A repeat that wrote nothing runs anywhere
+            // in queue order, so it shares the call: fewer calls, fewer fence
+            // signals, same order, same waits (`last` is stored per list,
+            // completion per submission, `firsts` per run — none per group).
+            // `made_repeats[i]` is the repeat this run made above (empties
+            // filtered out), so `is_some` names exactly the redirecting
+            // repeats classb cuts for.
+            if needs_cut(since_cut.contains(&id), made_repeats[i].is_some()) {
                 cuts.push(lists.len());
                 since_cut.clear();
             }
@@ -2643,33 +2654,43 @@ impl Host {
     /// len)` (or, with `writing`, writes it): finishes the submissions in
     /// flight whose GPU work writes it (or reads it), so that the step sees
     /// title memory and host copies as if they had run when submitted.
-    pub(crate) fn settle_range(&self, address: usize, len: usize, writing: bool) {
-        if let Some(value) = self
-            .timeline
+    /// The newest submission in flight whose GPU work touches `[address,
+    /// address + len)` (or reads it, with `writing`), if any: asked once
+    /// per submission by [`Batch::settle`] (the set in flight does not
+    /// change while the submission prepares: its own push comes after,
+    /// under the submission lock, and finishing only drops entries whose
+    /// values would wait as no-ops).
+    fn conflict_range(&self, address: usize, len: usize, writing: bool) -> Option<u64> {
+        self.timeline
             .conflict(address, address.saturating_add(len), writing)
-        {
-            #[cfg(feature = "diagnostics")]
-            let block = std::time::Instant::now();
-            self.settle(value);
-            #[cfg(feature = "diagnostics")]
-            if timing() {
-                starve::note_block(starve::CONFLICT, block.elapsed().as_micros() as u64);
-            }
+    }
+
+    /// Finishes the submissions in flight a conflict answer names, noting
+    /// a real wait for the diagnostics timing.
+    #[cfg(feature = "diagnostics")]
+    fn settle_noted(&self, value: u64, what: usize) {
+        let block = std::time::Instant::now();
+        self.settle(value);
+        if timing() {
+            starve::note_block(what, block.elapsed().as_micros() as u64);
         }
     }
 
-    /// Before view heap `key`'s page table is rewritten: finishes the
-    /// submissions in flight whose shaders read it.
-    fn settle_table(&self, key: usize) {
-        if let Some(value) = self.timeline.table_conflict(key) {
-            #[cfg(feature = "diagnostics")]
-            let block = std::time::Instant::now();
-            self.settle(value);
-            #[cfg(feature = "diagnostics")]
-            if timing() {
-                starve::note_block(starve::STAGING_TABLE, block.elapsed().as_micros() as u64);
-            }
-        }
+    /// The newest submission in flight whose shaders read view heap `key`'s
+    /// page table, if any: asked once per submission (as
+    /// [`Host::conflict_range`], the set in flight is fixed while the
+    /// submission prepares).
+    fn table_conflict(&self, key: usize) -> Option<u64> {
+        self.timeline.table_conflict(key)
+    }
+
+    /// Before view heap `key`'s page table is rewritten for a conflict
+    /// asked by [`Batch::table_conflict`]: finishes those submissions.
+    fn settle_table_value(&self, value: u64) {
+        #[cfg(feature = "diagnostics")]
+        self.settle_noted(value, starve::STAGING_TABLE);
+        #[cfg(not(feature = "diagnostics"))]
+        self.settle(value);
     }
 
     /// Runs `signal` once every submission made so far has finished.
@@ -3964,12 +3985,52 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Records a `Copy`/`Fill` step, merging it into the previous step when
+    /// the two copy one contiguous run: a step right after one of the same
+    /// kind whose destination and source both continue where the last left
+    /// off copies their concatenation. Fewer, larger ranges: lists record
+    /// their upload and title copies in small adjacent pieces, and each
+    /// step costs two conflict lookups at submission. The merged step
+    /// copies the same bytes in the same order; its settle covers the union
+    /// of the two ranges, which waits for every submission either range
+    /// would wait for (a conflict with either half conflicts with the
+    /// union), so no wait is lost and none is reordered. Zero-length steps
+    /// copy nothing and are dropped. Lengths that would overflow are kept
+    /// as separate steps.
+    fn push_copy(steps: &mut Vec<Step>, dst: usize, src: usize, len: usize, copy: bool) {
+        // Nothing to copy.
+        if len == 0 {
+            return;
+        }
+        match steps.last_mut() {
+            Some(Step::Copy(ldst, lsrc, llen))
+                if copy
+                    && ldst.checked_add(*llen) == Some(dst)
+                    && lsrc.checked_add(*llen) == Some(src)
+                    && llen.checked_add(len).is_some() =>
+            {
+                *llen += len;
+            }
+            Some(Step::Fill(ldst, lsrc, llen))
+                if !copy
+                    && ldst.checked_add(*llen) == Some(dst)
+                    && lsrc.checked_add(*llen) == Some(src)
+                    && llen.checked_add(len).is_some() =>
+            {
+                *llen += len;
+            }
+            _ => steps.push(if copy {
+                Step::Copy(dst, src, len)
+            } else {
+                Step::Fill(dst, src, len)
+            }),
+        }
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
-        deferred
-            .copies
-            .push(Step::Copy(dst as usize, src as usize, len));
+        Self::push_copy(&mut deferred.copies, dst as usize, src as usize, len, true);
         deferred.refreshed.clear();
         deferred.filled.clear();
         deferred.gpu_written.clear();
@@ -3978,9 +4039,8 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        let mut deferred = self.deferred();
+        Self::push_copy(&mut deferred.copies, dst as usize, src as usize, len, false);
     }
 
     /// The host address of `len` bytes of scratch memory that hold the title
@@ -4524,6 +4584,9 @@ impl HostList {
             );
             match step {
                 &Step::Copy(dst, src, len) => {
+                    if len == 0 {
+                        continue;
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         copy_count += 1;
@@ -4541,7 +4604,13 @@ impl HostList {
                         0
                     } else {
                         let copying = std::time::Instant::now();
-                        let whole = copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                        let whole = copy_mapped_cached(
+                            dst as *mut u8,
+                            src as *const u8,
+                            len,
+                            true,
+                            Some(&mut batch.committed),
+                        );
                         if whole {
                             batch.queue_gpu_copy(self, src, dst, len);
                         }
@@ -4551,6 +4620,9 @@ impl HostList {
                     }
                 }
                 &Step::Fill(dst, src, len) => {
+                    if len == 0 {
+                        continue;
+                    }
                     // A destination the submission's shaders write would
                     // lose their bytes to the fill; a source they write is
                     // still old here. Either way it runs after the
@@ -4678,22 +4750,45 @@ impl HostList {
                     // page table may write any copy it names (the pages they
                     // wrote are known only once they have run): the
                     // submission counts as writing them all.
+                    // The table's readers do not change mid-submission, so
+                    // its conflict is asked once per heap per submission;
+                    // the rewrite below settles for it only when stale.
+                    let conflict = batch.table_conflict(heap);
                     let host = batch.host;
-                    crate::memory::prepare(
+                    // The walk's ranges are queued after the prepare decided
+                    // the table: collected first, so the cache borrow does
+                    // not overlap the batch below (same order, same calls).
+                    let mut adds: Vec<(
+                        std::sync::Arc<crate::shadow::Shadow>,
+                        usize,
+                        usize,
+                        Option<u32>,
+                    )> = Vec::new();
+                    let repeat = crate::memory::prepare(
                         heap,
+                        &mut batch.tables_prepared,
                         || {
-                            if let Some(host) = host {
-                                host.settle_table(heap);
+                            if let Some((host, v)) = host.zip(conflict) {
+                                host.settle_table_value(v);
                             }
                         },
                         |s, a, l, bit| {
-                            batch.settle_refresh(s, a, l);
-                            batch.add_cached(s, a, l, bit);
-                            batch
-                                .shaders
-                                .push((std::sync::Arc::as_ptr(s) as usize, a, a + l));
+                            adds.push((s.clone(), a, l, bit));
                         },
                     );
+                    // A repeat skips the walk (nothing new to queue), but its
+                    // ranges still settle: a title write between the two
+                    // prepares re-samples here.
+                    for (s, a, l) in &repeat {
+                        batch.settle_refresh(s, *a, *l);
+                    }
+                    for (s, a, l, bit) in &adds {
+                        batch.settle_refresh(s, *a, *l);
+                        batch.add_cached(s, *a, *l, *bit);
+                        batch
+                            .shaders
+                            .push((std::sync::Arc::as_ptr(s) as usize, *a, *a + *l));
+                    }
                     batch.tables.insert(heap);
                     continue;
                 }
@@ -4803,9 +4898,12 @@ fn run_one_back(
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// A submission's refreshes not done yet, merged per buffer copy into
+/// disjoint ranges: what a range overlaps, or lies within a page of,
+/// coalesces, and distant ranges of one copy are copied apart instead of
+/// copying the span between them (the 40-50x over-ask of merged spans).
+/// Done before a step that writes title memory or gives a range to
+/// shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -4813,10 +4911,13 @@ fn run_one_back(
 /// once, it is checked again only after a step that writes title memory.
 ///
 /// A copy's range brought up to date is not copied again in the submission
-/// until a step writes title memory: every list of a world submission using
-/// title memory asks for every copy whole. What the title's threads write
+/// until a step writes title memory. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
+///
+/// A copy's disjoint ranges: the copy held, so that its address names no
+/// other.
+type Ranges = crate::fx::Map<usize, (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>;
 ///
 /// Heap-hull ranges queued so far in the submission (the `hull` field of
 /// [`Batch`]): per host copy (by copy address, which names no other while
@@ -4833,7 +4934,7 @@ fn run_one_back(
 /// unchanged.
 #[derive(Default)]
 struct HullCache {
-    queued: std::collections::HashMap<usize, (usize, usize, u64, bool)>,
+    queued: crate::fx::Map<usize, (usize, usize, u64, bool)>,
 }
 
 impl HullCache {
@@ -4893,12 +4994,11 @@ fn ranges_overlap(ranges: &[(usize, usize)], at: usize, len: usize) -> bool {
 
 #[derive(Default)]
 struct Batch<'a> {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Where each copy's refresh is in `refreshes`, by copy.
-    pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
-    /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// The disjoint ranges each copy is to be brought up to date in.
+    pending: Ranges,
+    /// The ranges of each copy brought up to date since the last title
+    /// write.
+    current: Ranges,
     /// Title ranges the submission's shaders are declared to write so far
     /// (start, end): their results reach title memory in the copy-back
     /// after the lists run, so a deferred copy touching one waits for it.
@@ -4917,7 +5017,7 @@ struct Batch<'a> {
     reads: Vec<(usize, usize)>,
     shaders: Vec<(usize, usize, usize)>,
     /// Page tables (by view heap key) the submission's shaders read.
-    tables: std::collections::HashSet<usize>,
+    tables: crate::fx::Set<usize>,
     /// The copies' generation when the submission's preparation started
     /// (`crate::shadow::generation`): hull ranges queued under it stay
     /// queued only while it holds.
@@ -4932,6 +5032,47 @@ struct Batch<'a> {
     /// pointer as `usize`): recorded into the list's prelude once all the
     /// submission's steps ran (so no later step touches their ranges).
     gpu_copies: Vec<(usize, GpuCopy)>,
+    /// 64 KiB title-memory pages found committed this submission, so that
+    /// `copy_mapped`'s fallback asks the kernel once per page (see
+    /// `crate::texture::committed_cached`): the submission's copies over
+    /// the same title memory re-ask the same pages. A page committed stays
+    /// committed for the submission (title writes meanwhile are for later
+    /// submissions); unmapped pages are never remembered (the title may map
+    /// them), so this is never cleared mid-submission.
+    committed: crate::fx::Set<usize>,
+    /// The newest in-flight submission value waited for this submission:
+    /// a conflict answer at or below it names only finished submissions,
+    /// so no wait is needed (the submission waits in order, finishing
+    /// everything up to each value it waits for).
+    settled: u64,
+    /// Conflict answers this submission, by range and mode: the set in
+    /// flight does not change while the submission prepares (its own push
+    /// comes after, under the submission lock, and finishing only drops
+    /// entries whose values wait as no-ops), so a repeated range scans
+    /// the timeline once.
+    range_settles: crate::fx::Map<(usize, usize, bool), Option<u64>>,
+    /// Table conflict answers this submission, by view heap key (as above:
+    /// asked once per heap per submission).
+    table_settles: crate::fx::Map<usize, Option<u64>>,
+    /// Page-table preparations done this submission, by view heap key:
+    /// the heap identity, the copies' generation they saw, and the dirty
+    /// ranges the walk queued. A repeat for the same triple finds the same
+    /// shared table (only this thread rewrites tables while the submission
+    /// prepares, and any replacement or copy-set change misses the
+    /// generation check), so its walk would queue nothing new: skipped, and
+    /// the stored ranges are re-settled instead (their settle samples title
+    /// writes racing the submission).
+    tables_prepared: crate::fx::Map<usize, crate::memory::PreparedTable>,
+}
+
+/// Whether conflict answer `v` (the newest in-flight submission touching
+/// a range, if any) still needs a wait after `settled`, and the new
+/// settled max: waits are only for submissions not waited for yet.
+/// Pure (unit-tested): the wait itself stays with the caller.
+fn wait_for(settled: &mut u64, v: Option<u64>) -> Option<u64> {
+    let v = v.filter(|&v| v > *settled)?;
+    *settled = v;
+    Some(v)
 }
 
 /// Entries that pay back data-parallel copies: at least this many ranges
@@ -4958,20 +5099,43 @@ fn copy_threads(entries: usize) -> usize {
 impl Batch<'_> {
     /// Before a step reads (or, with `writing`, writes) title memory
     /// `[address, address + len)`: earlier submissions whose GPU work
-    /// writes (or reads) it are finished first.
-    fn settle(&self, address: usize, len: usize, writing: bool) {
-        if let Some(host) = self.host {
-            host.settle_range(address, len, writing);
+    /// writes (or reads) it are finished first. The conflict is asked once
+    /// per range per submission (see `range_settles`); a repeat waits only
+    /// for a submission newer than everything waited for so far.
+    fn settle(&mut self, address: usize, len: usize, writing: bool) {
+        let Some(host) = self.host else { return };
+        let to = address.saturating_add(len);
+        let v = *self
+            .range_settles
+            .entry((address, to, writing))
+            .or_insert_with(|| host.conflict_range(address, len, writing));
+        if let Some(v) = wait_for(&mut self.settled, v) {
+            #[cfg(feature = "diagnostics")]
+            host.settle_noted(v, starve::CONFLICT);
+            #[cfg(not(feature = "diagnostics"))]
+            host.settle(v);
         }
+    }
+
+    /// The newest submission in flight whose shaders read view heap `key`'s
+    /// page table, asked once per submission (see `table_settles`).
+    fn table_conflict(&mut self, key: usize) -> Option<u64> {
+        let host = self.host?;
+        *self
+            .table_settles
+            .entry(key)
+            .or_insert_with(|| host.table_conflict(key))
     }
 
     /// Before a refresh of `[address, address + len)` of `shadow`: as
     /// [`Batch::settle`], but a submission whose shaders write the range
     /// through the same copy is waited for only if the title wrote a page
     /// of the overlap since the copy took it (the world's big heap is both
-    /// refreshed and written by shaders in most submissions).
+    /// refreshed and written by shaders in most submissions). The answer
+    /// depends on title writes racing the submission, so it is asked every
+    /// time; only the wait itself is skipped when already covered.
     fn settle_refresh(
-        &self,
+        &mut self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
@@ -4982,6 +5146,7 @@ impl Batch<'_> {
         if let Some(value) = host
             .timeline
             .refresh_conflict(copy, address, to, |a, b| shadow.stale(a, b))
+            && wait_for(&mut self.settled, Some(value)).is_some()
         {
             host.settle(value);
         }
@@ -4994,20 +5159,20 @@ impl Batch<'_> {
         if shadow.clean() {
             return;
         }
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let end = address + len;
+        if self
+            .current
+            .get(&key)
+            .is_some_and(|(_, ranges)| covered(ranges, address, end))
+        {
             return;
         }
-        match self.pending.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
-            None => {
-                self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
-            }
-        }
+        let (_, ranges) = self
+            .pending
+            .entry(key)
+            .or_insert_with(|| (shadow.clone(), vec![]));
+        push_range(ranges, COALESCE, address, end);
     }
 
     /// Like [`Batch::add`], for a heap hull or page-table range whose
@@ -5087,19 +5252,21 @@ impl Batch<'_> {
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
-        self.pending.clear();
-        let refreshes = std::mem::take(&mut self.refreshes);
-        for (shadow, from, to) in &refreshes {
-            self.note_current(shadow, *from, *to);
-        }
         let mut total = 0;
-        for (shadow, from, to) in refreshes {
-            let (copied, us) = Self::refresh_one(&shadow, from, to);
-            total += copied;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = us;
+        for (key, (shadow, ranges)) in self.pending.drain() {
+            for (from, to) in ranges {
+                let (copied, us) = Self::refresh_one(&shadow, from, to);
+                total += copied;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = us;
+                let (_, current) = self
+                    .current
+                    .entry(key)
+                    .or_insert_with(|| (shadow.clone(), vec![]));
+                push_copied(current, from, to);
+            }
         }
         total
     }
@@ -5118,8 +5285,11 @@ impl Batch<'_> {
         (copied, us)
     }
 
-    /// Remembers a flushed refresh as the copy's range brought up to date:
-    /// the union with what was current if they touch, else the larger.
+    /// Remembers a queued GPU copy's destination as brought up to date: the
+    /// CPU copy above put the same bytes in title memory, so later refreshes
+    /// of the range in this submission are skipped (as `flush` marks what it
+    /// copied). Same tail as `flush`, with no gap: coverage must not claim a
+    /// byte no flush copied.
     fn note_current(
         &mut self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -5127,12 +5297,11 @@ impl Batch<'_> {
         to: usize,
     ) {
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let (_, a, b) = self.current.entry(key).or_insert((shadow.clone(), from, to));
-        if from <= *b && *a <= to {
-            (*a, *b) = ((*a).min(from), (*b).max(to));
-        } else if to - from > *b - *a {
-            (*a, *b) = (from, to);
-        }
+        let (_, current) = self
+            .current
+            .entry(key)
+            .or_insert_with(|| (shadow.clone(), vec![]));
+        push_copied(current, from, to);
     }
 
     /// A buffer-to-buffer copy (`Step::Copy` of title `[src, src + len)` to
@@ -5259,6 +5428,64 @@ impl Batch<'_> {
     }
 }
 
+/// Refreshes whose gap is at most a page: coalesced, one kernel copy is
+/// cheaper than two.
+const COALESCE: usize = crate::watch::PAGE;
+
+/// Adds `[address, end)` to `ranges`, kept disjoint: what the range
+/// overlaps, or lies within `gap` of, merges into it — and ranges it now
+/// bridges merge together. The ranges to copy take [`COALESCE`] (one
+/// kernel copy is cheaper than two across a page's gap); the ranges
+/// copied take no gap, so coverage never claims a byte no flush copied
+/// (a request inside a gap would be wrongly skipped).
+fn push_range(ranges: &mut Vec<(usize, usize)>, gap: usize, address: usize, end: usize) {
+    let (mut from, mut to) = (address, end);
+    let mut i = 0;
+    while i < ranges.len() {
+        let (a, e) = ranges[i];
+        if a <= to.saturating_add(gap) && from <= e.saturating_add(gap) {
+            ranges.remove(i);
+            from = from.min(a);
+            to = to.max(e);
+        } else {
+            i += 1;
+        }
+    }
+    ranges.push((from, to));
+    ranges.sort_unstable();
+}
+
+/// Whether `[address, end)` lies inside one of `ranges`.
+fn covered(ranges: &[(usize, usize)], address: usize, end: usize) -> bool {
+    ranges.iter().any(|&(a, e)| a <= address && end <= e)
+}
+
+/// Adds the range a flush copied to `ranges`, the ranges already copied:
+/// joined only where they overlap by a whole page, or meet across a page
+/// boundary. A flush guards only pages its range covers whole, so a
+/// union of ranges meeting or overlapping inside a page could claim a
+/// page none of them guarded, and a later request for it would be
+/// skipped — the split page of #2473. Joined with the rule of #2474:
+/// the ranges join when their intersection contains a whole page.
+fn push_copied(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    let (mut f, mut t) = (from, to);
+    let mut i = 0;
+    while i < ranges.len() {
+        let (a, e) = ranges[i];
+        let (lo, hi) = (a.max(f), e.min(t));
+        let joins = lo.div_ceil(crate::watch::PAGE) <= hi / crate::watch::PAGE;
+        if joins {
+            ranges.remove(i);
+            f = f.min(a);
+            t = t.max(e);
+        } else {
+            i += 1;
+        }
+    }
+    ranges.push((f, t));
+    ranges.sort_unstable();
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -5278,6 +5505,22 @@ impl Batch<'_> {
 /// page met): buffer-to-buffer copies run on the GPU only then, falling back
 /// to this CPU copy for unmapped runs.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) -> bool {
+    copy_mapped_cached(dst, src, len, title_dst, None)
+}
+
+/// Like [`copy_mapped`], but a title destination's committed question goes
+/// through the submission's 64 KiB page cache (`known`, see
+/// `crate::texture::committed_cached`) when one is passed, so the
+/// submission's copies over the same title memory ask the kernel once per
+/// page. Same bytes either way: the cache only remembers answers `committed`
+/// would give.
+pub(crate) fn copy_mapped_cached(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+    known: Option<&mut crate::fx::Set<usize>>,
+) -> bool {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -5310,7 +5553,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // The copy stopped at an unmapped page. One of a title destination ends
     // it: the retries below write the destination themselves (zeros for
     // what cannot be read), and would fault there.
-    if title_dst && !crate::texture::committed(dst, len) {
+    if title_dst
+        && !match known {
+            Some(known) => crate::texture::committed_cached(known, dst, len),
+            None => crate::texture::committed(dst, len),
+        }
+    {
         return false;
     }
     #[cfg(feature = "diagnostics")]
@@ -6608,6 +6856,17 @@ fn parse_draws(text: &str) -> u64 {
     }
 }
 
+/// Whether the repeat of a list already run since the last cut needs its
+/// own `ExecuteCommandLists` call: only a repeat that wrote the list's own
+/// memory (its prelude copies it back on the GPU) must not share the call
+/// with the earlier run's lists. A repeat that wrote nothing runs anywhere
+/// in queue order, so it shares the call: fewer calls, fewer fence
+/// signals, same order, same waits. Pure (unit-tested): the loop keeps
+/// `firsts`/`cuts` consistent around it.
+fn needs_cut(since_cut_contains: bool, redirected: bool) -> bool {
+    since_cut_contains && redirected
+}
+
 /// Which run indices each cuts group holds: run `i` is in the group whose
 /// `cuts` window contains `firsts[i]` (diagnostics, timing). Alone mode does
 /// not use this (each run is its own group).
@@ -7177,7 +7436,247 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
-    use super::{Batch, HullCache};
+    use super::*;
+
+    /// Adjacent `Copy`/`Fill` steps over one contiguous run merge, and
+    /// zero-length steps are dropped: fewer steps (each costs two conflict
+    /// lookups at submission), the same bytes in the same order. Needs no
+    /// GPU: the merge is decided on addresses alone.
+    #[test]
+    fn adjacent_copy_steps_merge_into_one_contiguous_run() {
+        let mut steps: Vec<Step> = Vec::new();
+        HostList::push_copy(&mut steps, 0x1000, 0x2000, 0, true);
+        assert!(steps.is_empty(), "a zero-length copy records nothing");
+        HostList::push_copy(&mut steps, 0x1000, 0x2000, 64, true);
+        HostList::push_copy(&mut steps, 0x1040, 0x2040, 32, true);
+        assert!(
+            matches!(steps.as_slice(), [Step::Copy(0x1000, 0x2000, 96)]),
+            "a contiguous copy continues the run"
+        );
+        // A fill is another kind: no merge across kinds.
+        HostList::push_copy(&mut steps, 0x1060, 0x2060, 16, false);
+        assert_eq!(steps.len(), 2, "a fill starts its own run");
+        HostList::push_copy(&mut steps, 0x1070, 0x2070, 16, false);
+        assert!(
+            matches!(
+                steps.as_slice(),
+                [
+                    Step::Copy(0x1000, 0x2000, 96),
+                    Step::Fill(0x1060, 0x2060, 32)
+                ]
+            ),
+            "a contiguous fill continues its own run"
+        );
+        // The destination continues but the source does not: another range.
+        HostList::push_copy(&mut steps, 0x1080, 0x3000, 16, false);
+        assert_eq!(steps.len(), 3, "a new source starts a new step");
+        // Lengths that would overflow stay separate (and never wrap).
+        HostList::push_copy(&mut steps, usize::MAX - 4, 0x4000, 8, true);
+        HostList::push_copy(&mut steps, 0, 0x4008, 8, true);
+        assert_eq!(steps.len(), 5, "overflow never merges");
+        assert!(
+            matches!(
+                steps.as_slice(),
+                [_, _, _, Step::Copy(_, _, 8), Step::Copy(0, 0x4008, 8)]
+            ),
+            "both overflowing steps survive unmerged"
+        );
+    }
+
+    /// A conflict answer waits only past what was waited for: the first
+    /// conflict of a submission waits, a repeat or an older one does not,
+    /// and a newer one waits and moves the mark. Needs no GPU: the wait
+    /// itself stays with the caller.
+    #[test]
+    fn waits_cover_everything_up_to_the_newest_one_waited_for() {
+        let mut settled = 0;
+        assert_eq!(wait_for(&mut settled, None), None);
+        assert_eq!(settled, 0, "nothing in flight: nothing waited");
+        assert_eq!(wait_for(&mut settled, Some(5)), Some(5));
+        assert_eq!(settled, 5);
+        assert_eq!(wait_for(&mut settled, Some(3)), None, "already finished");
+        assert_eq!(wait_for(&mut settled, Some(5)), None, "waited for");
+        assert_eq!(wait_for(&mut settled, Some(7)), Some(7));
+        assert_eq!(settled, 7);
+        assert_eq!(wait_for(&mut settled, None), None);
+    }
+
+    /// Only a repeat that wrote the list's own memory splits the call: a
+    /// first run never splits, and a clean repeat (or one from before the
+    /// last cut) shares it. Needs no GPU: the policy is decided on
+    /// addresses alone.
+    #[test]
+    fn only_a_redirecting_repeat_splits_the_call() {
+        assert!(!needs_cut(false, false), "a first run never splits");
+        assert!(
+            !needs_cut(false, true),
+            "from before the last cut: no split"
+        );
+        assert!(!needs_cut(true, false), "a clean repeat shares the call");
+        assert!(needs_cut(true, true), "a redirecting repeat splits it");
+    }
+
+    /// Ranges of one copy stay disjoint: what a range overlaps, or lies
+    /// within a page of, coalesces; distant ranges do not copy the span
+    /// between them. Needs no GPU: the merge is decided on addresses alone.
+    #[test]
+    fn ranges_of_a_copy_stay_disjoint() {
+        let mut rs = vec![];
+        push_range(&mut rs, COALESCE, 0x1_0000, 0x1_1000);
+        push_range(&mut rs, COALESCE, 0x40_0000, 0x40_1000);
+        assert_eq!(rs, [(0x1_0000, 0x1_1000), (0x40_0000, 0x40_1000)]);
+        assert!(covered(&rs, 0x1_0000, 0x1_1000));
+        assert!(!covered(&rs, 0x1_0000, 0x2_0000));
+        // A page's gap coalesces ...
+        push_range(
+            &mut rs,
+            COALESCE,
+            0x1_1000 + crate::watch::PAGE,
+            0x1_2000 + crate::watch::PAGE,
+        );
+        assert_eq!(
+            rs,
+            [
+                (0x1_0000, 0x1_2000 + crate::watch::PAGE),
+                (0x40_0000, 0x40_1000),
+            ]
+        );
+        // ... a page and one byte more stays apart.
+        push_range(
+            &mut rs,
+            COALESCE,
+            0x1_2000 + 2 * crate::watch::PAGE + 1,
+            0x1_2900 + 2 * crate::watch::PAGE + 1,
+        );
+        assert_eq!(rs.len(), 3);
+        // A range bridging all of them coalesces them into one.
+        push_range(&mut rs, COALESCE, 0x1_3000 + crate::watch::PAGE, 0x50_0000);
+        assert_eq!(rs, [(0x1_0000, 0x50_0000)]);
+        assert!(covered(&rs, 0x2_0000, 0x4f_0000));
+    }
+
+    /// The ranges a flush copied join only where they meet across a page
+    /// boundary, and a request is covered only inside one range: a page's
+    /// gap coalesces what to copy, never what has been copied (a missed
+    /// refresh found on hardware: pages 0, 2 and 1 flushed in that order
+    /// copied pages 0 and 2 and skipped 1).
+    #[test]
+    fn the_gap_between_copied_ranges_is_not_covered() {
+        let mut copied = vec![(0x1_0000, 0x1_1000)];
+        push_copied(&mut copied, 0x2_1000, 0x2_2000);
+        // A page apart: not joined, the gap between them stays pending.
+        assert_eq!(copied, [(0x1_0000, 0x1_1000), (0x2_1000, 0x2_2000)]);
+        assert!(!covered(&copied, 0x1_1000, 0x2_1000));
+        // Meeting inside a page: not joined either — a flush guards only
+        // pages its range covers whole, so ranges meeting there together
+        // must not claim the page none of them guarded.
+        push_copied(&mut copied, 0x1_1000, 0x2_1000);
+        assert_eq!(
+            copied,
+            [
+                (0x1_0000, 0x1_1000),
+                (0x1_1000, 0x2_1000),
+                (0x2_1000, 0x2_2000)
+            ]
+        );
+        assert!(!covered(&copied, 0x1_1000 - 4, 0x1_1000 + 4));
+        // Overlapping without a whole page between them: not joined either,
+        // a union of page-flanking ranges would claim a page left unguarded.
+        let mut flanks = vec![(0x1_0000, 0x1_8000)];
+        push_copied(&mut flanks, 0x1_4000, 0x3_0000);
+        assert_eq!(flanks, [(0x1_0000, 0x1_8000), (0x1_4000, 0x3_0000)]);
+        assert!(!covered(&flanks, 0x1_0000, 0x2_0000));
+        // Meeting at a page boundary, or overlapping by a whole page: joined.
+        let mut whole = vec![(0x1_0000, 0x2_0000)];
+        push_copied(&mut whole, 0x2_0000, 0x3_0000);
+        assert_eq!(whole, [(0x1_0000, 0x3_0000)]);
+        assert!(covered(&whole, 0x1_1000, 0x2_1000));
+        let mut spans = vec![(0x1_0000, 0x3_0000)];
+        push_copied(&mut spans, 0x2_4000, 0x4_0000);
+        assert_eq!(spans, [(0x1_0000, 0x4_0000)]);
+        assert!(covered(&spans, 0x2_4000, 0x3_0000));
+    }
+
+    /// A submission asking for distant parts of one copy refreshes them
+    /// apart, not the span between them. Needs a host GPU; passes by
+    /// without one.
+    #[test]
+    fn distant_refreshes_of_a_copy_are_copied_apart() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(8);
+        let len = 8 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE / 2);
+        batch.add(&copy, p + 6 * PAGE, PAGE / 2);
+        let ranges = &batch.pending.values().next().unwrap().1;
+        assert_eq!(
+            ranges,
+            &[(p, p + PAGE / 2), (p + 6 * PAGE, p + 6 * PAGE + PAGE / 2)]
+        );
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Two flushes that each copy part of one page do not make the page
+    /// current: the page is guarded only by a flush covering it whole, so
+    /// what the halves copied must not join, and a later whole-page
+    /// request in the same submission still refreshes (the split page
+    /// of #2473). Needs a host GPU; passes by without one.
+    #[test]
+    fn a_page_copied_in_two_halves_is_refreshed_whole() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE / 2);
+        assert_eq!(batch.flush(), PAGE / 2, "the first half is copied");
+        batch.add(&copy, p + PAGE / 2, PAGE / 2);
+        assert_eq!(batch.flush(), PAGE / 2, "the other half is copied");
+        // Neither flush guarded the page, so the two halves must not join
+        // into a current range covering it: the page is still refreshed.
+        batch.add(&copy, p, PAGE);
+        assert_eq!(batch.flush(), PAGE, "the whole page is refreshed");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// The pages between two flushed ranges of one copy are refreshed
+    /// when asked for (pages 0, 2 and 1, in that order). Needs a host GPU;
+    /// passes by without one.
+    #[test]
+    fn a_page_between_flushed_ranges_is_refreshed_when_asked_for() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE);
+        assert_eq!(batch.flush(), PAGE, "page 0");
+        batch.add(&copy, p + 2 * PAGE, PAGE);
+        assert_eq!(batch.flush(), PAGE, "page 2");
+        // The middle page has not been copied: asking for it refreshes it.
+        batch.add(&copy, p + PAGE, PAGE);
+        assert_eq!(batch.flush(), PAGE, "page 1");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
 
     /// The hull cache needs no GPU: a repeat (same copy, covered range,
     /// generation and dirtiness) hits; anything else misses.
