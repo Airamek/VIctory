@@ -784,6 +784,87 @@ pub(crate) mod tests {
         let _ = taken;
     }
 
+    /// A re-upload the copy engine left in COPY_DEST names itself in the
+    /// COPY prelude through COMMON: a COPY batch that copies a subresource
+    /// it never transitions dies at Execute with INCOMPATIBLE_BARRIER_LAYOUT
+    /// expecting COMMON (retail diag19: thousands of hits, then device
+    /// removal; no host-side `fail`). The prelude used to suppress the
+    /// barrier when the entry already matched (`real == first`), and its
+    /// up-to-date skip used to drop the prelude for an all-re-upload
+    /// submission, so every re-upload of a COPY-left texture violated; the
+    /// touch restores the in-batch transition and leaves COPY_DEST, exactly
+    /// what the DIRECT side expects after its Wait. No GPU required: the
+    /// barrier pairs mirror `moves`' COPY branch (whose skip consults the
+    /// same helper), checked against the WARP probe rule (untouched
+    /// COPY_DEST/COPY_SOURCE entries fail; any in-batch transition passes)
+    /// and `replay`'s before-state chaining.
+    #[test]
+    fn copy_prelude_names_reuploads_through_common() {
+        const COMMON: u32 = 0;
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        // The probe rule: a COPY batch copying a subresource that enters
+        // in a copy layout is valid only if the batch names it with an
+        // in-batch transition; COMMON entries promote implicitly.
+        fn batch_names(entry: u32, barriers: &[(u32, u32)]) -> bool {
+            entry == COMMON || barriers.iter().any(|&(before, _)| before == entry)
+        }
+        // A re-upload left in COPY_DEST: the suppressed transition becomes
+        // a COMMON touch and back (leaves COPY_DEST for the DIRECT side).
+        // Before the fix this was nothing, which `batch_names` rejects.
+        let touch =
+            copy_prelude_touch(COPY_DEST, COPY_DEST).expect("a COPY_DEST entry is touched");
+        assert_eq!(touch, [(COPY_DEST, COMMON), (COMMON, COPY_DEST)]);
+        assert!(
+            batch_names(COPY_DEST, &touch),
+            "the touched batch names its COPY_DEST entry"
+        );
+        assert!(
+            !batch_names(COPY_DEST, &[]),
+            "an untouched COPY_DEST entry is what the layer rejected"
+        );
+        // Same for COPY_SOURCE entries.
+        let touch =
+            copy_prelude_touch(COPY_SOURCE, COPY_SOURCE).expect("a COPY_SOURCE entry is touched");
+        assert_eq!(touch, [(COPY_SOURCE, COMMON), (COMMON, COPY_SOURCE)]);
+        assert!(
+            batch_names(COPY_SOURCE, &touch),
+            "the touched batch names its COPY_SOURCE entry"
+        );
+        assert!(
+            !batch_names(COPY_SOURCE, &[]),
+            "an untouched COPY_SOURCE entry is what the layer rejected"
+        );
+        // A first upload from COMMON needs no touch: its own COMMON to
+        // COPY_DEST transition names it (and an untouched COMMON entry
+        // promotes implicitly, as the probe showed).
+        assert!(copy_prelude_touch(COMMON, COPY_DEST).is_none());
+        assert!(batch_names(COMMON, &[(COMMON, COPY_DEST)]));
+        assert!(batch_names(COMMON, &[]));
+        // The prelude's up-to-date skip consults the same helper: a
+        // touched entry always needs its prelude, even in an all-re-upload
+        // submission where every entry otherwise looks up to date.
+        assert!(copy_prelude_touch(COPY_DEST, COPY_DEST).is_some());
+        assert!(copy_prelude_touch(COMMON, COMMON).is_none());
+        // SHADER_RESOURCE-side entries never ride COPY: no touch, and the
+        // keep filter still refuses them.
+        assert!(copy_prelude_touch(SHADER_RESOURCE, COPY_DEST).is_none());
+        assert!(!copy_prelude_keep(SHADER_RESOURCE, COPY_DEST));
+        // The touch chains by the debug layer's before-state rule and
+        // leaves COPY_DEST, exactly what the DIRECT side's COPY_DEST to
+        // SHADER_RESOURCE barrier expects after its Wait.
+        let resource = 0x1234_5000usize;
+        let mut states = std::collections::HashMap::from([(resource, COPY_DEST)]);
+        let touched: Vec<(usize, u32, u32)> = copy_prelude_touch(COPY_DEST, COPY_DEST)
+            .expect("touched")
+            .into_iter()
+            .map(|(before, after)| (resource, before, after))
+            .collect();
+        replay(&touched, &mut states).expect("the COMMON touch chains");
+        assert_eq!(states[&resource], COPY_DEST, "left for the DIRECT side");
+    }
+
     /// COPY-kind lists emit no GPU-timing timestamp queries: a copy command
     /// list cannot issue them against the standard timestamp heap (retail
     /// `Close` fails `0x80070057`; WARP tolerates it). DIRECT-kind lists
@@ -4012,7 +4093,13 @@ impl HostList {
             && repeat.is_none()
             && buffer_copies.is_empty()
             && states.values().all(|(first, _, copy)| {
-                up_to_date(first, copy.state.load(Ordering::Relaxed))
+                let real = copy.state.load(Ordering::Relaxed);
+                // A COPY-kind touch pending (a re-upload the copy engine
+                // left in its first use's state) is work even when the
+                // entry looks up to date: without the prelude the batch
+                // would copy a subresource it never names.
+                up_to_date(first, real)
+                    && !(self.is_copy() && copy_prelude_touch(real, *first).is_some())
             })
             && buffer_states.values().all(|(first, _, shadow)| {
                 up_to_date(first, shadow.state.load(Ordering::Relaxed))
@@ -4024,19 +4111,41 @@ impl HostList {
         let moves = || -> Vec<D3D12_RESOURCE_BARRIER> {
             let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = states
                 .values()
-                .filter_map(|(first, _, copy)| {
+                .flat_map(|(first, _, copy)| -> Vec<D3D12_RESOURCE_BARRIER> {
                     let real = copy.state.load(Ordering::Relaxed);
                     // A COPY-kind prelude never records a SHADER_RESOURCE-side
                     // transition (a texture the DIRECT side left readable
                     // uploads on a DIRECT list instead): the COPY side keeps
                     // its COPY_DEST side only.
-                    (real != *first && (!self.is_copy() || copy_prelude_keep(real, *first))).then(|| {
-                        transition(
+                    if real != *first && (!self.is_copy() || copy_prelude_keep(real, *first)) {
+                        vec![transition(
                             &copy.texture,
                             D3D12_RESOURCE_STATES(real as i32),
                             D3D12_RESOURCE_STATES(*first as i32),
-                        )
-                    })
+                        )]
+                    } else if self.is_copy() {
+                        // A re-upload the copy engine left in its first
+                        // use's state records no transition above, but the
+                        // copy queue rejects a batch that never names the
+                        // subresource: touch COMMON and run back to `first`.
+                        match copy_prelude_touch(real, *first) {
+                            Some([(a, b), (c, d)]) => vec![
+                                transition(
+                                    &copy.texture,
+                                    D3D12_RESOURCE_STATES(a as i32),
+                                    D3D12_RESOURCE_STATES(b as i32),
+                                ),
+                                transition(
+                                    &copy.texture,
+                                    D3D12_RESOURCE_STATES(c as i32),
+                                    D3D12_RESOURCE_STATES(d as i32),
+                                ),
+                            ],
+                            None => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    }
                 })
                 .collect();
             barriers.extend(buffer_states.values().filter_map(|(first, _, shadow)| {
@@ -6943,6 +7052,26 @@ pub(crate) fn copy_uploadable(state: u32) -> bool {
 /// ever recorded into a COPY list.
 pub(crate) fn copy_prelude_keep(real: u32, first: u32) -> bool {
     copy_uploadable(real) && copy_uploadable(first)
+}
+
+/// The COPY-kind prelude barriers for a texture already in its first use's
+/// state (`real == first`): a re-upload the copy engine left in COPY_DEST
+/// (or COPY_SOURCE) records no `real`-to-`first` transition, so a COPY
+/// batch would copy a subresource it never transitions — and the copy
+/// queue rejects exactly that at Execute with INCOMPATIBLE_BARRIER_LAYOUT,
+/// expecting COMMON (retail diag19, then device removal; WARP probe:
+/// untouched COPY_DEST/COPY_SOURCE entries fail, any in-batch transition
+/// through COMMON passes). The touch runs the entry through COMMON and
+/// back to `first`, leaving what the DIRECT side expects (COPY_DEST)
+/// exactly as before. `None` where the entry needs no touch (a first
+/// upload from COMMON names itself in its own transition; textures the
+/// DIRECT side left readable never ride the copy engine).
+pub(crate) fn copy_prelude_touch(real: u32, first: u32) -> Option<[(u32, u32); 2]> {
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    const COMMON: u32 = 0;
+    (real == first && (real == COPY_DEST || real == COPY_SOURCE))
+        .then_some([(real, COMMON), (COMMON, first)])
 }
 
 /// Whether a buffer in `state` may move on the copy engine: only between
