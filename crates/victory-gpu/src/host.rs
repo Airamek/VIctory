@@ -1466,6 +1466,8 @@ impl Retired {
         spare.extend(self.scratch.chunks.into_iter().take(room));
         drop(spare);
         // The submission finished: its upload buffers are free for reuse.
+        // Readbacks are not pooled (READBACK heap, never upload memory):
+        // they drop with `deferred` here.
         return_spare_uploads(std::mem::take(&mut self.deferred.uploads));
         drop((self.deferred, self.states, self.buffer_states, self.twins, self.budget));
     }
@@ -1542,6 +1544,11 @@ struct Deferred {
     copies: Vec<Step>,
     /// The list's upload buffers: buffer, mapped pointer, bytes.
     uploads: Vec<(ID3D12Resource, usize, usize)>,
+    /// The list's readback buffers: buffer, mapped pointer, bytes. Kept
+    /// apart from `uploads`: READBACK-heap COPY_DEST buffers are never
+    /// valid upload (copy-source) memory, so they must not reach the
+    /// upload pool behind `take_spare_upload`.
+    readbacks: Vec<(ID3D12Resource, usize, usize)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -3259,7 +3266,8 @@ impl HostList {
                     .store(self.last.load(Ordering::Acquire), Ordering::Release);
             } else {
                 // Nothing running uses the list: its finished upload buffers
-                // go back to the pool with the takes below.
+                // go back to the pool with the takes below (readbacks drop
+                // with `old`: never pooled, never upload memory).
                 let old = std::mem::take(&mut *self.deferred());
                 return_spare_uploads(old.uploads);
                 self.states
@@ -3851,7 +3859,7 @@ impl HostList {
     /// over).
     pub(crate) fn is_empty(&self) -> bool {
         let d = self.deferred();
-        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
+        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.readbacks.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
         drop(d);
         deferred_empty
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
@@ -3886,7 +3894,9 @@ impl HostList {
     pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.mapped_buffer(size, true)?;
         name(&buffer, || format!("list readback {size:#x}"));
-        self.deferred().uploads.push((buffer.clone(), data as usize, size as usize));
+        // A readback of its own: READBACK-heap COPY_DEST memory is never
+        // pooled as an upload (wrong heap, never a valid copy source).
+        self.deferred().readbacks.push((buffer.clone(), data as usize, size as usize));
         Some((buffer, data))
     }
 
@@ -6379,6 +6389,88 @@ mod batch {   // `mod tests` is already taken at the top of this file
         drop((first, second));
         // SAFETY: `list` is open again after `reset()`; close it before the final `reset()`.
         unsafe { list.list.Close().expect("close list") };
+        list.reset();
+    }
+
+    /// Readback buffers are never pooled as uploads: a readback buffer
+    /// that went through `reset` is not handed back out by `upload`
+    /// (READBACK-heap COPY_DEST memory is never a valid copy source).
+    /// Needs a host GPU; passes by without one. The 16 KiB size keeps
+    /// its pool window clear of the 4 KiB upload-pool test's.
+    #[test]
+    fn readback_buffers_are_never_pooled_as_uploads() {
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let (readback, _) = list.readback(host, 16384).expect("readback");
+        let readback_raw = readback.as_raw();
+        // SAFETY: `list` is open from `new_list`; close it before `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        list.reset();
+        // The readback went through `reset`: an upload must not reuse it.
+        let (upload, _) = list.upload(host, 16384).expect("upload after readback");
+        assert_ne!(
+            upload.as_raw(),
+            readback_raw,
+            "a readback buffer is never reused as an upload"
+        );
+        drop((readback, upload));
+        // SAFETY: `list` is open again after `reset()`; close it before the final `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        list.reset();
+    }
+
+    /// Readback buffers are never retired into the upload pool either:
+    /// a `Deferred` holding only a readback retires nothing
+    /// `take_spare_upload` can hand out. Needs a host GPU; passes by
+    /// without one.
+    #[test]
+    fn readback_buffers_are_not_retired_into_the_upload_pool() {
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let (readback, data) = list.readback(host, 16384).expect("readback");
+        let readback_raw = readback.as_raw();
+        // SAFETY: `list` is open from `new_list`; close it before `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        // Retire the readback as `reset` does while the list runs: it must
+        // not reach the upload pool.
+        let mut deferred = super::Deferred::default();
+        deferred.readbacks.push((readback, data as usize, 16384));
+        let (Some(allocator), Some(prelude)) = (
+            host.fresh_allocator(super::ListKind::Direct),
+            host.fresh_prelude(super::ListKind::Direct),
+        ) else {
+            return;
+        };
+        super::Retired {
+            kind: super::ListKind::Direct,
+            allocator,
+            prelude,
+            deferred,
+            scratch: super::Scratch::default(),
+            states: Default::default(),
+            buffer_states: Default::default(),
+            twins: Default::default(),
+            budget: None,
+        }
+        .retire();
+        // An upload after the retire must not reuse the readback buffer.
+        let (upload, _) = list.upload(host, 16384).expect("upload after retire");
+        assert_ne!(
+            upload.as_raw(),
+            readback_raw,
+            "a retired readback buffer is never handed out as an upload"
+        );
+        drop(upload);
         list.reset();
     }
 
