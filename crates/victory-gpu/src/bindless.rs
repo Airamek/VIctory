@@ -204,28 +204,7 @@ pub(crate) fn uploads(
     // The copy engine path has its own list (COPY kind) behind its own lock;
     // the direct path keeps its list. The kind never changes for a holder.
     let use_copy = crate::host::copy_enabled();
-    let mut guard = if use_copy {
-        COPY_LIST.lock().unwrap_or_else(|e| e.into_inner())
-    } else {
-        LIST.lock().unwrap_or_else(|e| e.into_inner())
-    };
     crate::texture::recycle();
-    match &guard.0 {
-        // Closed by the last submission, which has run.
-        Some(list) => list.reset(),
-        // Made open.
-        None => {
-            let host = crate::host::host()?;
-            let list = if use_copy {
-                host.new_copy_list().ok()?
-            } else {
-                host.new_list().ok()?
-            };
-            list.set_ours();
-            guard.0 = Some(list);
-        }
-    }
-    let list = guard.0.as_ref()?;
     // What to bring up: the textures lists read through tables, and those
     // the heaps view that shaders read lately. Collected under the heaps'
     // locks and brought up without them, several at a time: reading title
@@ -277,24 +256,89 @@ pub(crate) fn uploads(
             }
         }
     }
-    let mut recorded = false;
-    // The textures copied into stay alive in `work` until recorded.
-    let mut readable = Vec::new();
+    // The textures whose title memory changed, with their uploads.
+    let mut changed: Vec<(
+        Arc<crate::texture::Staging>,
+        Arc<crate::resource::HostTexture>,
+        crate::texture::Upload,
+    )> = Vec::new();
     for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
         if let Some(upload) = upload {
-            readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
-            recorded = true;
-            #[cfg(feature = "diagnostics")]
-            UPLOADED.fetch_add(1, Relaxed);
+            changed.push((staging.clone(), copy.clone(), upload));
         }
+    }
+    if changed.is_empty() {
+        // Nothing to record (a list's reset next time is fine).
+        return None;
+    }
+    // Offload by residency: a texture the DIRECT side left readable (a
+    // SHADER_RESOURCE real state) cannot transition on the copy engine
+    // (COPY lists record only copy-state barriers), so it is uploaded on a
+    // DIRECT list instead, exactly as with the gate off. First uploads
+    // (COMMON) and textures the copy engine left (COPY_DEST/SOURCE) go on
+    // the COPY list. With the gate off everything goes on the DIRECT list.
+    let (mut copy_work, mut direct_work) = (Vec::new(), Vec::new());
+    for (staging, copy, upload) in changed {
+        if use_copy && crate::host::copy_uploadable(copy.state.load(Relaxed)) {
+            copy_work.push((staging, copy, upload));
+        } else {
+            direct_work.push((staging, copy, upload));
+        }
+    }
+    let copy = record_uploads(&COPY_LIST, true, &copy_work);
+    let direct = record_uploads(&LIST, false, &direct_work);
+    // A list recording nothing is not run (its reset next time is fine).
+    (copy.is_some() || direct.is_some()).then(|| Uploads { copy, direct })
+}
+
+/// Records `work` into the holder's list (reset, or made open when there is
+/// none yet): the SHADER_RESOURCE barriers of DIRECT uploads after all
+/// their copies. A COPY-kind list (`copy`) records copies only; the DIRECT
+/// side makes them readable after the copy Wait. Ours (not the title's):
+/// uploads are no use of the title's. `None` for empty work (no list is
+/// touched) or without a host GPU.
+fn record_uploads(
+    holder: &'static Mutex<Holder>,
+    copy: bool,
+    work: &[(
+        Arc<crate::texture::Staging>,
+        Arc<crate::resource::HostTexture>,
+        crate::texture::Upload,
+    )],
+) -> Option<std::sync::MutexGuard<'static, Holder>> {
+    if work.is_empty() {
+        return None;
+    }
+    let mut guard = holder.lock().unwrap_or_else(|e| e.into_inner());
+    match &guard.0 {
+        // Closed by the last submission, which has run.
+        Some(list) => list.reset(),
+        // Made open.
+        None => {
+            let host = crate::host::host()?;
+            let list = if copy {
+                host.new_copy_list().ok()?
+            } else {
+                host.new_list().ok()?
+            };
+            list.set_ours();
+            guard.0 = Some(list);
+        }
+    }
+    let list = guard.0.as_ref()?;
+    // The textures copied into stay alive in `work` until recorded.
+    let mut readable = Vec::new();
+    for (staging, copy, upload) in work {
+        readable.extend(crate::texture::record_upload(list, copy, staging, upload));
+        #[cfg(feature = "diagnostics")]
+        UPLOADED.fetch_add(1, Relaxed);
     }
     if !readable.is_empty() {
         // SAFETY: an open list; the barriers name live textures.
         unsafe { list.list.ResourceBarrier(&readable) };
     }
     list.close();
-    // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    Some(guard)
 }
 
 /// The upload list, used under its lock only.
@@ -303,12 +347,25 @@ pub(crate) struct Holder(Option<HostList>);
 // submission at a time, under the lock.
 unsafe impl Send for Holder {}
 
-/// The upload list of a submission, ours until it has run.
-pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
+/// The upload lists of a submission, each used under its own lock: at most
+/// one COPY-kind list (first uploads, on the copy engine when the gate is
+/// on) and at most one DIRECT list (re-uploads of resident textures, which
+/// the copy engine cannot transition; every upload with the gate off).
+/// Ours until they have run.
+pub(crate) struct Uploads {
+    copy: Option<std::sync::MutexGuard<'static, Holder>>,
+    direct: Option<std::sync::MutexGuard<'static, Holder>>,
+}
 
 impl Uploads {
-    pub(crate) fn list(&self) -> &HostList {
-        self.0.0.as_ref().expect("made before it is handed out")
+    /// The COPY-kind upload list, if any.
+    pub(crate) fn copy_list(&self) -> Option<&HostList> {
+        self.copy.as_ref().and_then(|h| h.0.as_ref())
+    }
+
+    /// The DIRECT upload list, if any.
+    pub(crate) fn direct_list(&self) -> Option<&HostList> {
+        self.direct.as_ref().and_then(|h| h.0.as_ref())
     }
 }
 

@@ -712,6 +712,68 @@ pub(crate) mod tests {
         let _ = taken;
     }
 
+    /// Second and later uploads of an already-resident texture must not
+    /// record a SHADER_RESOURCE-side transition into a COPY-kind prelude:
+    /// replay what a COPY prelude keeps (as [`transition`] issues them). A
+    /// first upload runs COMMON to COPY_DEST; a resident texture (left
+    /// SHADER_RESOURCE by the DIRECT side) records nothing there (it is
+    /// uploaded on a DIRECT list instead). No GPU required: the kept
+    /// barriers mirror `prelude`'s COPY filter and `record_upload`.
+    #[test]
+    fn copy_prelude_records_no_shader_resource_side_transitions() {
+        const COMMON: u32 = 0;
+        const CODE_COMMON: u32 = 0x1;
+        const COPY_DEST: u32 = 0x400;
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        // Only between copy states: first uploads, and staying put.
+        assert!(copy_prelude_keep(COMMON, COPY_DEST));
+        assert!(copy_prelude_keep(CODE_COMMON, COPY_DEST));
+        assert!(copy_prelude_keep(COPY_DEST, COPY_DEST));
+        // Anything SHADER_RESOURCE-side is never recorded into a COPY list.
+        for &(real, first) in &[
+            (SHADER_RESOURCE, COPY_DEST),
+            (COPY_DEST, SHADER_RESOURCE),
+            (SHADER_RESOURCE, SHADER_RESOURCE),
+        ] {
+            assert!(
+                !copy_prelude_keep(real, first),
+                "a COPY prelude keeps {real:#x} to {first:#x}"
+            );
+        }
+        // Uploadable on the copy engine exactly when a COPY prelude could
+        // move it: first uploads (COMMON) and textures the copy engine left.
+        assert!(copy_uploadable(COMMON));
+        assert!(copy_uploadable(CODE_COMMON));
+        assert!(copy_uploadable(COPY_DEST));
+        assert!(!copy_uploadable(SHADER_RESOURCE));
+        // The kept barriers run a first upload from COMMON to COPY_DEST,
+        // with no SHADER_RESOURCE bits anywhere.
+        let resource = 0x1234_5000usize;
+        let mut states = std::collections::HashMap::from([(resource, COMMON)]);
+        let first = vec![(resource, COMMON, COPY_DEST)];
+        replay(&first, &mut states).expect("a first upload's copy barrier runs");
+        assert_eq!(states[&resource], COPY_DEST, "left for the DIRECT side");
+        // A resident texture contributes no barrier: nothing to replay, and
+        // nothing recorded carries SHADER_RESOURCE bits.
+        let kept: Vec<(usize, u32, u32)> = [(SHADER_RESOURCE, COPY_DEST)]
+            .into_iter()
+            .filter(|&(real, first)| copy_prelude_keep(real, first))
+            .map(|(real, first)| (resource, real, first))
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "no SHADER_RESOURCE-side barrier is kept for a COPY prelude"
+        );
+        assert!(
+            first
+                .iter()
+                .all(|&(_, before, after)| before & SHADER_RESOURCE == 0 && after & SHADER_RESOURCE == 0),
+            "no recorded barrier carries SHADER_RESOURCE bits"
+        );
+        let taken = issued();
+        let _ = taken;
+    }
+
     /// The copy-queue rollout switch defaults off, the timeline waits for
     /// both queues, and staging retires on both completeds. No GPU required
     /// except for the list-kind checks (early-return without one, as the
@@ -2055,29 +2117,62 @@ impl Host {
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
-        // Copy offload: the upload list runs on the copy engine, not prepended
-        // to the direct runs. Otherwise (gate off) it runs first on DIRECT.
-        // Without a copy queue the COPY list still runs first on DIRECT (its
-        // copy-only commands are valid there); the DIRECT side still makes
-        // the textures readable.
-        let upload_is_copy = uploads.as_ref().is_some_and(|u| u.list().is_copy());
+        // Copy offload: the COPY-kind upload list runs on the copy engine,
+        // not prepended to the direct runs. Re-uploads of resident textures
+        // (which the copy engine cannot transition) run on a DIRECT upload
+        // list first, exactly as with the gate off. Otherwise (gate off) the
+        // one upload list runs first on DIRECT. Without a copy queue a COPY
+        // list still runs first on DIRECT (its copy-only commands are valid
+        // there); the DIRECT side still makes the textures readable.
+        let copy_upload: Option<&HostList> = uploads.as_ref().and_then(|u| u.copy_list());
+        let direct_upload: Option<&HostList> = uploads.as_ref().and_then(|u| u.direct_list());
         let use_copy_queue =
-            upload_is_copy && self.copy_queue.is_some() && self.copy_fence.is_some();
-        let runs: Vec<&HostList> = if use_copy_queue {
+            copy_upload.is_some() && self.copy_queue.is_some() && self.copy_fence.is_some();
+        let mut mains: Vec<&HostList> = if use_copy_queue {
             runs.to_vec()
         } else {
-            uploads
-                .as_ref()
-                .map(|u| u.list())
-                .into_iter()
-                .chain(runs.iter().copied())
-                .collect()
+            copy_upload.into_iter().chain(runs.iter().copied()).collect()
         };
-        let runs = &runs[..];
+        // The DIRECT side makes the COPY-uploaded textures readable after
+        // the Wait below: every texture the COPY list leaves in COPY_DEST
+        // starts the first DIRECT run in SHADER_RESOURCE, so its prelude
+        // records COPY_DEST to SHADER_RESOURCE. Never on an upload list
+        // itself (COPY lists allow only copy states).
+        if copy_upload.is_some() {
+            let is_upload = |l: &HostList| {
+                copy_upload.is_some_and(|u| std::ptr::eq(u, l))
+                    || direct_upload.is_some_and(|u| std::ptr::eq(u, l))
+            };
+            if let Some(first) = mains.iter().copied().find(|&l| !is_upload(l)) {
+                let uploaded: Vec<std::sync::Arc<crate::resource::HostTexture>> = copy_upload
+                    .into_iter()
+                    .chain(direct_upload)
+                    .flat_map(|up| {
+                        up.states
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .values()
+                            .map(|(_, _, copy)| copy.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                for copy in &uploaded {
+                    first.ensure_shader_resource(copy);
+                }
+                #[cfg(feature = "diagnostics")]
+                COPY_UPLOADED.fetch_add(uploaded.len() as u64, Ordering::Relaxed);
+            }
+        }
+        // A DIRECT upload list (re-uploads under the gate) runs first, in
+        // queue order before the title's runs.
+        if let Some(direct) = direct_upload {
+            mains.insert(0, direct);
+        }
+        let runs = &mains[..];
         // The copy upload list, if any (COPY kind): submitted on the copy
         // queue below, before the direct runs.
         let upload_list: Option<&HostList> = if use_copy_queue {
-            uploads.as_ref().map(|u| u.list())
+            copy_upload
         } else {
             None
         };
@@ -2161,24 +2256,6 @@ impl Host {
             {
                 COPY_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
                 COPY_SIGNALLED.store(copy_value, Ordering::Relaxed);
-            }
-            // The DIRECT side makes the uploaded textures readable after the
-            // Wait below: every texture the COPY list leaves in COPY_DEST
-            // starts the first DIRECT run in SHADER_RESOURCE, so its prelude
-            // records COPY_DEST to SHADER_RESOURCE.
-            if let Some(&first) = runs.first() {
-                let uploaded: Vec<std::sync::Arc<crate::resource::HostTexture>> = up
-                    .states
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .values()
-                    .map(|(_, _, copy)| copy.clone())
-                    .collect();
-                for copy in &uploaded {
-                    first.ensure_shader_resource(copy);
-                }
-                #[cfg(feature = "diagnostics")]
-                COPY_UPLOADED.fetch_add(uploaded.len() as u64, Ordering::Relaxed);
             }
         }
         let mut repeats = Vec::new();
@@ -3327,18 +3404,12 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(ID3D12Resource, u32)> {
-        // COPY lists move only to copy states: never to shader, unordered or
-        // render-target reads (those run on DIRECT, after the copy Wait).
-        if self.is_copy() {
-            const COPY_STATES: u32 = 0x400 | 0x800 | 0x1;
-            debug_assert!(
-                wanted & !(COPY_STATES | 0x40 | 0x80) == 0 || wanted & COPY_STATES != 0,
-                "COPY list transition to {wanted:#x}: copy states only"
-            );
-            let sr_uav_rt = 0x4 | 0x8 | 0x40 | 0x80 | 0x10 | 0x20;
-            if wanted & sr_uav_rt != 0 && wanted & COPY_STATES == 0 {
-                crate::host::fail(format_args!("a COPY list transition to {wanted:#x}: copy states only"));
-            }
+        // COPY lists move only between copy states: never to shader,
+        // unordered-access, render-target or depth reads (those run on
+        // DIRECT, after the copy Wait). Anything else is rejected here,
+        // before a COPY-kind prelude could record it.
+        if self.is_copy() && !copy_uploadable(wanted) {
+            crate::host::fail(format_args!("a COPY list transition to {wanted:#x}: copy states only"));
         }
         // One host texture for the whole move (`crate::resource::evict` may
         // give it up meanwhile; this list then holds it).
@@ -3381,17 +3452,10 @@ impl HostList {
         copy: &std::sync::Arc<crate::resource::HostTexture>,
         wanted: u32,
     ) -> Option<D3D12_RESOURCE_BARRIER> {
-        if self.is_copy() {
+        if self.is_copy() && !copy_uploadable(wanted) {
             // The copy engine leaves uploads in COPY_DEST for the DIRECT side
             // to make readable: COPY lists move only between copy states.
-            const COPY_OK: u32 = 0x400 | 0x800 | 0x1;
-            if wanted & !COPY_OK != 0 {
-                debug_assert!(
-                    false,
-                    "COPY list move_texture to {wanted:#x}: copy states only"
-                );
-                crate::host::fail(format_args!("a COPY list move_texture to {wanted:#x}: copy states only"));
-            }
+            crate::host::fail(format_args!("a COPY list move_texture to {wanted:#x}: copy states only"));
         }
         let wanted = legal_state(&copy.texture, wanted);
         let before = self.track(copy, wanted)?;
@@ -3583,7 +3647,11 @@ impl HostList {
                 .values()
                 .filter_map(|(first, _, copy)| {
                     let real = copy.state.load(Ordering::Relaxed);
-                    (real != *first).then(|| {
+                    // A COPY-kind prelude never records a SHADER_RESOURCE-side
+                    // transition (a texture the DIRECT side left readable
+                    // uploads on a DIRECT list instead): the COPY side keeps
+                    // its COPY_DEST side only.
+                    (real != *first && (!self.is_copy() || copy_prelude_keep(real, *first))).then(|| {
                         transition(
                             &copy.texture,
                             D3D12_RESOURCE_STATES(real as i32),
@@ -5758,6 +5826,25 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .iter()
         .filter(|&&(flag, deny, _)| (flags & flag != 0) == deny)
         .fold(state, |s, &(_, _, bits)| s & !bits)
+}
+
+/// Whether a texture in `state` may be uploaded on the copy engine: only
+/// between copy states. A texture the DIRECT side left readable
+/// (SHADER_RESOURCE) cannot transition there (COPY lists record only
+/// copy-state barriers): it is uploaded on a DIRECT list instead. Covers
+/// the resting COMMON (0) as well as the codebase's 0x1.
+pub(crate) fn copy_uploadable(state: u32) -> bool {
+    const COPY: u32 = 0x400 | 0x800 | 0x1;
+    state & !COPY == 0
+}
+
+/// Whether a COPY-kind prelude may record a `real` to `first` transition:
+/// only between copy states. A texture the DIRECT side left readable never
+/// transitions on the copy engine; the COPY side keeps its COPY_DEST side
+/// only, and no SHADER_RESOURCE-side (PIXEL or NON_PIXEL) transition is
+/// ever recorded into a COPY list.
+pub(crate) fn copy_prelude_keep(real: u32, first: u32) -> bool {
+    copy_uploadable(real) && copy_uploadable(first)
 }
 
 impl Host {
