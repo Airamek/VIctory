@@ -460,13 +460,21 @@ pub(crate) fn upload_copy(
 }
 
 /// Records into `list` the copy of `buffer` (laid out as `staging` says)
-/// into host texture `copy`. Returns the barrier that leaves it readable by
-/// shaders, for the caller to record with the others after every copy: one
-/// barrier per texture between the copies kept the GPU from overlapping
-/// them (new shots copy hundreds of textures, run evict6). On a COPY list
-/// (`VICTORY_COPY_QUEUE`) the texture is left in COPY_DEST for the DIRECT
+/// into host texture `copy`, tracking the state the copy leaves it in.
+/// Returns the barrier that leaves it readable by shaders, for the caller
+/// to record with the others after every copy: one barrier per texture
+/// between the copies kept the GPU from overlapping them (new shots copy
+/// hundreds of textures, run evict6). On a COPY list
+/// (`VICTORY_COPY_QUEUE`) the texture is left in COMMON for the DIRECT
 /// side to make readable (no SHADER_RESOURCE barrier on the copy engine),
 /// so nothing is returned.
+/// The COPY list never transitions to COPY_DEST: first uploads promote
+/// implicitly from COMMON (no barrier at all), and re-uploads barrier to
+/// COMMON in the COPY prelude (a single leg). A COPY_DEST transition on the
+/// copy engine is rejected by the retail driver (diag24/25: a COPY batch
+/// copying a subresource the prelude left in LEGACY_COPY_DEST dies at
+/// Execute expecting COMMON, then device removal) while the DIRECT side
+/// accepts any entry state after the copy Wait.
 #[must_use]
 pub(crate) fn record_upload(
     list: &HostList,
@@ -474,9 +482,14 @@ pub(crate) fn record_upload(
     staging: &Staging,
     (buffer, at, subresources): &Upload,
 ) -> Option<D3D12_RESOURCE_BARRIER> {
+    const COMMON: u32 = 0;
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-    if let Some(b) = list.move_texture(copy, COPY_DEST) {
+    // The copy engine leaves uploads in COMMON (tracked as the first use,
+    // so the COPY prelude names exactly that); DIRECT lists track COPY_DEST
+    // exactly as before.
+    let wanted = if list.is_copy() { COMMON } else { COPY_DEST };
+    if let Some(b) = list.move_texture(copy, wanted) {
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };
     }
@@ -485,9 +498,9 @@ pub(crate) fn record_upload(
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
     if list.is_copy() {
-        // COPY leaves textures in COPY_DEST; the DIRECT prelude (or the
-        // first DIRECT `move_texture(SHADER_RESOURCE)`) records the
-        // COPY_DEST to SHADER_RESOURCE barrier after the copy Wait.
+        // The DIRECT prelude (or the first DIRECT
+        // `move_texture(SHADER_RESOURCE)`) records the COMMON to
+        // SHADER_RESOURCE barrier after the copy Wait.
         return None;
     }
     list.move_texture(copy, SHADER_RESOURCE)
