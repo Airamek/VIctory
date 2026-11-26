@@ -353,7 +353,7 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
     let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
     if let Some(to_depth) = list.twin_use(depth, side, writes)
-        && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
+        && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w), list)
     {
         list.need_rebind();
     }
@@ -435,8 +435,17 @@ impl Twin {
     /// the twin into `depth` (`to_depth`) or back. `mv` moves textures to
     /// the copy states (tracked by the list, or from their real states in
     /// a prelude). True if it ran our conversion, which replaces the
-    /// list's compute root signature and pipeline.
-    pub(crate) fn copy(&self, l: &ID3D12GraphicsCommandList, depth: &Arc<HostTexture>, to_depth: bool, mv: &mut Mover) -> bool {
+    /// list's compute root signature and pipeline. DIRECT lists only (the
+    /// conversion dispatches compute): `host` guards the entry.
+    pub(crate) fn copy(
+        &self,
+        l: &ID3D12GraphicsCommandList,
+        depth: &Arc<HostTexture>,
+        to_depth: bool,
+        mv: &mut Mover,
+        host: &HostList,
+    ) -> bool {
+        host.assert_direct("Twin::copy");
         let (src, dst) = if to_depth { (COPY_SOURCE, COPY_DEST) } else { (COPY_DEST, COPY_SOURCE) };
         let mut barriers: Vec<_> = self.planes.iter().filter_map(|p| mv(p, src)).collect();
         barriers.extend(mv(depth, dst));
@@ -763,7 +772,7 @@ mod tests {
         // SAFETY: an open list and live textures; the copies below move
         // only subresources between their named states.
         unsafe { list.list.ResourceBarrier(&barriers) };
-        assert!(!twin.copy(&list.list, &depth, false, &mut |_, _| None), "no conversion");
+        assert!(!twin.copy(&list.list, &depth, false, &mut |_, _| None, &list), "no conversion");
 
         // Read the twin plane back.
         let plane = &twin.planes[0];
