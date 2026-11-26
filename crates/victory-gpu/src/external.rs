@@ -287,7 +287,7 @@ mod tests {
         unsafe { (pool as *mut u32).write_volatile(0xff33_2211) };
 
         let (allocator, list) = new_title_list();
-        let hl = crate::list::host_list(list).unwrap();
+        let hl = crate::list::segments(list).pop().unwrap();
         let (host_tex, state) = host_texture(list, tex, SHADER_RESOURCE).unwrap();
         assert_eq!(state, SHADER_RESOURCE);
 
@@ -324,7 +324,7 @@ mod tests {
             })
             .unwrap();
             close_list(list);
-            host.execute(&[hl]);
+            host.execute(&[&hl]);
             // Submissions run async: finish the GPU work before reading it back.
             host.drain();
             assert_eq!(host.log_messages(), None);
@@ -382,7 +382,7 @@ mod tests {
         }
 
         let (allocator, list) = new_title_list();
-        let hl = crate::list::host_list(list).unwrap();
+        let hl = crate::list::segments(list).pop().unwrap();
         let (w_tex, s) = host_texture(list, writer, COPY_DEST).unwrap();
         assert_eq!(s, COPY_DEST);
         let (up_loc, w_sub) = copy_locations(&upload, wfp, &w_tex);
@@ -426,7 +426,7 @@ mod tests {
         })
         .unwrap();
         close_list(list);
-        host.execute(&[hl]);
+        host.execute(&[&hl]);
         // Submissions run async: finish the GPU work before reading it back.
         host.drain();
         assert_eq!(host.log_messages(), None);
@@ -457,7 +457,7 @@ mod tests {
             .expect("single-plane depth twin");
 
         let (allocator, list) = new_title_list();
-        let hl = crate::list::host_list(list).unwrap();
+        let hl = crate::list::segments(list).pop().unwrap();
 
         // Clear depth to 0.25, then request `UNORDERED_ACCESS` externally:
         // `twin::route` copies `DEPTH -> TWIN` and returns `twin_plane` in 0x8.
@@ -510,7 +510,7 @@ mod tests {
         })
         .unwrap();
         close_list(list);
-        host.execute(&[hl]);
+        host.execute(&[&hl]);
         // Submissions run async: finish the GPU work before reading it back.
         host.drain();
         assert_eq!(host.log_messages(), None);
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(ds_state, SHADER_RESOURCE);
         assert_eq!(ds_sr.as_raw(), ds_copy.texture.as_raw());
         close_list(list);
-        host.execute(&[hl]);
+        host.execute(&[&hl]);
         // Submissions run async: finish the GPU work before reading it back.
         host.drain();
         assert_eq!(host.log_messages(), None);
@@ -591,7 +591,7 @@ mod tests {
         }
 
         let (allocator, list) = new_title_list();
-        let hl = crate::list::host_list(list).unwrap();
+        let hl = crate::list::segments(list).pop().unwrap();
         let (w_tex, _) = host_texture(list, writer, COPY_DEST).unwrap();
         let (up_loc, w_sub) = copy_locations(&upload, wfp, &w_tex);
         // SAFETY: open list; `w_tex` is in `COPY_DEST`.
@@ -601,7 +601,7 @@ mod tests {
         .unwrap();
 
         let before_aliases = crate::texture::ALIAS_COPIES.load(Relaxed);
-        let (got_sr, s) = host_texture_for(hl, placed, &placed_copy, SHADER_RESOURCE).unwrap();
+        let (got_sr, s) = host_texture_for(&hl, placed, &placed_copy, SHADER_RESOURCE).unwrap();
         assert_eq!(s, SHADER_RESOURCE);
         assert_eq!(got_sr.as_raw(), placed_copy.texture.as_raw());
         assert_eq!(crate::texture::ALIAS_COPIES.load(Relaxed), before_aliases + 1);
@@ -610,7 +610,7 @@ mod tests {
             "refresh used the held copy without re-populating placed's evicted slot"
         );
 
-        let (got_cp, s) = host_texture_for(hl, placed, &placed_copy, COPY_SOURCE).unwrap();
+        let (got_cp, s) = host_texture_for(&hl, placed, &placed_copy, COPY_SOURCE).unwrap();
         assert_eq!(s, COPY_SOURCE);
         assert_eq!(got_cp.as_raw(), placed_copy.texture.as_raw());
         let mut pfp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
@@ -636,11 +636,16 @@ mod tests {
         })
         .unwrap();
         close_list(list);
-        host.execute(&[hl]);
+        host.execute(&[&hl]);
         // Submissions run async: finish the GPU work before reading it back.
         host.drain();
         assert_eq!(readback_value::<[u32; 2]>(&readback), [0x07e0_07e0, 0xffff_ffff]);
         reset_list(list, allocator);
+        // The reset may have swapped the title list's shells (a held shell
+        // is left to its in-flight submission, never reset under it): resolve
+        // the current one again instead of recording into the stale shell
+        // (its first-use set would skip the upload below).
+        let hl = crate::list::segments(list).pop().unwrap();
 
         // 2. Upload path: capture `old_copy` of a read-only texture, evict its
         //    cached slot (`made_copy` becomes `None`), and verify `upload_copy`
@@ -655,14 +660,14 @@ mod tests {
 
         // SAFETY: `up_pool` holds four committed 4 KiB pages.
         unsafe { (up_pool as *mut u32).write_volatile(0xff77_6655) };
-        let (up_sr, s) = host_texture_for(hl, tex, &old_copy, SHADER_RESOURCE).unwrap();
+        let (up_sr, s) = host_texture_for(&hl, tex, &old_copy, SHADER_RESOURCE).unwrap();
         assert_eq!(s, SHADER_RESOURCE);
         assert_eq!(up_sr.as_raw(), old_copy.texture.as_raw());
         assert!(
             crate::resource::made_copy(tex).is_none(),
             "upload_copy used the held copy without re-populating tex's evicted slot"
         );
-        let (up_cp, s) = host_texture_for(hl, tex, &old_copy, COPY_SOURCE).unwrap();
+        let (up_cp, s) = host_texture_for(&hl, tex, &old_copy, COPY_SOURCE).unwrap();
         assert_eq!(s, COPY_SOURCE);
         assert_eq!(up_cp.as_raw(), old_copy.texture.as_raw());
 
@@ -689,7 +694,7 @@ mod tests {
         })
         .unwrap();
         close_list(list);
-        host.execute(&[hl]);
+        host.execute(&[&hl]);
         // Submissions run async: finish the GPU work before reading it back.
         host.drain();
         assert_eq!(readback_value::<u32>(&ureadback), 0xff77_6655);

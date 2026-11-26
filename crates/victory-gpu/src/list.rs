@@ -233,7 +233,7 @@ fn next_segment<'a>(this: This) -> Option<&'a crate::host::HostList> {
     let mut hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
     if hosts.len() <= k {
         let made = crate::host::host()?.new_list().ok()?;
-        hosts.push(std::sync::Arc::new(made));
+        hosts.push(made);
     }
     list.segment.store(k, std::sync::atomic::Ordering::Relaxed);
     let next: *const crate::host::HostList = std::sync::Arc::as_ptr(&hosts[k]);
@@ -258,10 +258,14 @@ fn restart(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(segment = k, "a list reset while a queue still holds part of it: that part keeps its own host list");
             let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
-            match spare.map(Ok).or_else(|| crate::host::host().map(|host| host.new_list())) {
-                Some(Ok(fresh)) => left = Some(std::mem::replace(h, std::sync::Arc::new(fresh))),
-                _ => continue,
-            }
+            // A fresh shell is already pinned (`new_list` returns an `Arc`);
+            // a spare one is wrapped on its way out of `SPARE`.
+            let Some(fresh) = spare.map(std::sync::Arc::new).or_else(|| {
+                crate::host::host().and_then(|host| host.new_list().ok())
+            }) else {
+                continue;
+            };
+            left = Some(std::mem::replace(h, fresh));
         } else if k <= used {
             h.reset();
         }
@@ -397,7 +401,7 @@ fn new_list(
         hosts: std::sync::Mutex::new(
             crate::host::host()
                 .and_then(|h| match h.new_list() {
-                    Ok(list) => Some(std::sync::Arc::new(list)),
+                    Ok(list) => Some(list),
                     Err(e) => {
                         tracing::warn!(error = %e, "no host command list");
                         None

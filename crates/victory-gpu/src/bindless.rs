@@ -342,7 +342,7 @@ fn record_uploads(
 }
 
 /// The upload list, used under its lock only.
-pub(crate) struct Holder(Option<HostList>);
+pub(crate) struct Holder(Option<Arc<HostList>>);
 // SAFETY: D3D12 objects are free-threaded; the list is used by one
 // submission at a time, under the lock.
 unsafe impl Send for Holder {}
@@ -359,12 +359,12 @@ pub(crate) struct Uploads {
 
 impl Uploads {
     /// The COPY-kind upload list, if any.
-    pub(crate) fn copy_list(&self) -> Option<&HostList> {
+    pub(crate) fn copy_list(&self) -> Option<&Arc<HostList>> {
         self.copy.as_ref().and_then(|h| h.0.as_ref())
     }
 
     /// The DIRECT upload list, if any.
-    pub(crate) fn direct_list(&self) -> Option<&HostList> {
+    pub(crate) fn direct_list(&self) -> Option<&Arc<HostList>> {
         self.direct.as_ref().and_then(|h| h.0.as_ref())
     }
 }

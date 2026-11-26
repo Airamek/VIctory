@@ -3230,7 +3230,7 @@ uint ps() : SV_Target { return 1; }
         );
         let p = crate::pipeline::host::HostPipeline::new(&[shader], None).expect("a host pipeline");
         // Closed, as recorded lists are before the frame resets them.
-        let lists: Vec<HostList> = (0..LISTS)
+        let lists: Vec<std::sync::Arc<HostList>> = (0..LISTS)
             .map(|_| {
                 let list = host.new_list().unwrap();
                 list.close();
@@ -3265,7 +3265,7 @@ uint ps() : SV_Target { return 1; }
                 list.close();
             }
             let started = std::time::Instant::now();
-            let runs: Vec<&HostList> = lists.iter().collect();
+            let runs: Vec<&std::sync::Arc<HostList>> = lists.iter().collect();
             host.execute(&runs);
             (bind, started.elapsed())
         };
@@ -3551,6 +3551,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let write = |byte: u8| unsafe { std::ptr::write_bytes(address as *mut u8, byte, 64 * 64 * 4) };
         write(0x40);
         host.execute(&[&reading()]);
+        // Submissions run async: the temporary list's drop no longer
+        // settles (an `Arc` drop only releases), so drain explicitly
+        // before reading the output back (as the sibling tests do).
+        host.drain();
         assert!((texel() - 64.0 / 255.0).abs() < 1e-6, "uploaded: {}", texel());
         // The title writes the memory again and a list reading the texture
         // is recorded: its upload is due.

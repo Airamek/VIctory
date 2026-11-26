@@ -161,6 +161,7 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
         S_OK
     );
     let commands = crate::list::host_list(list).unwrap();
+    let submit_list = crate::list::segments(list).pop().unwrap();
     let l = &commands.list;
     let newer = crate::list::has_newer_table(list);
     let bounds = slot::<extern "system" fn(This, f32, f32)>(list, if newer { 0x230 } else { 0x220 });
@@ -224,7 +225,7 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     };
     let submit = || {
         assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
-        host.execute(&[commands]);
+        host.execute(&[&submit_list]);
     };
     // SAFETY: the list is open; the depth buffer is in DEPTH_WRITE.
     unsafe { l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None) };
