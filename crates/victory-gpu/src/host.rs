@@ -4273,7 +4273,7 @@ impl HostList {
                         usize,
                         Option<u32>,
                     )> = Vec::new();
-                    crate::memory::prepare(
+                    let repeat = crate::memory::prepare(
                         heap,
                         &mut batch.tables_prepared,
                         || {
@@ -4285,6 +4285,12 @@ impl HostList {
                             adds.push((s.clone(), a, l, bit));
                         },
                     );
+                    // A repeat skips the walk (nothing new to queue), but its
+                    // ranges still settle: a title write between the two
+                    // prepares re-samples here.
+                    for (s, a, l) in &repeat {
+                        batch.settle_refresh(s, *a, *l);
+                    }
                     for (s, a, l, bit) in &adds {
                         batch.settle_refresh(s, *a, *l);
                         batch.add_cached(s, *a, *l, *bit);
@@ -4505,12 +4511,14 @@ struct Batch<'a> {
     /// asked once per heap per submission).
     table_settles: crate::fx::Map<usize, Option<u64>>,
     /// Page-table preparations done this submission, by view heap key:
-    /// the heap identity and copies' generation they saw. A repeat for
-    /// the same pair finds the same shared table (only this thread
-    /// rewrites tables while the submission prepares, and any replacement
-    /// or copy-set change misses the generation check), so its walk
-    /// would queue nothing new and settle nothing: skipped.
-    tables_prepared: crate::fx::Map<usize, (usize, u64)>,
+    /// the heap identity, the copies' generation they saw, and the dirty
+    /// ranges the walk queued. A repeat for the same triple finds the same
+    /// shared table (only this thread rewrites tables while the submission
+    /// prepares, and any replacement or copy-set change misses the
+    /// generation check), so its walk would queue nothing new: skipped, and
+    /// the stored ranges are re-settled instead (their settle samples title
+    /// writes racing the submission).
+    tables_prepared: crate::fx::Map<usize, crate::memory::PreparedTable>,
 }
 
 /// Whether conflict answer `v` (the newest in-flight submission touching
