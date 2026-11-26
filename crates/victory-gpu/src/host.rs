@@ -90,6 +90,12 @@ pub(crate) struct Host {
     /// submission first, so the engine's reusable lists and differs
     /// buffers are never reset or overwritten while in flight).
     card_serial: Mutex<Option<u64>>,
+    /// Finished submissions' shells, stashed by `complete` for `finish` to
+    /// recycle: `complete` runs under the timeline's `finishing` lock, and
+    /// recycling takes each list's locks, which the submitting thread may
+    /// hold across `settle` (see `run_deferred`) — so the reclaim waits
+    /// until `finish_both` has released `finishing`.
+    to_recycle: Mutex<Vec<std::sync::Arc<HostList>>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -471,6 +477,7 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(Presentation::default()),
             card: OnceLock::new(),
             card_serial: Mutex::new(None),
+            to_recycle: Mutex::new(Vec::new()),
         })
     }
 }
@@ -2910,6 +2917,20 @@ impl Host {
         let reached = self.completed();
         let copy_reached = self.copy_completed();
         self.timeline.finish_both(reached, copy_reached, |p| self.complete(p));
+        // Reclaim the finished submissions' shells now that `finishing` is
+        // released (see `to_recycle`): replaced shells (the title moved on,
+        // sole-owned) reset into `SPARE`; shells the title still holds are
+        // skipped by `try_unwrap` and stay with it.
+        let stashed = std::mem::take(
+            &mut *self
+                .to_recycle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        // Reclaim the finished shells: replaced shells (the title moved on,
+        // sole-owned) reset into `SPARE`; shells the title still holds are
+        // skipped by `try_unwrap` and stay with it.
+        stashed.into_iter().for_each(crate::list::recycle);
     }
 
     /// The newest submission value the GPU has run (no waiting).
@@ -3155,7 +3176,7 @@ impl Host {
     /// Once the GPU has run a submission: what its shaders wrote goes back
     /// into title memory, then its bottom-of-pipe writes, which tell the
     /// title the GPU is done.
-    fn complete(&self, p: Pending) {
+    fn complete(&self, mut p: Pending) {
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             // Any submission in flight may have faulted. The `Arc`s keep
@@ -3363,6 +3384,14 @@ impl Host {
         // It has run, and every submission before it: what was retired
         // before it was submitted goes.
         drop(p.retired);
+        // Its shells are reclaimed by `finish` once `finishing` is released
+        // (see `to_recycle`): recycling here would take each list's locks
+        // under the timeline lock the submitting thread may wait on while
+        // holding one of them (`run_deferred` settles under `deferred`).
+        self.to_recycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(p.lists.drain(..));
         self.log_messages();
 
     }
@@ -9656,6 +9685,45 @@ mod submissions {
         assert!(!list.running());
         assert_eq!(Arc::strong_count(&list), 1, "finished: let go");
         assert_eq!(Arc::as_ptr(&list), addr, "the shell never moved");
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Finished submissions refill the shell pool through the production
+    /// path: `execute`, the title drops its side (as `restart` does when a
+    /// queue still holds part of a list), `drain` completes (stash under
+    /// `finishing`) and `finish` recycles past it into `SPARE`. Before the
+    /// fix the queue-side `recycle` ran while `Pending` still pinned the
+    /// shells, so the pool never refilled. Needs a host GPU; passes by
+    /// without one.
+    #[test]
+    fn finished_submissions_refill_the_shell_pool() {
+        let Some(host) = super::host() else { return }; // no host GPU here
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        host.drain();
+        // Room whatever other tests left: the pool is an optimization, so
+        // clearing it changes no behavior.
+        crate::list::clear_spares();
+        crate::list::take_recycled();
+        let list = host.new_list().unwrap();
+        list.close();
+        // Gated so the completion cannot win the race below: the shell is
+        // dropped while in flight, then the gate opens and `drain` finishes
+        // it, so the stash holds the only `Arc` at recycle time.
+        let gate = Gate::new(host);
+        host.execute_gated(&[&list], &gate.0);
+        assert!(list.running(), "the gate holds the submission in flight");
+        // The title moved on (as `restart` does): `Pending` holds the only
+        // other `Arc` until the submission finishes.
+        drop(list);
+        gate.release();
+        host.drain();
+        // At least our shell (concurrent tests pool through the same path,
+        // so only the floor is asserted).
+        assert!(
+            crate::list::take_recycled() >= 1,
+            "a finished shell pooled through complete/finish"
+        );
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

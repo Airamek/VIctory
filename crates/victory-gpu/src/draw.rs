@@ -3567,6 +3567,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         copying.close();
         host.execute(&[&copying]);
         host.execute(&[&late]);
+        // Submissions run async: finish the GPU work before reading it back
+        // (without this the assert below passes on stale data either way).
+        host.drain();
         assert!(
             (texel() - 64.0 / 255.0).abs() < 1e-6,
             "the host's texels kept, not title memory uploaded over them: {}",

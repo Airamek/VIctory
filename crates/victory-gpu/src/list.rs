@@ -289,8 +289,28 @@ pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.len() < KEPT {
             spare.push(list);
+            RECYCLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
+}
+
+/// Shells returned to `SPARE` by [`recycle`] since the last call
+/// (production reclaim proof: completions refill the pool through
+/// `Host::finish`, which drains the stashed shells past `finishing`).
+#[cfg(windows)]
+static RECYCLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Shells pooled since the last call.
+#[cfg(all(test, windows))]
+pub(crate) fn take_recycled() -> u64 {
+    RECYCLED.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tests only: empties the shell pool (an optimization; behavior-neutral),
+/// so a test can prove its own submission refilled it.
+#[cfg(all(test, windows))]
+pub(crate) fn clear_spares() {
+    SPARE.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// What a title list owned that the host list a queue still holds, if any,
