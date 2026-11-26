@@ -275,8 +275,10 @@ pub(crate) fn uploads(
     // SHADER_RESOURCE real state) cannot transition on the copy engine
     // (COPY lists record only copy-state barriers), so it is uploaded on a
     // DIRECT list instead, exactly as with the gate off. First uploads
-    // (COMMON) and textures the copy engine left (COPY_DEST/SOURCE) go on
-    // the COPY list. With the gate off everything goes on the DIRECT list.
+    // (COMMON) and textures a DIRECT-side copy left (COPY_DEST/SOURCE) go on
+    // the COPY list, which itself leaves every upload in COMMON (first
+    // uploads promote implicitly, re-uploads barrier to COMMON in the COPY
+    // prelude). With the gate off everything goes on the DIRECT list.
     let (mut copy_work, mut direct_work) = (Vec::new(), Vec::new());
     for (staging, copy, upload) in changed {
         if use_copy && crate::host::copy_uploadable(copy.state.load(Relaxed)) {
