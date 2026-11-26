@@ -1446,9 +1446,17 @@ pub(crate) struct HostList {
 
 impl Drop for HostList {
     /// Its allocators and upload memory may not go while the GPU runs it,
-    /// and a submission in flight still names it.
+    /// and a submission in flight still names it: wait that out, without
+    /// finishing. The last pin drops at the end of the completion that
+    /// finishes the submission, under the submission lock; finishing there
+    /// would deadlock on it.
     fn drop(&mut self) {
-        self.settle();
+        let last = self.last.load(Ordering::Acquire);
+        if last != 0
+            && let Some(host) = made()
+        {
+            host.wait_value(last);
+        }
     }
 }
 
@@ -2922,6 +2930,39 @@ impl Host {
         };
         // SAFETY: a plain query.
         unsafe { fence.GetCompletedValue() }
+    }
+
+    /// Waits until the GPU has run the submission that signalled `value`
+    /// (both queues where the submission has copy work), without finishing
+    /// anything.
+    pub(crate) fn wait_value(&self, value: u64) {
+        // As `settle` below, but without finishing anything: a list's drop
+        // waits this out for its own submission, and that drop runs at the
+        // end of the completion that finishes it (the submission's last
+        // pin); finishing there would deadlock on the submission lock the
+        // completion holds, so the drop must never finish.
+        if self
+            .timeline
+            .span()
+            .is_some_and(|(oldest, _)| oldest <= value)
+        {
+            self.wait_gpu(value, true);
+            if copy_enabled() {
+                // The submission may carry copy work: waiting needs the copy
+                // fence past it too (with no copy work in flight the wait
+                // returns at once).
+                let copy_value = *self.copy_submitted.lock().unwrap_or_else(|e| e.into_inner());
+                if copy_value != 0 {
+                    #[cfg(feature = "diagnostics")]
+                    let block = std::time::Instant::now();
+                    self.wait_copy(copy_value, true);
+                    #[cfg(feature = "diagnostics")]
+                    if timing() {
+                        starve::note_block(starve::COPY_WAIT, block.elapsed().as_micros() as u64);
+                    }
+                }
+            }
+        }
     }
 
     /// Finishes every submission up to the one that signals `value`,
