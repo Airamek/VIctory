@@ -287,7 +287,7 @@ mod tests {
         unsafe { (pool as *mut u32).write_volatile(0xff33_2211) };
 
         let (allocator, list) = new_title_list();
-        let hl = crate::list::segments(list).pop().unwrap();
+        let mut hl = crate::list::segments(list).pop().unwrap();
         let (host_tex, state) = host_texture(list, tex, SHADER_RESOURCE).unwrap();
         assert_eq!(state, SHADER_RESOURCE);
 
@@ -330,6 +330,9 @@ mod tests {
             assert_eq!(host.log_messages(), None);
             assert_eq!(readback_value::<u32>(&readback), want, "uploaded texel");
             reset_list(list, allocator);
+            // The reset may have swapped the title list's shells: resolve
+            // the current one again instead of recording into a stale shell.
+            hl = crate::list::segments(list).pop().unwrap();
         }
         assert!(crate::texture::uploads(tex) >= 2);
 
@@ -457,7 +460,7 @@ mod tests {
             .expect("single-plane depth twin");
 
         let (allocator, list) = new_title_list();
-        let hl = crate::list::segments(list).pop().unwrap();
+        let mut hl = crate::list::segments(list).pop().unwrap();
 
         // Clear depth to 0.25, then request `UNORDERED_ACCESS` externally:
         // `twin::route` copies `DEPTH -> TWIN` and returns `twin_plane` in 0x8.
@@ -524,6 +527,10 @@ mod tests {
         let _ = crate::twin::uav(ds, &ds_copy, Some(&uav_desc), host.cpu_view())
             .expect("two-plane depth+stencil twin");
         reset_list(list, allocator);
+        // The reset may have swapped the title list's shells: resolve the
+        // current one again instead of submitting a stale shell (its replay
+        // would pass without running the new record).
+        hl = crate::list::segments(list).pop().unwrap();
         assert!(host_texture(list, ds, UNORDERED_ACCESS).is_none());
         let (ds_sr, ds_state) = host_texture(list, ds, SHADER_RESOURCE).unwrap();
         assert_eq!(ds_state, SHADER_RESOURCE);
