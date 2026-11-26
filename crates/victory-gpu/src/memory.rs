@@ -554,6 +554,11 @@ fn layout(key: usize) -> Arc<Layout> {
         .unwrap_or_default()
 }
 
+/// One submission's record of a view heap's page-table preparation: the
+/// heap identity and copies' generation seen, and the dirty ranges the
+/// walk queued (re-settled, not re-queued, on a repeat prepare).
+pub(crate) type PreparedTable = (usize, u64, Vec<(Arc<Shadow>, usize, usize)>);
+
 /// At submission, for a list using title memory with view heap `key`
 /// bound: the heap's page table names every host copy there is, each
 /// brought up to date (`add` takes a copy's range and its change-tracker
@@ -563,34 +568,52 @@ fn layout(key: usize) -> Arc<Layout> {
 /// them); one that went out of date only since is rewritten next time.
 ///
 /// `seen` remembers the preparations done this submission, by view heap
-/// key: the heap identity and copies' generation they saw. A heap
-/// prepared already for the same pair finds the same shared table (only
-/// the submitting thread rewrites tables while the submission prepares,
-/// and a replaced heap or a changed copy set misses the check below), so
-/// its walk would queue nothing new and settle nothing: skipped.
+/// key: the heap identity, the copies' generation they saw, and the dirty
+/// ranges the walk queued. A heap prepared already for the same pair finds
+/// the same shared table (only the submitting thread rewrites tables while
+/// the submission prepares, and a replaced heap or a changed copy set
+/// misses the check below), so its walk would queue nothing new: skipped,
+/// and the walked ranges are returned instead. The caller still settles
+/// those: `stale` samples title writes racing the submission, so a write
+/// between the two prepares can newly need a wait for an in-flight
+/// same-copy shader writer above the settled watermark.
 pub(crate) fn prepare(
     key: usize,
-    seen: &mut crate::fx::Map<usize, (usize, u64)>,
+    seen: &mut crate::fx::Map<usize, PreparedTable>,
     settle: impl FnOnce(),
     mut add: impl FnMut(&Arc<Shadow>, usize, usize, Option<u32>),
-) {
+) -> Vec<(Arc<Shadow>, usize, usize)> {
     let now = crate::shadow::generation();
+    // A repeat at the same copies' generation, with the same table still
+    // there: the walk would queue nothing new (its adds were deduped by the
+    // hull/current maps, and a rewrite settled on the first prepare). The
+    // heap lookup itself stays: it is the identity check.
+    let hit: Option<Vec<(Arc<Shadow>, usize, usize)>> = with_heap(key, |heap| {
+        let host = std::ptr::from_ref(heap) as usize;
+        let same = shared()
+            .iter()
+            .find(|(k, s)| *k == key && s.host == host)
+            .is_some_and(|(_, s)| s.generation == now);
+        let seen_entry = seen.get(&key);
+        if same && seen_entry.is_some_and(|&(h, g, _)| h == host && g == now) {
+            return seen_entry.map(|(_, _, ranges)| ranges.clone());
+        }
+        None
+    })
+    .flatten();
+    if let Some(ranges) = hit {
+        return ranges;
+    }
     let Some((stale, host)) = with_heap(key, |heap| {
         let host = std::ptr::from_ref(heap) as usize;
         let generation = shared()
             .iter()
             .find(|(k, s)| *k == key && s.host == host)
             .map(|(_, s)| s.generation);
-        // The heap prepared already at this copies' generation, and the
-        // same table is still there: unchanged since, nothing to do. The
-        // heap lookup itself stays: it is the identity check.
-        if generation == Some(now) && seen.get(&key).is_some_and(|&(h, g)| h == host && g == now) {
-            return None;
-        }
         Some((generation.is_some_and(|g| g != now), host))
     })
     .flatten() else {
-        return;
+        return Vec::new();
     };
     if stale {
         settle();
@@ -606,11 +629,7 @@ pub(crate) fn prepare(
         Some(s.layout.clone())
     })
     .flatten();
-    // Remember the successful prepare (a missing heap stays uncached: it
-    // may appear next time).
-    if layout.is_some() {
-        seen.insert(key, (host, now));
-    }
+    let mut walked = Vec::new();
     // Copies the title has not written since they took it are passed by
     // without touching them (the table names every copy, ~4,700 in the world).
     // Each range's change-tracker bit goes with it, so the submission's
@@ -620,9 +639,16 @@ pub(crate) fn prepare(
             if !crate::watch::clean_bit(*bit) {
                 let (start, len) = c.range();
                 add(c, start as usize, len as usize, *bit);
+                walked.push((c.clone(), start as usize, len as usize));
             }
         }
     }
+    // Remember the successful prepare (a missing heap stays uncached: it
+    // may appear next time), with the walked ranges for repeats to settle.
+    if layout.is_some() {
+        seen.insert(key, (host, now, walked));
+    }
+    Vec::new()
 }
 
 /// Whether any marked page in `marks` fell outside a valid copy in `l`.
