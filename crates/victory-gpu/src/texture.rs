@@ -135,8 +135,10 @@ pub(crate) fn recycle() {
             }
             c.marks.pop_front();
         }
-        if c.marks.is_empty() {
-            // Nothing in flight reads the chunks: rewind (the submission
+        if c.marks.is_empty() && planes_outstanding() == 0 {
+            // Nothing in flight reads the chunks, and no recorded but
+            // unsubmitted list still holds a plane chunk (its offsets would
+            // be handed out again under it): rewind (the submission
             // being prepared carves afresh after this). Needs both queues
             // done (both completeds past every mark, checked above).
             (c.current, c.used) = (0, 0);
@@ -261,6 +263,54 @@ fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         crate::host::name(&buffer, || "texture staging chunk".into());
         c.all.push((buffer, data as usize));
     }
+}
+
+/// Movie-plane chunks carved but not yet released (their lists still hold
+/// them): [`recycle`] does not rewind while any is outstanding, so a
+/// recorded-but-unsubmitted list's chunk offsets are never handed out again
+/// under it.
+static PLANES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Movie-plane chunks still held by lists.
+pub(crate) fn planes_outstanding() -> u64 {
+    PLANES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A movie plane's own upload chunk: its buffer (kept until the list holding
+/// it is reset). Dropping it releases the chunk, letting [`recycle`] rewind
+/// again.
+pub(crate) struct PlaneChunk {
+    // Never read: a lifetime guard (the mapping stays valid past any chunk
+    // truncation while a list holds it) and the release accounting in
+    // `Drop`.
+    #[allow(dead_code)]
+    buffer: ID3D12Resource,
+}
+
+impl PlaneChunk {
+    pub(crate) fn new(buffer: ID3D12Resource) -> Self {
+        PlaneChunk { buffer }
+    }
+}
+
+// SAFETY: a D3D12 resource (free-threaded); only the chunk's own fill
+// writes its mapping, before the list's copy reads it.
+unsafe impl Send for PlaneChunk {}
+
+impl Drop for PlaneChunk {
+    fn drop(&mut self) {
+        PLANES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `size` bytes of per-list staging space for a movie plane (see
+/// [`staging_space`]): its buffer, the space's offset in it, and its mapping
+/// there. The space stays taken (past any [`recycle`] rewind) until the list
+/// drops the chunk.
+pub(crate) fn take_plane_chunk(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+    let carved = staging_space(size)?;
+    PLANES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(carved)
 }
 
 // SAFETY: the title memory is only read, under `last`'s lock.
@@ -454,9 +504,83 @@ pub(crate) fn upload_copy(
     let Some(staging) = staging_for(resource, copy) else {
         return;
     };
+    // A CPU-written movie plane bypasses the shared staging buffers and
+    // hashes for a chunk of its own: concurrent frames never share one.
+    if staging.movie_plane() {
+        upload_plane(list, copy, &staging);
+        return;
+    }
     // Each list recorded the copy before (run perf7: 149 textures uploaded
     // 3,195 times in a frame, 17 ms of GPU time), changed or not.
     list.defer_texture(staging, copy.clone());
+}
+
+/// A movie plane's upload: its own chunk of upload memory, filled from title
+/// memory when the list is submitted, instead of the shared staging buffers
+/// (which concurrent frames would share, or stall on, through the staging
+/// hashes). The copy is recorded now, through [`record_upload`] like every
+/// other upload (so the copy engine's legality findings inherit); the fill
+/// runs at submission, in record order before the copy.
+fn upload_plane(list: &HostList, copy: &Arc<crate::resource::HostTexture>, staging: &Arc<Staging>) {
+    if list.is_copy() {
+        // COPY lists take no per-list memory: the shared staging path,
+        // which the copy engine can record.
+        list.defer_texture(staging.clone(), copy.clone());
+        return;
+    }
+    let (start, end) = staging.range();
+    let (at, len) = (start, end.saturating_sub(start));
+    let footprint = staging.footprints[0].Footprint;
+    let pitch = footprint.RowPitch as usize;
+    let bytes = pitch.saturating_mul(staging.rows[0] as usize);
+    if bytes == 0 || len == 0 {
+        return;
+    }
+    let Some((buffer, base, data)) = take_plane_chunk(bytes as u64) else {
+        once!("no upload buffer for a CPU-written movie plane");
+        return;
+    };
+    let dst = data as usize;
+    let plane = staging.clone();
+    list.defer_plane(
+        PlaneChunk::new(buffer.clone()),
+        (at, len),
+        move || fill_plane(&plane.layout, at, len, dst, bytes, pitch),
+    );
+    let upload = (buffer, base, vec![0u32]);
+    if let Some(barrier) = record_upload(list, copy, staging, &upload) {
+        // SAFETY: an open list; the barrier names a live texture.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+}
+
+/// Fills a plane chunk (`dst`, `bytes` of `pitch`-pitched rows) from the
+/// title memory `[at, at + len)`: the one mapped read when the layout pitch
+/// matches, else a scratch copy detiled (zeros where it cannot be read).
+fn fill_plane(
+    layout: &victory_formats::texture::Layout,
+    at: usize,
+    len: usize,
+    dst: usize,
+    bytes: usize,
+    pitch: usize,
+) {
+    // SAFETY: the list owns this chunk until its GPU work is done (past any
+    // rewind: outstanding plane chunks hold the rewind off).
+    let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
+    let direct = layout.mips.first().is_some_and(|mip| {
+        mip.offset == 0 && mip.pitch as usize * layout.desc.element_bytes as usize == pitch
+    });
+    if direct && bytes <= len && crate::host::read_into(at as *const u8, out) {
+        return;
+    }
+    let mut scratch = Scratch::take(len);
+    let read = &mut scratch.0[..len];
+    crate::host::copy_mapped(read.as_mut_ptr(), at as *const u8, len, false);
+    if let Err(error) = layout.detile(read, 0, 0, out, pitch, bytes) {
+        out.fill(0);
+        once!("could not copy the linear plane into the list's upload buffer: {error:?}");
+    }
 }
 
 /// Records into `list` the copy of `buffer` (laid out as `staging` says)
@@ -832,6 +956,24 @@ impl Staging {
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
         self.tracked.as_ref().is_none_or(|t| !t.clean())
+    }
+
+    /// Whether the texture is a CPU-written movie plane: one R8 subresource
+    /// the decoder rewrites every frame (a linear Tex2d, one mip, one
+    /// sample, one footprint at offset 0). Such planes bypass the shared
+    /// staging buffers and hashes for per-list chunks ([`upload_plane`]).
+    fn movie_plane(&self) -> bool {
+        use victory_formats::texture::Dimension;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
+        let desc = &self.layout.desc;
+        desc.dimension == Dimension::Tex2d
+            && desc.swizzle.0 == 0
+            && desc.depth == 1
+            && desc.mips == 1
+            && desc.samples == 1
+            && self.footprints.len() == 1
+            && self.footprints[0].Offset == 0
+            && self.footprints[0].Footprint.Format == DXGI_FORMAT_R8_UNORM
     }
 
     /// A staging buffer with the texture memory detiled into it if it
@@ -1237,6 +1379,107 @@ mod tests {
     }
 
     #[test]
+    fn movie_plane_needs_a_single_r8_subresource() {
+        use victory_formats::texture::{Desc, Dimension, Swizzle};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_SUBRESOURCE_FOOTPRINT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+        };
+        fn good_desc() -> Desc {
+            Desc {
+                dimension: Dimension::Tex2d,
+                width: 64,
+                height: 64,
+                depth: 1,
+                mips: 1,
+                element_bytes: 1,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::LINEAR,
+            }
+        }
+        fn good_layout() -> victory_formats::texture::Layout {
+            let mut texture =
+                victory_formats::texture::Texture::new(&victory_formats::texture::TextureDesc {
+                    dimension: Dimension::Tex2d,
+                    width: 64,
+                    height: 64,
+                    depth_or_array: 1,
+                    mips: 1,
+                    format: 61,
+                    samples: 1,
+                    swizzle: Swizzle::LINEAR,
+                })
+                .expect("a test layout");
+            texture.planes.remove(0).layout
+        }
+        fn staging(desc: Desc, formats: &[(u64, DXGI_FORMAT)]) -> Staging {
+            let mut layout = good_layout();
+            layout.desc = desc;
+            let footprints = formats
+                .iter()
+                .map(|&(offset, format)| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: offset,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: format,
+                        Width: 64,
+                        Height: 64,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                })
+                .collect::<Vec<_>>();
+            Staging {
+                size: 1 << 20,
+                rows: vec![64; footprints.len()],
+                layout,
+                mips: desc.mips,
+                memory: std::ptr::null(),
+                tracked: None,
+                spans: Vec::new(),
+                last: Mutex::default(),
+                uploads: Default::default(),
+                copied: Default::default(),
+                footprints,
+            }
+        }
+        let r8 = [(0, DXGI_FORMAT_R8_UNORM)];
+        assert!(staging(good_desc(), &r8).movie_plane(), "an R8 plane");
+        let mut desc = good_desc();
+        desc.swizzle = Swizzle::SW_4KB_S;
+        assert!(!staging(desc, &r8).movie_plane(), "a swizzled texture");
+        let mut desc = good_desc();
+        desc.depth = 2;
+        assert!(!staging(desc, &r8).movie_plane(), "an array texture");
+        let mut desc = good_desc();
+        desc.mips = 2;
+        assert!(!staging(desc, &r8).movie_plane(), "a mipmapped texture");
+        let mut desc = good_desc();
+        desc.samples = 2;
+        assert!(!staging(desc, &r8).movie_plane(), "a multisampled texture");
+        let mut desc = good_desc();
+        desc.dimension = Dimension::Tex3d;
+        assert!(!staging(desc, &r8).movie_plane(), "a volume texture");
+        let rgba = [(0, DXGI_FORMAT_R8G8B8A8_UNORM)];
+        assert!(
+            !staging(good_desc(), &rgba).movie_plane(),
+            "an RGBA plane is not a movie plane"
+        );
+        let two = [(0, DXGI_FORMAT_R8_UNORM), (16384, DXGI_FORMAT_R8_UNORM)];
+        assert!(
+            !staging(good_desc(), &two).movie_plane(),
+            "two footprints are not a movie plane"
+        );
+        let off = [(512, DXGI_FORMAT_R8_UNORM)];
+        assert!(
+            !staging(good_desc(), &off).movie_plane(),
+            "a footprint past zero is not a movie plane"
+        );
+    }
+
+    #[test]
     fn committed_rejects_overflow_and_noaccess_pages() {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
@@ -1430,5 +1673,42 @@ mod tests {
         assert!(!committed_cached(&mut known, usize::MAX as *const u8, 16));
         // SAFETY: freeing the reservation above.
         unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+
+    /// A plane chunk carved for a list is not handed out again while the
+    /// submission covering it is in flight, or while the list holds it: it
+    /// retires with the list (both queues past its submission, through the
+    /// same dual-completed [`recycle`] as staging space). Needs a host GPU;
+    /// passes by without one.
+    #[test]
+    fn plane_chunks_are_not_reused_while_held_or_covered() {
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // A submission made now covers the carve below (every submission
+        // marks what was taken, whether or not it uploads).
+        let list = host.new_list().expect("a list");
+        list.close();
+        let held = take_plane_chunk(1 << 20).expect("a plane chunk");
+        let held_pos = (held.0.as_raw(), held.1);
+        host.execute(&[&list]);
+        // Still held (and covered while in flight): nothing rewinds, so the
+        // next carve advances past the held chunk. The hold alone pins this,
+        // whatever the fences have passed.
+        host.drain();
+        recycle();
+        let next = take_plane_chunk(1 << 20).expect("a second plane chunk");
+        assert!(
+            next.0.as_raw() != held_pos.0 || next.1 > held_pos.1,
+            "a covered or held chunk is never handed out again"
+        );
+        drop((held, next));
+        list.reset();
+        // Released and drained (both queues past every submission), the space
+        // is rewound and usable again: no leak, no use-after-reuse.
+        host.drain();
+        recycle();
+        let _again = take_plane_chunk(1 << 20).expect("a plane chunk after release");
     }
 }

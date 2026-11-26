@@ -3518,6 +3518,61 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(submit(Some(0x80)).0, 0, "the same bytes in a shared page: not uploaded");
     }
 
+    /// A CPU-written movie plane (one R8 subresource) uploads once per list,
+    /// not once per submission: each list fills its own chunk, so concurrent
+    /// frames never share one.
+    #[test]
+    fn a_movie_plane_is_uploaded_once_per_list() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        // Runtime memory the change journal follows; R8 64x64, linear: a
+        // movie plane.
+        let address = crate::watch::tests::pool(1) as u64;
+        let object = texture_at_address(address, &texture_words(64, 64, 61, 1, 0));
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[61, 4, 0x1688, 0, 0, 1]);
+        let view = View::Shader(object as usize, Some(desc));
+        slots.make(0, &view);
+        // SAFETY: the texture's memory (a 64 KiB page).
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64) };
+        // A plane upload is recorded (not just prepared) per list.
+        let before = crate::texture::uploads(object);
+        let lists = [host.new_list().unwrap(), host.new_list().unwrap()];
+        for list in &lists {
+            readable(list, &used(ResourceType::Srv), &view, false);
+            run(list, &slots, &read, 0, Some(&out), (8, 8));
+            list.close();
+        }
+        assert_eq!(
+            crate::texture::uploads(object) - before,
+            2,
+            "one upload per list, not one per submission"
+        );
+        host.execute(&[&lists[0], &lists[1]]);
+        host.drain();
+        // SAFETY: inside the mapped output.
+        let texel = unsafe { (data as *const [f32; 4]).read() };
+        assert!((texel[0] - 64.0 / 255.0).abs() < 1e-6, "the plane's bytes: {texel:?}");
+        // New bytes fill independently again (each list its own chunk).
+        // SAFETY: the texture's memory.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x80, 64 * 64) };
+        let before = crate::texture::uploads(object);
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Srv), &view, false);
+        run(&list, &slots, &read, 0, Some(&out), (8, 8));
+        list.close();
+        assert_eq!(crate::texture::uploads(object) - before, 1);
+        host.execute(&[&list]);
+        host.drain();
+        // SAFETY: inside the mapped output.
+        let texel = unsafe { (data as *const [f32; 4]).read() };
+        assert!((texel[0] - 128.0 / 255.0).abs() < 1e-6, "the new bytes: {texel:?}");
+    }
+
     /// A list recorded before another whose host copy writes a texture it
     /// reads, but run after it, reads the host's texels: whether its upload
     /// from title memory is still due is decided when its submission is

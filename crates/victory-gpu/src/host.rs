@@ -1750,6 +1750,12 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>),
+    /// Fills a CPU-written linear movie plane's per-list upload chunk from
+    /// title memory: the range it reads (a title write there waits it out),
+    /// and the fill. Runs at submission, in record order before the copy
+    /// reading the chunk. A list repeated in one submission refills the same
+    /// chunk (as the shared staging refresh runs once per submission).
+    Plane((usize, usize), Box<dyn Fn() + Send>),
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
     Heap(std::sync::Arc<crate::bindless::Viewed>),
@@ -1796,6 +1802,11 @@ struct Deferred {
     copies: Vec<Step>,
     /// The list's upload buffers: buffer, mapped pointer, bytes.
     uploads: Vec<(ID3D12Resource, usize, usize)>,
+    /// The list's movie-plane chunks (kept until the list is reset, past
+    /// any staging rewind): each retires with the list, like `uploads`.
+    /// Never read: dropping the list releases them.
+    #[allow(dead_code)]
+    plane_uploads: Vec<crate::texture::PlaneChunk>,
     /// The list's readback buffers: buffer, mapped pointer, bytes. Kept
     /// apart from `uploads`: READBACK-heap COPY_DEST buffers are never
     /// valid upload (copy-source) memory, so they must not reach the
@@ -1979,6 +1990,9 @@ impl Pending {
                     Step::Refresh(_, address, len) => touches.reads.push((*address, address + len)),
                     Step::Texture(staging, _) => {
                         touches.reads.push(staging.range());
+                    }
+                    Step::Plane((at, len), _) => {
+                        touches.reads.push((*at, at + len));
                     }
                     _ => {}
                 }
@@ -4980,6 +4994,21 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging, copy));
     }
 
+    /// Fills a movie plane's per-list upload chunk at submission: `read` is
+    /// the title range the fill reads (a later title write there waits it
+    /// out), `fill` the chunk fill, run in record order before the copy
+    /// reading the chunk. The `chunk` is kept until the list is reset.
+    pub(crate) fn defer_plane(
+        &self,
+        chunk: crate::texture::PlaneChunk,
+        read: (usize, usize),
+        fill: impl Fn() + Send + 'static,
+    ) {
+        let mut deferred = self.deferred();
+        deferred.plane_uploads.push(chunk);
+        deferred.copies.push(Step::Plane(read, Box::new(fill)));
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
@@ -5010,6 +5039,7 @@ impl HostList {
                     Step::Run(..) | Step::Host(..) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
                     Step::Texture(..) => C::StepTextureUs,
+                    Step::Plane(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
                     Step::Memory(_) => C::StepMemoryUs,
                 },
@@ -5169,6 +5199,17 @@ impl HostList {
                 }
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
+                Step::Plane((at, len), fill) => {
+                    // A title write to the range waits the fill out first
+                    // (as a read of title memory): it fills the chunk the
+                    // list's copy reads, before any copy does.
+                    batch.settle(*at, *len, false);
+                    let started = std::time::Instant::now();
+                    fill();
+                    PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PREPARING[3].fetch_add(*len as u64, Ordering::Relaxed);
+                    continue;
+                }
                 Step::Heap(viewed) => {
                     crate::bindless::refresh(viewed, |s, a, l, bit| {
                         batch.settle_refresh(s, a, l);
@@ -9903,6 +9944,55 @@ mod submissions {
         releaser.join().unwrap();
         // SAFETY: our word, copied while the second was submitted.
         assert_eq!(unsafe { std::ptr::read_volatile(&*copy) }, 0x1234_5678_9abc);
+        second.reset();
+        first.reset();
+    }
+
+    #[test]
+    fn a_plane_fill_reading_what_an_earlier_submission_writes_waits_for_it() {
+        let Some(host) = super::host() else { return };
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (first, second) = (host.new_list().unwrap(), host.new_list().unwrap());
+        let word = Box::new(0u64);
+        let at = (&raw const *word).cast_mut().cast::<u8>();
+        first.defer_write(at, Written::Value(0x1234_5678_9abc), 8);
+        first.close();
+        // A movie-plane fill of the word at submission: after the first's
+        // write, as the GPU would order them (a later title write to the
+        // range read-blocks the fill).
+        let out = Box::new(0u64);
+        let (src, dst) = (
+            (&raw const *word) as usize,
+            (&raw const *out) as usize,
+        );
+        let (buffer, _, _) = crate::texture::take_plane_chunk(64).expect("a plane chunk");
+        second.defer_plane(
+            crate::texture::PlaneChunk::new(buffer),
+            (src, 8),
+            move || {
+                // SAFETY: our word, read while the second is submitted.
+                let value = unsafe { std::ptr::read_volatile(src as *const u64) };
+                // SAFETY: our box, written by this fill alone.
+                unsafe { std::ptr::write_volatile(dst as *mut u64, value) };
+            },
+        );
+        second.close();
+        let gate = Gate::new(host);
+        host.execute_gated(&[&first], &gate.0);
+        // Signal the gate from another thread so `second` genuinely waits in
+        // `settle` without ever deadlocking parallel host tests.
+        let gate_fence = gate.0.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            // SAFETY: our private fence.
+            unsafe {
+                let _ = gate_fence.Signal(1);
+            }
+        });
+        host.execute(&[&second]);
+        releaser.join().unwrap();
+        host.drain();
+        assert_eq!(*out, 0x1234_5678_9abc, "the fill waited for the title write");
         second.reset();
         first.reset();
     }
