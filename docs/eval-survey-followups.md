@@ -88,14 +88,55 @@ Targeted suites green at each step (`indirect::` 7/7 incl. the new GPU-run
 test, `fence::` 3/3 incl. the new wake test, `shadow::` 19/19, `card::` 3/3;
 clippy and policy clean).
 
-One pre-existing load flake observed and chased, not caused by this branch:
-full-workspace runs intermittently fail exactly one timing-sensitive test —
-first `frame::tests::waits_end_on_ticks_and_count_frames` (`left: 0, right:
-1`), then on re-run `host::tests::read_marks_of_both_bitmaps_are_taken` while
-the frame test passed. Both pass in isolation; neither touches the clamp
-(frame waits), the fence wait (frame ticks predate it), or card paths. Confirmed pre-existing:
-the same full `victory-gpu` suite on the clean base tip (`D:\dev\VIctory` @
-`5be261f`, separate target dir) also fails under load — 2 failed
-(`read_marks_of_both_bitmaps_are_taken` again, plus
-`bytes_off_the_runtimes_memory_are_copied_at_each_use`), each passing in
-isolation. No action taken here; the branch's own targeted suites are green.
+## Gates — adjudication (no green full run; NOT pushed)
+
+Path taken: capped retries then adjudication, per lead follow-up. Gates were
+NOT weakened (no skips, no thread/job games; solo runs below are diagnostics
+only, not gate replacements).
+
+`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+and `cargo xtask policy` are CLEAN on the full stack. `cargo test --workspace
+--locked` never went green in 9 attempts (branch) — but neither does the clean
+base, and the failures rotate across the same set of timing/global-state
+tests, all green in isolation on both trees.
+
+Branch full-suite runs (victory-gpu lib; other crates always pass):
+R1 312+1f (frame-ticks), R2 312+1f (read-marks), R3 312+2f
+(frame-ticks+huge-slot), R4 312+2f (huge-slot+bytes-off-runtime),
+R5 313+1f (draw-format-readback), R6 313+1f (read-marks),
+R7 310+4f (frame-ticks+bytes-off-runtime+marked-pages+title-writes-busy),
+capped-1 313+1f (read-marks), capped-2 310+4f (read-marks+3 watch tests).
+
+Adjudication table (solo = alone in the test binary; in-suite = full parallel run):
+
+| test | branch solo | base solo | branch in-suite (9 runs) | base in-suite (2 runs) |
+|---|---|---|---|---|
+| frame::waits_end_on_ticks_and_count_frames | pass | pass | failed R1,R3,R7 | — |
+| host::read_marks_of_both_bitmaps_are_taken | pass | pass | failed R2,R6,capped-1,capped-2 | failed B1 (+B2 companion, log-truncated) |
+| pipeline::make::huge_compiles_wait_for_the_slot | pass | pass | failed R3,R4 | — |
+| shadow::bytes_off_the_runtimes_memory_are_copied_at_each_use | pass | pass | failed R4,R7 | failed B1 |
+| shadow::marked_pages_go_back_by_the_bytes_the_gpu_changed | pass | pass | failed R7 | — |
+| shadow::title_writes_under_a_busy_range_are_copied | pass | pass | failed R7 | — |
+| draw::a_texture_written_in_one_format_reads_in_another_through_a_placed_view | pass | pass | failed R5 | — |
+| watch::kernel_reads_into_guarded_blocks_after_opening | pass | pass | failed capped-2 | failed B2 |
+| watch::writes_mark_every_tracker_of_their_page | pass | pass | failed capped-2 | failed B2 |
+| watch::writes_through_another_mapping_mark_the_tracker | pass | pass | failed capped-2 | failed B2 |
+| watch::a_tracker_dropped_on_one_mapping_leaves_the_other_guarded | (not run solo) | (not run solo) | — | failed B2 |
+
+Base full runs: B1 311+2f (read-marks + bytes-off-runtime), B2 308+5f (4 watch
+tests + 1 further line truncated from the captured tail). So the clean base
+flakes at the same or worse rate with zero of this branch's diff applied.
+
+Why unrelated to this branch: every failing test asserts wall-clock timing
+(50 ms ticks, 100–150 ms sleep/wait windows, `elapsed < 10 ms`) or
+process-global registries (`take_reads`, snapshot/watch globals) shared with
+concurrently running sibling tests; none executes the indirect clamp shader
+(item 1), the fence null-event wait (item 2 — its test is thread-local and
+0.10 s), or card paths (item 3 — asserts are no-ops, the deleted loop was
+dead). The branch's own new/changed tests pass in every full run
+(`a_record_that_does_not_fit_takes_nothing`, `blocking_waits_end_on_signal`).
+
+Lead decision needed: push `eval/survey-followups` (4 local commits, fork-only
+remote verified, origin untouched) with the test gate red-for-flakes, retry
+the suite at a quiet hour, or quarantine the flaky tests (out of scope here).
+Branch left UNPUSHED pending that call.
