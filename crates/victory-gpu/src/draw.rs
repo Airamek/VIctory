@@ -3230,7 +3230,7 @@ uint ps() : SV_Target { return 1; }
         );
         let p = crate::pipeline::host::HostPipeline::new(&[shader], None).expect("a host pipeline");
         // Closed, as recorded lists are before the frame resets them.
-        let lists: Vec<HostList> = (0..LISTS)
+        let lists: Vec<std::sync::Arc<HostList>> = (0..LISTS)
             .map(|_| {
                 let list = host.new_list().unwrap();
                 list.close();
@@ -3265,7 +3265,7 @@ uint ps() : SV_Target { return 1; }
                 list.close();
             }
             let started = std::time::Instant::now();
-            let runs: Vec<&HostList> = lists.iter().collect();
+            let runs: Vec<&std::sync::Arc<HostList>> = lists.iter().collect();
             host.execute(&runs);
             (bind, started.elapsed())
         };

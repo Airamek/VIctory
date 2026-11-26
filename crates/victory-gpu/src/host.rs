@@ -1840,22 +1840,12 @@ struct Deferred {
 /// oldest first.
 const IN_FLIGHT: usize = 16;
 
-/// A list a submission in flight names.
-#[derive(Clone, Copy)]
-struct ListRef(*const HostList);
-
-// SAFETY: host lists are used from any thread (their state is behind
-// locks), and one is not dropped while a submission naming it is in flight
-// (`HostList::last`); a reset hands the memory such a submission uses to
-// the timeline instead of reusing it.
-unsafe impl Send for ListRef {}
-
-impl ListRef {
-    fn get<'a>(self) -> &'a HostList {
-        // SAFETY: as above, the list outlives the submission.
-        unsafe { &*self.0 }
-    }
-}
+// A submission in flight names its lists by `Arc`: the `Arc` pins the
+// allocation, so `list::recycle`'s `Arc::try_unwrap` fails while any
+// submission naming the list is in flight and the shell never moves into
+// `SPARE` (or frees) under a live `Pending`. A prior `ListRef` raw pointer
+// here dangled exactly then (a recycled shell handed to another title
+// list, the slow path dereferencing freed/moved memory).
 
 /// A range shaders write (host copy, address, bytes) and the runs (by
 /// index) that declared it.
@@ -1877,7 +1867,15 @@ type CardWrites = (
 
 /// What is left of a submission once the GPU has run it.
 struct Pending {
-    lists: Vec<ListRef>,
+    /// The lists it ran, pinned: the `Arc` keeps each shell alive and
+    /// unmoved while the submission is in flight (`list::recycle` cannot
+    /// take one).
+    lists: Vec<std::sync::Arc<HostList>>,
+    /// The pipelines each list bound, as of submission: the slow-submission
+    /// report reads this snapshot, never the live sets (a reset clears
+    /// those while the submission still runs, and SPARE reuse rebuilds
+    /// them).
+    pipelines: std::collections::BTreeSet<String>,
     /// The host fence value of its direct submission (0: none) and of its
     /// copy submission (0: none; uploads stayed on the direct queue).
     value: u64,
@@ -1925,7 +1923,7 @@ impl Pending {
     /// A submission's, after its steps ran, with the title memory its GPU
     /// work writes (copied back, written at the bottom of the pipe) and
     /// reads (host copies and textures brought up to date for it).
-    fn of(runs: &[&HostList]) -> (Pending, Touches) {
+    fn of(runs: &[&std::sync::Arc<HostList>]) -> (Pending, Touches) {
         let mut back: Vec<Back> = Vec::new();
         let mut card_writes: Vec<CardWrites> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> =
@@ -1985,8 +1983,23 @@ impl Pending {
             pending_writes.push(writes);
             pending_resolves.push(deferred.resolves.clone());
         }
+        // The slow-submission report's snapshot, taken at submission: one
+        // list's lock at a time (a submission may name a list twice). The
+        // live sets are cleared by a reset and rebuilt by SPARE reuse while
+        // the submission still runs; the completion reads only this.
+        let mut pipelines = std::collections::BTreeSet::new();
+        for list in runs {
+            pipelines.extend(
+                list.pipelines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned(),
+            );
+        }
         let pending = Pending {
-            lists: runs.iter().map(|&l| ListRef(l)).collect(),
+            lists: runs.iter().map(|&l| l.clone()).collect(),
+            pipelines,
             value: 0,
             copy_value: 0,
             back,
@@ -2144,16 +2157,16 @@ impl Host {
     }
 
     /// A new list, open for recording.
-    pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+    pub(crate) fn new_list(&self) -> windows::core::Result<std::sync::Arc<HostList>> {
         self.new_list_kind(ListKind::Direct)
     }
 
     /// A new copy-engine list, open for recording (`VICTORY_COPY_QUEUE`).
-    pub(crate) fn new_copy_list(&self) -> windows::core::Result<HostList> {
+    pub(crate) fn new_copy_list(&self) -> windows::core::Result<std::sync::Arc<HostList>> {
         self.new_list_kind(ListKind::Copy)
     }
 
-    fn new_list_kind(&self, kind: ListKind) -> windows::core::Result<HostList> {
+    fn new_list_kind(&self, kind: ListKind) -> windows::core::Result<std::sync::Arc<HostList>> {
         let list_type = match kind {
             ListKind::Direct => D3D12_COMMAND_LIST_TYPE_DIRECT,
             ListKind::Copy => D3D12_COMMAND_LIST_TYPE_COPY,
@@ -2205,7 +2218,7 @@ impl Host {
             };
             #[cfg(feature = "diagnostics")]
             made.emit_busy_start();
-            Ok(made)
+            Ok(std::sync::Arc::new(made))
         }
     }
 
@@ -2254,7 +2267,7 @@ impl Host {
 
     /// Runs closed lists. Their submission joins the timeline, finished
     /// once the GPU has run it.
-    pub(crate) fn execute(&self, runs: &[&HostList]) {
+    pub(crate) fn execute(&self, runs: &[&std::sync::Arc<HostList>]) {
         // A list named twice would execute twice: its earlier run's memory
         // is still in flight when the later run submits, so the submission
         // splits there -- and, worse, some drivers lose the lists between
@@ -2267,7 +2280,7 @@ impl Host {
             let mut seen: Vec<*const HostList> = Vec::with_capacity(runs.len() - start);
             let mut end = runs.len();
             for (i, list) in runs.iter().enumerate().skip(start) {
-                let id: *const HostList = *list;
+                let id: *const HostList = std::sync::Arc::as_ptr(list);
                 if seen.contains(&id) {
                     end = i;
                     break;
@@ -2298,11 +2311,11 @@ impl Host {
     /// submission lock right before `ExecuteCommandLists` so other parallel
     /// tests cannot deadlock behind `gate` while holding `submitted`.
     #[cfg(test)]
-    fn execute_gated(&self, runs: &[&HostList], gate: &ID3D12Fence) {
+    fn execute_gated(&self, runs: &[&std::sync::Arc<HostList>], gate: &ID3D12Fence) {
         self.execute_inner(runs, Some(gate));
     }
 
-    fn execute_inner(&self, runs: &[&HostList], #[cfg(test)] gate: Option<&ID3D12Fence>) {
+    fn execute_inner(&self, runs: &[&std::sync::Arc<HostList>], #[cfg(test)] gate: Option<&ID3D12Fence>) {
         self.finisher.call_once(|| {
             let spawned = std::thread::Builder::new()
                 .name("victory-gpu-finisher".into())
@@ -2398,11 +2411,11 @@ impl Host {
         // one upload list runs first on DIRECT. Without a copy queue a COPY
         // list still runs first on DIRECT (its copy-only commands are valid
         // there); the DIRECT side still makes the textures readable.
-        let copy_upload: Option<&HostList> = uploads.as_ref().and_then(|u| u.copy_list());
-        let direct_upload: Option<&HostList> = uploads.as_ref().and_then(|u| u.direct_list());
+        let copy_upload: Option<&std::sync::Arc<HostList>> = uploads.as_ref().and_then(|u| u.copy_list());
+        let direct_upload: Option<&std::sync::Arc<HostList>> = uploads.as_ref().and_then(|u| u.direct_list());
         let use_copy_queue =
             copy_upload.is_some() && self.copy_queue.is_some() && self.copy_fence.is_some();
-        let mut mains: Vec<&HostList> = if use_copy_queue {
+        let mut mains: Vec<&std::sync::Arc<HostList>> = if use_copy_queue {
             runs.to_vec()
         } else {
             copy_upload.into_iter().chain(runs.iter().copied()).collect()
@@ -2413,9 +2426,9 @@ impl Host {
         // records COPY_DEST to SHADER_RESOURCE. Never on an upload list
         // itself (COPY lists allow only copy states).
         if copy_upload.is_some() {
-            let is_upload = |l: &HostList| {
-                copy_upload.is_some_and(|u| std::ptr::eq(u, l))
-                    || direct_upload.is_some_and(|u| std::ptr::eq(u, l))
+            let is_upload = |l: &std::sync::Arc<HostList>| {
+                copy_upload.is_some_and(|u| std::sync::Arc::ptr_eq(u, l))
+                    || direct_upload.is_some_and(|u| std::sync::Arc::ptr_eq(u, l))
             };
             if let Some(first) = mains.iter().copied().find(|&l| !is_upload(l)) {
                 let uploaded: Vec<std::sync::Arc<crate::resource::HostTexture>> = copy_upload
@@ -2445,7 +2458,7 @@ impl Host {
         let runs = &mains[..];
         // The copy upload list, if any (COPY kind): submitted on the copy
         // queue below, before the direct runs.
-        let upload_list: Option<&HostList> = if use_copy_queue {
+        let upload_list: Option<&std::sync::Arc<HostList>> = if use_copy_queue {
             copy_upload
         } else {
             None
@@ -2496,8 +2509,7 @@ impl Host {
         let mut repeated: Vec<bool> = Vec::with_capacity(runs.len());
         let mut made_repeats: Vec<Option<Repeat>> = Vec::with_capacity(runs.len());
         for (i, list) in runs.iter().enumerate() {
-            let id: *const HostList = *list;
-            let is_repeated = runs[..i].iter().any(|&l| std::ptr::eq(l, id));
+            let is_repeated = runs[..i].iter().any(|l| std::sync::Arc::ptr_eq(*l, *list));
             repeated.push(is_repeated);
             // A repeat's steps would rewrite the list's own memory (upload
             // memory, scratch, budget word) before its earlier run has read
@@ -2610,7 +2622,7 @@ impl Host {
         // buffer-to-buffer copies, which run before the list's own commands
         // on the GPU.
         for (i, list) in runs.iter().enumerate() {
-            let id: *const HostList = *list;
+            let id: *const HostList = std::sync::Arc::as_ptr(list);
             // A repeat that wrote the list's own memory starts a new
             // `ExecuteCommandLists` call (the queue runs them in order, so
             // nothing waits): its prelude must not share the call with the
@@ -2646,11 +2658,15 @@ impl Host {
         // For copy offload the pending submission names the upload list too
         // (kept alive until both queues ran it); its staging reads are the
         // direct runs' texture steps below.
-        let pending_runs: Vec<&HostList> = match upload_list {
-            Some(up) => std::iter::once(up).chain(runs.iter().copied()).collect(),
-            None => runs.to_vec(),
+        let pending_runs: Vec<std::sync::Arc<HostList>> = match upload_list {
+            Some(up) => std::iter::once(up).chain(runs.iter().copied()).cloned().collect(),
+            None => runs.iter().map(|&l| l.clone()).collect(),
         };
-        let (mut pending, mut touches) = Pending::of(&pending_runs);
+        let pending_refs: Vec<&std::sync::Arc<HostList>> = pending_runs.iter().collect();
+        let (mut pending, mut touches) = Pending::of(&pending_refs);
+        // The device-removed report names these same lists by pointer or
+        // name; the `Arc`s above keep them alive and unmoved for it.
+        let diag_runs: Vec<&HostList> = pending_runs.iter().map(|l| l.as_ref()).collect();
         // Deferred copies kept past the lists' run: they run at completion,
         // after the copy-backs (see `complete`), when a source the shaders
         // wrote has reached title memory.
@@ -2783,7 +2799,7 @@ impl Host {
                 fail(format_args!(
                     "a host submission of {} lists was not signalled ({e}){}",
                     pending_runs.len(),
-                    self.removal_data(&pending_runs)
+                    self.removal_data(&diag_runs)
                 ));
             }
             #[cfg(feature = "diagnostics")]
@@ -2824,7 +2840,7 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        for list in pending_runs.iter().copied() {
+        for list in pending_runs.iter() {
             list.last.store(*submitted, Ordering::Release);
         }
         pending.removed_in = removed_in;
@@ -3101,10 +3117,14 @@ impl Host {
     fn complete(&self, p: Pending) {
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            // Any submission in flight may have faulted.
-            let mut runs: Vec<&HostList> = p.lists.iter().map(|l| l.get()).collect();
+            // Any submission in flight may have faulted. The `Arc`s keep
+            // every list alive and unmoved for this live dereference.
+            // Owned clones: `each_work` only lends each submission for the
+            // call, so the report holds its own pins.
+            let mut held: Vec<std::sync::Arc<HostList>> = p.lists.iter().cloned().collect();
             self.timeline
-                .each_work(|w| runs.extend(w.lists.iter().map(|l| l.get())));
+                .each_work(|w| held.extend(w.lists.iter().cloned()));
+            let runs: Vec<&HostList> = held.iter().map(|l| l.as_ref()).collect();
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}{}",
                 p.lists.len(),
@@ -3124,18 +3144,11 @@ impl Host {
             now - from
         };
         // The host resets a device whose submission runs for about 2 s.
+        // The report reads the submit-time snapshot: the live sets may
+        // have been cleared by a reset and rebuilt by SPARE reuse while
+        // the submission ran (dereferencing them here faulted, ~0x118).
         if ran > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = p
-                .lists
-                .iter()
-                .flat_map(|l| {
-                    l.get()
-                        .pipelines
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                })
-                .collect();
+            let pipelines = &p.pipelines;
             tracing::warn!(
                 ms = ran.as_millis(),
                 lists = p.lists.len(),
@@ -6846,7 +6859,7 @@ struct Presenter {
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
-    copy: HostList,
+    copy: std::sync::Arc<HostList>,
     hwnd: HWND,
     meter: Meter,
     /// The newest submission when the last frame was presented (its copy
@@ -8435,6 +8448,71 @@ mod batch {   // `mod tests` is already taken at the top of this file
         assert!(needs_cut(true, true), "a redirecting repeat splits it");
     }
 
+    /// A submission pins its lists and reports submit-time pipelines: it
+    /// holds an `Arc` per list, so `list::recycle`'s `Arc::try_unwrap`
+    /// fails while the submission is in flight (the shell never moves into
+    /// `SPARE`, or frees, under a live `Pending`), and the slow-submission
+    /// report reads the submit-time snapshot, not the live sets (a reset
+    /// clears those while the submission still runs, and SPARE reuse
+    /// rebuilds them). Needs no GPU: the pinning is `Arc` ownership and
+    /// the timeline below is the real one; the contract block ties the
+    /// pattern to the real `Pending` (it fails to compile before the fix,
+    /// where `Pending::of` took `&[&HostList]` and kept `Vec<ListRef>`
+    /// with no snapshot).
+    #[test]
+    fn pending_pins_its_lists_and_reports_submit_time_pipelines() {
+        use std::sync::Arc;
+        // The contract the fix establishes on the real types: submissions
+        // are built from `Arc`s, and name `Arc`s plus a pipelines snapshot.
+        fn contract(of: fn(&[&Arc<HostList>]) -> (Pending, Touches)) {
+            let _ = of;
+        }
+        let _ = contract(Pending::of);
+        fn lists_are_arcs(p: &Pending) {
+            let _: &Vec<Arc<HostList>> = &p.lists;
+            let _: &std::collections::BTreeSet<String> = &p.pipelines;
+        }
+        let _ = lists_are_arcs;
+        // The mechanism, on the real timeline: an in-flight submission's
+        // work holds an `Arc` (as `Pending.lists` does), so `try_unwrap`
+        // (what `recycle` uses) fails until the submission finishes.
+        let t: Timeline<(Arc<String>, std::collections::BTreeSet<String>)> = Timeline::new();
+        let shell = Arc::new("shell".to_string());
+        let addr = Arc::as_ptr(&shell);
+        let snapshot: std::collections::BTreeSet<String> =
+            ["orig".to_string()].into_iter().collect();
+        t.push(1, 0, Touches::default(), (shell.clone(), snapshot.clone()));
+        assert!(
+            Arc::strong_count(&shell) > 1,
+            "a submission in flight pins its lists"
+        );
+        assert!(
+            Arc::try_unwrap(shell.clone()).is_err(),
+            "recycle's try_unwrap fails under a live submission"
+        );
+        // A submit-time snapshot (as `Pending.pipelines`), not the live
+        // value a reset clears and SPARE reuse rebuilds meanwhile.
+        let mut live = snapshot.clone();
+        live.insert("post-submit".to_string());
+        assert_eq!(Arc::as_ptr(&shell), addr, "the Arc never moves the shell");
+        // Until `finish_both` runs the work, which sees the snapshot.
+        t.finish_both(1, 1, |(shelled, snap)| {
+            assert_eq!(&*shelled, "shell");
+            assert!(snap.contains("orig"));
+            assert!(
+                !snap.contains("post-submit"),
+                "completion reports submit-time pipelines"
+            );
+            assert_eq!(Arc::as_ptr(&shelled), addr);
+        });
+        assert_eq!(t.len(), 0);
+        assert_eq!(
+            Arc::strong_count(&shell),
+            1,
+            "finished: the submission lets its lists go"
+        );
+    }
+
     /// Ranges of one copy stay disjoint: what a range overlaps, or lies
     /// within a page of, coalesces; distant ranges do not copy the span
     /// between them. Needs no GPU: the merge is decided on addresses alone.
@@ -9477,6 +9555,81 @@ mod submissions {
         assert!(!list.running());
     }
 
+    /// An in-flight submission pins its list against recycling and
+    /// completes from its submit-time pipelines: submitted against a gated
+    /// fence, the queue may recycle the shell (`SPARE` poisoning included)
+    /// and the title may reset and rebind the list, yet the shell stays
+    /// put, `try_unwrap` fails, and the forced slow path reports the
+    /// submit-time set. Needs a host GPU; passes by without one.
+    #[test]
+    fn an_in_flight_submission_pins_its_list_against_recycling() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let Some(host) = super::host() else { return }; // no host GPU here
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        host.drain();
+        let list = host.new_list().unwrap();
+        list.used_pipeline("submit-time-pipe");
+        list.close();
+        let addr = Arc::as_ptr(&list);
+        let gate = Gate::new(host);
+        host.execute_gated(&[&list], &gate.0);
+        assert!(list.running(), "the gate holds the submission in flight");
+        // SPARE poisoning: a recycled shell waits in the spares while our
+        // submission runs. Pre-fix, our shell would join it here: the
+        // queue's `recycle` try_unwrap succeeded under a live `Pending`,
+        // and the shell was handed to another title list on reuse.
+        let poison = host.new_list().unwrap();
+        poison.close();
+        crate::list::recycle(poison);
+        // The title drops its side (as `restart` does when a queue still
+        // holds part of a list): the submission still pins the shell.
+        // (Not a literal drop here: `HostList::drop` settles the gated
+        // submission and would deadlock. The strong count is the same
+        // observation `try_unwrap` makes.)
+        assert!(
+            Arc::strong_count(&list) > 1,
+            "a submission in flight pins its lists (pre-fix: 1, recyclable)"
+        );
+        assert!(
+            Arc::try_unwrap(list.clone()).is_err(),
+            "recycle's try_unwrap fails under a live Pending"
+        );
+        // In-place mutation after submit, plus the reset titles do at once:
+        // the live set is cleared and rebuilt while the submission runs.
+        list.reset();
+        list.used_pipeline("post-submit-pipe");
+        // The in-flight submission still names the shell and the
+        // submit-time set. Pre-fix this was a raw pointer at a recycled
+        // shell and the live set just cleared: the slow path faulted
+        // reading it (~0x118 in the user crash).
+        let mut saw = false;
+        host.timeline.each_work(|p| {
+            assert!(
+                p.lists.iter().any(|l| Arc::ptr_eq(l, &list)),
+                "the in-flight submission names our shell"
+            );
+            assert_eq!(Arc::as_ptr(&list), addr, "stable while in flight");
+            assert!(p.pipelines.contains("submit-time-pipe"));
+            assert!(
+                !p.pipelines.contains("post-submit-pipe"),
+                "completion reports submit-time pipelines"
+            );
+            saw = true;
+        });
+        assert!(saw, "our submission is in flight");
+        // Past the slow-submission threshold, so completion takes the slow
+        // path over the snapshot, never the live sets.
+        std::thread::sleep(Duration::from_millis(350));
+        gate.release();
+        host.drain();
+        assert!(!list.running());
+        assert_eq!(Arc::strong_count(&list), 1, "finished: let go");
+        assert_eq!(Arc::as_ptr(&list), addr, "the shell never moved");
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     /// A present waits for the previous frame's submissions, not its own:
     /// the frame it presents is still running when it returns, and is
     /// finished (bottom-of-pipe write included) once the next one begins.
@@ -9553,7 +9706,7 @@ mod submissions {
         assert!(list.running());
         let mut spares = 0;
         host.timeline.each_work(|w| {
-            if w.lists.iter().any(|l| std::ptr::eq(l.0, &list)) {
+            if w.lists.iter().any(|l| std::sync::Arc::ptr_eq(l, &list)) {
                 spares += w.preludes.len();
             }
         });
@@ -9861,7 +10014,7 @@ mod fills {
 
     const PAGE: usize = 4096;
 
-    fn list() -> Option<HostList> {
+    fn list() -> Option<std::sync::Arc<HostList>> {
         host()?.new_list().ok()
     }
 

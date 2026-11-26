@@ -206,7 +206,7 @@ fn pump(held: &mut Holding, why: Why) {
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
     let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
+        let lists: Vec<&std::sync::Arc<crate::host::HostList>> = segments.iter().collect();
         let at = std::time::Instant::now();
         host.execute(&lists);
         ran += at.elapsed();
