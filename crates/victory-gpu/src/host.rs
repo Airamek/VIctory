@@ -9718,12 +9718,24 @@ mod submissions {
         drop(list);
         gate.release();
         host.drain();
-        // At least our shell (concurrent tests pool through the same path,
-        // so only the floor is asserted).
-        assert!(
-            crate::list::take_recycled() >= 1,
-            "a finished shell pooled through complete/finish"
-        );
+        // The recycle lands on whichever thread finishes the submission: the
+        // test thread's `drain` may find the span already empty (finished on
+        // the finisher between its span check and its tail), so wait for the
+        // pool instead of assuming the reclaim already ran. Solo this is
+        // exact (nothing else recycles); in-suite it is a floor.
+        let pooled = {
+            let start = std::time::Instant::now();
+            loop {
+                if crate::list::take_recycled() >= 1 {
+                    break true;
+                }
+                if start.elapsed() > std::time::Duration::from_secs(10) {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        assert!(pooled, "a finished shell pooled through complete/finish");
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
