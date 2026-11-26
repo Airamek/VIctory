@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
-use victory_shader::{HwStage, RootType};
+use victory_shader::{HwStage, ResourceType, RootType, UsedResource};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
@@ -79,27 +79,44 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// A console shader container's translation: the host shader (or why it
+/// has none), the console resources its code reads, and whether the
+/// translation came from the cache (so no native decode ran for it).
+pub struct Cached {
+    pub shader: Result<HostShader, String>,
+    pub used: Vec<UsedResource>,
+    pub hit: bool,
+}
+
 /// The translation of a console shader container, from the cache when
-/// there is one, and whether it came from there.
-pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+/// there is one.
+pub fn host_shader(container: &[u8]) -> Cached {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| -> Result<(HostShader, Vec<UsedResource>), String> {
+        victory_shader::emit::translate_with_used(c, options).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
-        None => (translate(container), false),
+        None => match translate(container) {
+            Ok((shader, used)) => Cached { shader: Ok(shader), used, hit: false },
+            Err(reason) => Cached { shader: Err(reason), used: Vec::new(), hit: false },
+        },
     }
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation (or refusal) out. `ran` tells a miss from a hit.
+/// encoded translation (or refusal) with its used resources out. `ran`
+/// tells a miss from a hit.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
 }
 
-impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
+impl<F: Fn(&[u8]) -> Result<(HostShader, Vec<UsedResource>), String> + Send + Sync> Converter
+    for Translate<F>
+{
     fn id(&self) -> &'static str {
         "shader.dxil"
     }
@@ -109,7 +126,11 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        Ok(encode(&(self.translate)(&input[32..])))
+        let (translation, used) = match (self.translate)(&input[32..]) {
+            Ok((shader, used)) => (Ok(shader), used),
+            Err(reason) => (Err(reason), Vec::new()),
+        };
+        Ok(encode(&translation, &used))
     }
 }
 
@@ -117,8 +138,8 @@ fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
-    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
-) -> (Result<HostShader, String>, bool) {
+    translate: impl Fn(&[u8]) -> Result<(HostShader, Vec<UsedResource>), String> + Send + Sync,
+) -> Cached {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -132,7 +153,7 @@ fn cached(
                 break;
             }
         };
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        if let Some((shader, used)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let hit = !converter.ran.load(Ordering::Relaxed);
             let (counter, what) = if hit {
                 (&HITS, "from the cache")
@@ -141,13 +162,16 @@ fn cached(
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return (shader, hit);
+            return Cached { shader, used, hit };
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    ((converter.translate)(container), false)
+    match (converter.translate)(container) {
+        Ok((shader, used)) => Cached { shader: Ok(shader), used, hit: false },
+        Err(reason) => Cached { shader: Err(reason), used: Vec::new(), hit: false },
+    }
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
@@ -188,9 +212,30 @@ fn root_type(code: u32) -> RootType {
     }
 }
 
+fn kind_code(kind: ResourceType) -> u32 {
+    match kind {
+        ResourceType::Srv => 0,
+        ResourceType::Sampler => 1,
+        ResourceType::Cbv => 2,
+        ResourceType::Uav => 3,
+        ResourceType::Other(x) => 4 + u32::from(x),
+    }
+}
+
+fn kind_type(code: u32) -> Option<ResourceType> {
+    match code {
+        0 => Some(ResourceType::Srv),
+        1 => Some(ResourceType::Sampler),
+        2 => Some(ResourceType::Cbv),
+        3 => Some(ResourceType::Uav),
+        x => Some(ResourceType::Other(u8::try_from(x - 4).ok()?)),
+    }
+}
+
 /// Little-endian words and length-prefixed lists; a refusal is its
-/// reason's text.
-fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
+/// reason's text. The used resources follow the flags word: entries
+/// written by an older translator end there and do not decode.
+fn encode(translation: &Result<HostShader, String>, used: &[UsedResource]) -> Vec<u8> {
     let s = match translation {
         Ok(s) => s,
         Err(reason) => return [REFUSED.as_slice(), reason.as_bytes()].concat(),
@@ -263,10 +308,25 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    word(&mut out, used.len() as u32);
+    for u in used {
+        for v in [
+            kind_code(u.kind),
+            root_code(u.root),
+            u.table_offset_dwords,
+            u.lower_bound,
+            u.stride,
+            u32::from(u.dwords),
+            u32::from(u.user_data),
+            u32::from(u.slot),
+        ] {
+            word(&mut out, v);
+        }
+    }
     out
 }
 
-fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
+fn decode(bytes: &[u8]) -> Option<(Result<HostShader, String>, Vec<UsedResource>)> {
     struct Reader<'a>(&'a [u8]);
     impl<'a> Reader<'a> {
         fn take(&mut self, n: usize) -> Option<&'a [u8]> {
@@ -283,7 +343,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         }
     }
     if let Some(reason) = bytes.strip_prefix(REFUSED) {
-        return Some(Err(String::from_utf8(reason.to_vec()).ok()?));
+        return Some((Err(String::from_utf8(reason.to_vec()).ok()?), Vec::new()));
     }
     let mut r = Reader(bytes);
     if r.take(4)? != MAGIC {
@@ -324,22 +384,39 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let memory = r.word()?;
-    r.0.is_empty().then_some(Ok(HostShader {
-        stage,
-        dxil,
-        user_data,
-        samplers,
-        static_samplers,
-        root_cbvs,
-        root_srvs,
-        root_uavs,
-        memory: memory & 1 != 0,
-        memory_writes: memory & 2 != 0,
-        view_addresses: memory & 4 != 0,
-        heap: memory & 8 != 0,
-        heap_writes: memory & 16 != 0,
-        view_marks: memory & 32 != 0,
-    }))
+    let n = r.word()? as usize;
+    let mut used = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        used.push(UsedResource {
+            kind: kind_type(r.word()?)?,
+            root: root_type(r.word()?),
+            table_offset_dwords: r.word()?,
+            lower_bound: r.word()?,
+            stride: r.word()?,
+            dwords: u8::try_from(r.word()?).ok()?,
+            user_data: u8::try_from(r.word()?).ok()?,
+            slot: u8::try_from(r.word()?).ok()?,
+        });
+    }
+    r.0.is_empty().then_some((
+        Ok(HostShader {
+            stage,
+            dxil,
+            user_data,
+            samplers,
+            static_samplers,
+            root_cbvs,
+            root_srvs,
+            root_uavs,
+            memory: memory & 1 != 0,
+            memory_writes: memory & 2 != 0,
+            view_addresses: memory & 4 != 0,
+            heap: memory & 8 != 0,
+            heap_writes: memory & 16 != 0,
+            view_marks: memory & 32 != 0,
+        }),
+        used,
+    ))
 }
 
 #[cfg(test)]
@@ -375,6 +452,31 @@ mod tests {
         }
     }
 
+    fn used() -> Vec<UsedResource> {
+        vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 2,
+                lower_bound: 5,
+                stride: 4,
+                dwords: 8,
+                user_data: 9,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Other(7),
+                root: RootType::Other(11),
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ]
+    }
+
     #[test]
     fn translations_come_back_from_the_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -384,21 +486,22 @@ mod tests {
         let runs = AtomicU64::new(0);
         let translate = |_: &[u8]| {
             runs.fetch_add(1, Ordering::Relaxed);
-            Ok(shader())
+            Ok((shader(), used()))
         };
+        let hit = |cached: Cached| (cached.shader, cached.used, cached.hit);
         assert_eq!(
-            cached(&cache, &build, container, translate),
-            (Ok(shader()), false)
+            hit(cached(&cache, &build, container, translate)),
+            (Ok(shader()), used(), false)
         );
         assert_eq!(
-            cached(&cache, &build, container, translate),
-            (Ok(shader()), true)
+            hit(cached(&cache, &build, container, translate)),
+            (Ok(shader()), used(), true)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
         assert_eq!(
-            cached(&cache, &[8; 32], container, translate).0,
+            hit(cached(&cache, &[8; 32], container, translate)).0,
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
@@ -408,13 +511,13 @@ mod tests {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
         assert_eq!(
-            cached(&cache, &build, container, translate),
-            (Ok(shader()), false)
+            hit(cached(&cache, &build, container, translate)),
+            (Ok(shader()), used(), false)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         assert_eq!(
-            cached(&cache, &build, container, translate),
-            (Ok(shader()), true)
+            hit(cached(&cache, &build, container, translate)),
+            (Ok(shader()), used(), true)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
@@ -422,11 +525,14 @@ mod tests {
         let fails = AtomicU64::new(0);
         let fail = |_: &[u8]| {
             fails.fetch_add(1, Ordering::Relaxed);
-            Err::<HostShader, _>("unsupported".to_owned())
+            Err::<(HostShader, Vec<UsedResource>), _>("unsupported".to_owned())
         };
-        let refused = (Err("unsupported".to_owned()), false);
-        assert_eq!(cached(&cache, &build, b"other", fail), refused);
-        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        let refused = (Err("unsupported".to_owned()), Vec::new(), false);
+        assert_eq!(hit(cached(&cache, &build, b"other", fail)), refused);
+        assert_eq!(
+            hit(cached(&cache, &build, b"other", fail)),
+            (refused.0, refused.1, true)
+        );
         assert_eq!(fails.load(Ordering::Relaxed), 1);
     }
 
@@ -452,7 +558,7 @@ mod tests {
         assert!(
             std::str::from_utf8(ENCODING)
                 .unwrap()
-                .contains("fn encode(translation: &Result<HostShader, String>)")
+                .contains("fn encode(translation: &Result<HostShader, String>, used: &[UsedResource])")
         );
     }
 
@@ -470,13 +576,30 @@ mod tests {
 
     #[test]
     fn entries_round_trip_and_reject_damage() {
-        let bytes = encode(&Ok(shader()));
-        assert_eq!(decode(&bytes), Some(Ok(shader())));
+        let bytes = encode(&Ok(shader()), &used());
+        assert_eq!(decode(&bytes), Some((Ok(shader()), used())));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        // An entry written before the used resources were kept ends where
+        // the flags word does, and is translated again.
+        let legacy = encode_legacy(&Ok(shader()));
+        assert_eq!(decode(&legacy), None);
+        // A used entry of unknown kind is damage, not a silent default.
+        let mut bad_kind = bytes.clone();
+        let at = bad_kind.len() - used().len() * 32;
+        bad_kind[at..at + 4].copy_from_slice(&300u32.to_le_bytes());
+        assert_eq!(decode(&bad_kind), None);
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
-        assert_eq!(decode(&encode(&refusal)), Some(refusal));
+        assert_eq!(decode(&encode(&refusal, &[])), Some((refusal, Vec::new())));
         assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);
+    }
+
+    /// The entry layout before the used resources were kept (for the
+    /// upgrade test above): the flags word ends the entry.
+    fn encode_legacy(translation: &Result<HostShader, String>) -> Vec<u8> {
+        let bytes = encode(translation, &used());
+        let used_words = used().len() * 8 * 4 + 4;
+        bytes[..bytes.len() - used_words].to_vec()
     }
 }

@@ -218,7 +218,10 @@ pub fn run(paths: &[PathBuf], threads: usize, keys_only: Option<PathBuf>) -> Res
     });
     let listed = listed.into_inner();
     if let Some(file) = keys_only {
-        std::fs::write(file, lock(&lines).join("\n"))?;
+        // Deterministic order: workers push in completion order.
+        let mut lines = lock(&lines);
+        lines.sort();
+        std::fs::write(file, lines.join("\n"))?;
     }
     let mut todo = todo.into_inner().unwrap_or_else(|e| e.into_inner());
     todo.sort_by_key(|&(later, _)| later);

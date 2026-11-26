@@ -167,6 +167,12 @@
 //!   a view the bit of its first byte's page as base with that byte's
 //!   offset in its page as phase. Writes at computed addresses mark the
 //!   page-table bitmap instead ("Title memory").
+//! * **The host's tables** (the page table, the view addresses, the view
+//!   marks, the view strides) are read once per entry (added 2026-11-25):
+//!   where a shader reads an entry it has read on every path there, it
+//!   takes the first read's value (`bitcode::reuse`). So the reads of one
+//!   entry inside an invocation agree, even where the host rewrites the
+//!   entry while the list runs.
 //! * **Read marks** (with [`Options::view_marks`]; added 2026-11-25):
 //!   every image instruction that reads a texture shader view the program
 //!   takes from the resource heap itself (not through a table, whose slots
@@ -383,6 +389,16 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    translate_with_used(container, options).map(|(shader, _)| shader)
+}
+
+/// [`translate_with`], also returning the translated program's used
+/// resources (what the host binds): one container parse and native decode
+/// serves both, instead of decoding again for the resources.
+pub fn translate_with_used(
+    container: &[u8],
+    options: Options,
+) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -400,13 +416,14 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    let used = native.used.clone();
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_with(&c, &native, &p, &st, &io, &res, options).map(|shader| (shader, used))
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.

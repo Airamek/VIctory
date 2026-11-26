@@ -1139,6 +1139,9 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        if x == 0 || y == 0 || z == 0 {
+            return;
+        }
         self.flush_indirect(list);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1642,6 +1645,9 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        if vertices == 0 || instances == 0 {
+            return;
+        }
         self.flush_indirect(list);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -1747,6 +1753,9 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        if indices == 0 || instances == 0 {
+            return;
+        }
         self.flush_indirect(list);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
