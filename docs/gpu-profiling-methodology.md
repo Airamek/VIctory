@@ -220,6 +220,13 @@ conditions are required:
    from capture frames. Standard repo gates still apply to any code change
    (`cargo test --workspace --locked`, `clippy -D warnings`, `cargo xtask
    policy` - ROADMAP_30FPS.md:40-45).
+5. **Flaky-test adjudication is by census, never by skipping.**
+   `docs/preexisting-flakes.md` records every test known to fail
+   intermittently on clean trees (what it asserts, why it flakes, and the
+   base SHA + prover for each). A gate failure matching a census entry is
+   adjudicated by the census standard (solo pass; for non-census suspects
+   solo + base-solo + group-run-together decider) — tests are never
+   `#[ignore]`d or otherwise skipped to green a branch.
 
 WARP runs may support correctness and footprint claims only. PresentMon (not
 yet integrated) is required before any hardware fps claim, not before
