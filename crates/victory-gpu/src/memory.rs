@@ -883,10 +883,12 @@ mod tests {
         // would leave it).
         let list = host.new_list().unwrap();
         drop(bind(&list, OURS).expect("a page table"));
-        let mut seen = crate::fx::Map::default();
         // Tests running in parallel may move the copies' generation between
-        // the two prepares; only a pair sharing one counts.
+        // the two prepares; only a pair sharing one counts. Each attempt
+        // prepares fresh: a `seen` kept across attempts would hit on the
+        // first prepare and fail the walk assertion below.
         for _ in 0..100 {
+            let mut seen = crate::fx::Map::default();
             let before = crate::shadow::generation();
             let mut first = 0;
             prepare(OURS, &mut seen, || {}, |_, _, _, _| first += 1);
