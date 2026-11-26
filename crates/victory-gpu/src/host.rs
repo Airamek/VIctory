@@ -1446,12 +1446,17 @@ pub(crate) struct HostList {
 
 impl Drop for HostList {
     /// Its allocators and upload memory may not go while the GPU runs it,
-    /// and a submission in flight still names it.
-    ///
-    /// SCRATCH-BISECT (revert before push): settle+finish, to distinguish
-    /// the wait-only change from the pin change for the eviction failure.
+    /// and a submission in flight still names it: wait that out, without
+    /// finishing. The last pin drops at the end of the completion that
+    /// finishes the submission, under the submission lock; finishing there
+    /// would deadlock on it.
     fn drop(&mut self) {
-        self.settle();
+        let last = self.last.load(Ordering::Acquire);
+        if last != 0
+            && let Some(host) = made()
+        {
+            host.wait_value(last);
+        }
     }
 }
 
