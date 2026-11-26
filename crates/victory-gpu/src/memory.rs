@@ -234,6 +234,20 @@ fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
     SHARED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// View heap `key` was released: its page table goes with it (lists that
+/// name it hold the table), and a heap made later at its address starts
+/// with none of its state.
+#[cfg(windows)]
+pub(crate) fn release(key: usize) {
+    shared().retain(|(k, _)| *k != key);
+}
+
+/// Whether view heap `key` has a page table.
+#[cfg(test)]
+pub(crate) fn has_table(key: usize) -> bool {
+    shared().iter().any(|(k, _)| *k == key)
+}
+
 /// Runs `f` on the host heap behind view heap `key` while it cannot go
 /// away; None if it is gone or has no host heap.
 fn with_heap<R>(key: usize, f: impl FnOnce(&HostHeap) -> R) -> Option<R> {
@@ -532,11 +546,7 @@ impl Shared {
         // for `TABLE_DWORDS` dwords; no submission runs.
         let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
         let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
-        tracing::debug!(
-            copies = ranges.len(),
-            blocks = blocks.len() - 1,
-            "title memory page table"
-        );
+        tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
         self.layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
@@ -740,6 +750,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 };
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
+                    // Our adaptive overlap index: same test as upstream's
+                    // linear scan (see `AdaptiveRanges`), indexed.
                     Some(_) if precise.overlaps(at, at + (1 << 16)) => {}
                     Some(&k) if k != NO_OWNER => writes.push((k as usize, at)),
                     _ => {
