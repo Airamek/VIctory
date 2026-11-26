@@ -191,6 +191,15 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+/// What a host GPU failure does in tests: fail the test. Production
+/// aborts the run (no console state carries on); tests must keep their
+/// verdicts, one poisoned submission failing its own test instead of
+/// killing the binary with `0xC0000409` and losing every other verdict.
+#[cfg(test)]
+fn panic_on_failure(report: &str) -> ! {
+    panic!("host GPU failure: {report}");
+}
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
@@ -297,6 +306,11 @@ pub(crate) fn made() -> Option<&'static Host> {
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
+    // In tests a host GPU failure fails the test instead of aborting the
+    // binary, so one poisoned submission cannot take the other verdicts
+    // with it (freeze-class post-mortem §137-138).
+    #[cfg(test)]
+    on_failure(panic_on_failure);
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -359,6 +373,13 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
+            // Tests fail red here instead of freezing the whole PC: refuse
+            // the hardware device when a hang would not come back as a
+            // removal (TdrLevel 0/1). Production keeps the log-only warning.
+            #[cfg(test)]
+            if let Some(warning) = crate::tdr::Tdr::read().warning() {
+                panic!("refusing the host device in tests: {warning}");
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
