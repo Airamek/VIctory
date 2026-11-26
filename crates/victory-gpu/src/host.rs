@@ -3869,6 +3869,9 @@ impl HostList {
     /// SHADER_RESOURCE barrier. Used at submission, before preludes run.
     pub(crate) fn ensure_shader_resource(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) {
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        // Textures move to shader-readable on the DIRECT side only (as
+        // buffers in `ensure_buffer_readable` below).
+        self.assert_direct("ensure_shader_resource");
         let wanted = legal_state(&copy.texture, SHADER_RESOURCE);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -4041,7 +4044,13 @@ impl HostList {
                 .collect();
             barriers.extend(buffer_states.values().filter_map(|(first, _, shadow)| {
                 let real = shadow.state.load(Ordering::Relaxed);
-                (real != *first).then(|| {
+                // As textures above: a COPY-kind prelude moves only between
+                // copy states (buffers never name one; no producer moves
+                // them there today).
+                (real != *first
+                    && (!self.is_copy()
+                        || (copy_buffer_state_legal(real) && copy_buffer_state_legal(*first))))
+                .then(|| {
                     transition(
                         &shadow.buffer,
                         D3D12_RESOURCE_STATES(real as i32),
@@ -4096,7 +4105,7 @@ impl HostList {
                                 ));
                                 there
                             })
-                        });
+                        }, self);
                         if !back.is_empty() {
                             list.ResourceBarrier(&back);
                         }
@@ -5565,7 +5574,11 @@ impl Batch<'_> {
     /// share a buffer (one barrier cannot move both ends), or a queued copy
     /// already uses one of the buffers in the other role (the prelude merges
     /// each buffer's needs with OR, so COPY_SOURCE | COPY_DEST is no valid
-    /// state), or the submission already declared shader writes over them.
+    /// state), or the submission already declared shader writes over them,
+    /// or either buffer is outside the copy states (the copy engine barriers
+    /// only between COMMON, COPY_SOURCE and COPY_DEST: a buffer the DIRECT
+    /// side left readable or writable records no valid barrier on a COPY
+    /// list).
     fn queue_gpu_copy(&mut self, list: &HostList, src: usize, dst: usize, len: usize) {
         if len == 0 {
             return;
@@ -5577,6 +5590,24 @@ impl Batch<'_> {
             return;
         };
         if !src_shadow.covers(src, len) || !dst_shadow.covers(dst, len) {
+            return;
+        }
+        // The copy engine moves only between copy states: a buffer the
+        // DIRECT side left readable or writable (VERTEX, SHADER_RESOURCE,
+        // UAV, ...) records no valid barrier on a COPY list, so its copies
+        // keep their CPU result (already in title memory). Before any side
+        // effect below (the refresh, the current mark), so a refused copy
+        // changes nothing.
+        let (src_state, dst_state) = (
+            src_shadow.state.load(Ordering::Relaxed),
+            dst_shadow.state.load(Ordering::Relaxed),
+        );
+        if !copy_buffer_state_legal(src_state) || !copy_buffer_state_legal(dst_state) {
+            tracing::debug!(
+                src_state,
+                dst_state,
+                "buffer-to-buffer copy stays on the CPU: a buffer state the copy engine cannot barrier"
+            );
             return;
         }
         // One buffer cannot be both ends of one barrier pair without an
@@ -6917,6 +6948,19 @@ pub(crate) fn copy_prelude_keep(real: u32, first: u32) -> bool {
     copy_uploadable(real) && copy_uploadable(first)
 }
 
+/// Whether a buffer in `state` may move on the copy engine: only between
+/// the common state and the copy states. A buffer the DIRECT side left in
+/// a shader-readable or writable state (VERTEX, SHADER_RESOURCE, UAV,
+/// ...) records no valid barrier on a COPY list (retail diag18: 0xC1
+/// VERTEX|SHADER_RESOURCE died in `record_copy_prelude`); its copies stay
+/// on the CPU (already in title memory). GENERIC_READ is refused with the
+/// rest: it carries SHADER_RESOURCE-side bits no COPY list may barrier.
+pub(crate) fn copy_buffer_state_legal(state: u32) -> bool {
+    state == D3D12_RESOURCE_STATE_COMMON.0 as u32
+        || state == D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32
+        || state == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32
+}
+
 /// Whether a list of `kind` emits GPU-timing timestamp queries
 /// (diagnostics, `VICTORY_GPU_TIMING`): DIRECT lists stamp each noted
 /// command against the standard timestamp heap, but a COPY-kind command
@@ -7565,10 +7609,11 @@ fn record_gpu_copies(list: &ID3D12GraphicsCommandList, copies: &[GpuCopy]) {
 /// Wait on the copy fence). The prelude runs on the copy queue and is
 /// recycled with the submission; the buffers stay alive in their owning
 /// lists (`keep`), whose last submission (both queues) outlives them.
-/// `None` where no prelude could be made: the caller falls back to the
-/// lists' DIRECT preludes.
+/// `None` where no prelude could be made, or where a buffer sits outside
+/// the copy states: the caller falls back to the lists' DIRECT preludes
+/// (whole batch, never split: what the COPY side would leave behind decides
+/// what the DIRECT side's copy-to-readable moves expect).
 fn record_copy_prelude(host: &Host, copies: &[GpuCopy]) -> Option<Prelude> {
-    let prelude = host.fresh_prelude(ListKind::Copy)?;
     // One barrier per buffer (a buffer may feed several copies): from its
     // real state to the union of what the copies need.
     let mut ends: Vec<(ID3D12Resource, u32, u32)> = Vec::new();
@@ -7590,6 +7635,19 @@ fn record_copy_prelude(host: &Host, copies: &[GpuCopy]) -> Option<Prelude> {
             D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
         );
     }
+    // Whole-batch fallback: a buffer outside the copy states refuses the
+    // batch to the DIRECT preludes (which barrier any state), rather than
+    // recording a COPY prelude for the rest and leaving the DIRECT side to
+    // guess what ran where. The queue already refuses these
+    // (`queue_gpu_copy`), so this fires only for states changed meanwhile;
+    // the CPU copies are done either way.
+    if !ends.iter().all(|(_, real, _)| copy_buffer_state_legal(*real)) {
+        tracing::debug!(
+            "copy-engine buffer copies fall back to DIRECT: a buffer state the copy engine cannot barrier"
+        );
+        return None;
+    }
+    let prelude = host.fresh_prelude(ListKind::Copy)?;
     // SAFETY: a fresh prelude nothing pending or running uses, and live
     // shadow buffers (kept by their lists).
     let recorded = unsafe {
@@ -8521,6 +8579,219 @@ mod batch {   // `mod tests` is already taken at the top of this file
             crate::shadow::unregister(pool, pool as u64);
             crate::watch::tests::free(pool);
         }
+    }
+
+    /// A buffer-to-buffer copy whose buffer the DIRECT side left outside
+    /// the copy states is refused: a COPY list records only copy-state
+    /// barriers, so the prelude would die recording e.g. 0xC1 (VERTEX and
+    /// CONSTANT BUFFER | PIXEL | NON PIXEL SHADER RESOURCE, the retail
+    /// diag18 value) to COPY_SOURCE on a COPY list. Refused copies keep
+    /// their CPU result (already in title memory); buffers in COMMON or
+    /// the copy states queue normally. Needs a host GPU; passes by
+    /// without one.
+    #[test]
+    fn buffer_copies_from_non_copy_states_stay_on_the_cpu() {
+        use crate::watch::PAGE;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (p, q) = (crate::watch::tests::pool(1), crate::watch::tests::pool(1));
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        crate::shadow::register(q, q as u64, PAGE as u64);
+        let (Some(src), Some(dst)) = (
+            crate::shadow::find(p as u64, PAGE as u64),
+            crate::shadow::find(q as u64, PAGE as u64),
+        ) else {
+            crate::shadow::unregister(q, q as u64);
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        assert_ne!(
+            src.buffer.as_raw(),
+            dst.buffer.as_raw(),
+            "each pool in its own buffer"
+        );
+        let list = host.new_list().expect("a host list");
+        let mut batch = Batch {
+            host: Some(host),
+            submission_gen: crate::shadow::generation(),
+            ..Batch::default()
+        };
+        const COMMON: u32 = D3D12_RESOURCE_STATE_COMMON.0 as u32;
+        const COPY_SOURCE: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        // Positive control: COMMON buffers queue for the GPU, and the COPY
+        // prelude then moves only between copy states.
+        src.state.store(COMMON, Ordering::Relaxed);
+        dst.state.store(COMMON, Ordering::Relaxed);
+        batch.queue_gpu_copy(&list, p, q, PAGE);
+        assert_eq!(batch.gpu_copies.len(), 1, "COMMON buffers queue");
+        let mine = batch.take_gpu_copies(&list);
+        assert_eq!(mine.len(), 1, "the owning list takes its copy");
+        let Some(prelude) = record_copy_prelude(host, &mine) else {
+            drop(mine);
+            drop(src);
+            drop(dst);
+            crate::shadow::unregister(q, q as u64);
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            crate::watch::tests::free(q);
+            return; // no COPY prelude could be made here
+        };
+        for (_, before, after) in crate::host::tests::issued() {
+            for &state in &[before, after] {
+                assert!(
+                    state == COMMON || state == COPY_SOURCE || state == COPY_DEST,
+                    "a COPY prelude moves only between copy states, not {state:#x}"
+                );
+            }
+        }
+        drop(prelude);
+        drop(mine);
+        // The retail failure: a source the DIRECT side left readable
+        // (VERTEX | SHADER_RESOURCE, 0xC1) records no valid COPY-list
+        // barrier, so it stays on the CPU.
+        src.state
+            .store(BUFFER_VERTEX | BUFFER_SHADER_RESOURCE, Ordering::Relaxed);
+        dst.state.store(COMMON, Ordering::Relaxed);
+        batch.queue_gpu_copy(&list, p, q, PAGE);
+        assert!(
+            batch.gpu_copies.is_empty(),
+            "a source outside the copy states stays on the CPU"
+        );
+        // The destination side too: a UAV destination stays on the CPU.
+        src.state.store(COMMON, Ordering::Relaxed);
+        dst.state.store(BUFFER_UNORDERED_ACCESS, Ordering::Relaxed);
+        batch.queue_gpu_copy(&list, p, q, PAGE);
+        assert!(
+            batch.gpu_copies.is_empty(),
+            "a destination outside the copy states stays on the CPU"
+        );
+        assert!(
+            batch.take_gpu_copies(&list).is_empty(),
+            "refused copies record no COPY prelude"
+        );
+        // Positive control: the states the copy engine leaves queue again
+        // (queue only: re-recording them would barrier a state to itself).
+        src.state.store(COPY_SOURCE, Ordering::Relaxed);
+        dst.state.store(COPY_DEST, Ordering::Relaxed);
+        batch.queue_gpu_copy(&list, p, q, PAGE);
+        assert_eq!(batch.gpu_copies.len(), 1, "copy states queue");
+        let mine = batch.take_gpu_copies(&list);
+        assert_eq!(mine.len(), 1, "the owning list takes its copy");
+        drop(mine);
+        drop(list);
+        drop(src);
+        drop(dst);
+        crate::shadow::unregister(q, q as u64);
+        crate::shadow::unregister(p, p as u64);
+        crate::watch::tests::free(p);
+        crate::watch::tests::free(q);
+    }
+
+    /// A COPY-engine batch touching a buffer outside the copy states falls
+    /// back whole to the DIRECT preludes: `record_copy_prelude` refuses it
+    /// (rather than splitting some copies onto COPY and the rest onto
+    /// DIRECT), recording no barrier carrying the illegal bits. Asserts at
+    /// the issued-transition level, mirroring the texture `copy_prelude`
+    /// test. Without the fallback the illegal record aborts the run
+    /// (`fail`, as retail diag18); without validation it returns `Some`
+    /// carrying the illegal barriers: either way the pre-fix code fails
+    /// here. Needs a host GPU; passes by without one.
+    #[test]
+    fn buffer_copies_with_non_copy_states_fall_back_whole_batch_to_direct() {
+        use crate::watch::PAGE;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (p, q) = (crate::watch::tests::pool(1), crate::watch::tests::pool(1));
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        crate::shadow::register(q, q as u64, PAGE as u64);
+        let (Some(src), Some(dst)) = (
+            crate::shadow::find(p as u64, PAGE as u64),
+            crate::shadow::find(q as u64, PAGE as u64),
+        ) else {
+            crate::shadow::unregister(q, q as u64);
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        assert_ne!(
+            src.buffer.as_raw(),
+            dst.buffer.as_raw(),
+            "each pool in its own buffer"
+        );
+        let list = host.new_list().expect("a host list");
+        let mut batch = Batch {
+            host: Some(host),
+            submission_gen: crate::shadow::generation(),
+            ..Batch::default()
+        };
+        const COMMON: u32 = D3D12_RESOURCE_STATE_COMMON.0 as u32;
+        // A legal batch records: the COPY prelude moves only between copy
+        // states (asserted at the issued-transition level, below).
+        src.state.store(COMMON, Ordering::Relaxed);
+        dst.state.store(COMMON, Ordering::Relaxed);
+        batch.queue_gpu_copy(&list, p, q, PAGE);
+        let mine = batch.take_gpu_copies(&list);
+        assert_eq!(mine.len(), 1, "COMMON buffers queue");
+        // A batch whose buffer the DIRECT side left outside the copy states
+        // is refused whole (either end): no COPY prelude, no barrier
+        // carrying the illegal bits. 0xC1 is the retail diag18 value
+        // (VERTEX | SHADER_RESOURCE); 0xC0 a resident readable buffer; the
+        // rest the other non-copy buffer states.
+        for &bad in &[
+            BUFFER_VERTEX | BUFFER_SHADER_RESOURCE,
+            BUFFER_SHADER_RESOURCE,
+            BUFFER_UNORDERED_ACCESS,
+            BUFFER_INDEX,
+            BUFFER_INDIRECT_ARGUMENT,
+        ] {
+            for &(src_bad, dst_bad) in &[(bad, COMMON), (COMMON, bad)] {
+                src.state.store(src_bad, Ordering::Relaxed);
+                dst.state.store(dst_bad, Ordering::Relaxed);
+                let _ = crate::host::tests::issued();
+                assert!(
+                    record_copy_prelude(host, &mine).is_none(),
+                    "a batch outside the copy states falls back to DIRECT ({src_bad:#x} to {dst_bad:#x})"
+                );
+                assert!(
+                    crate::host::tests::issued().is_empty(),
+                    "no COPY barrier carries {bad:#x}"
+                );
+            }
+        }
+        // Restored to copy states the batch records again.
+        src.state.store(COMMON, Ordering::Relaxed);
+        dst.state.store(COMMON, Ordering::Relaxed);
+        let Some(prelude) = record_copy_prelude(host, &mine) else {
+            drop(mine);
+            drop(src);
+            drop(dst);
+            crate::shadow::unregister(q, q as u64);
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            crate::watch::tests::free(q);
+            return; // no COPY prelude could be made here
+        };
+        for (_, before, after) in crate::host::tests::issued() {
+            for &state in &[before, after] {
+                assert!(
+                    state == COMMON
+                        || state == D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32
+                        || state == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
+                    "a COPY prelude moves only between copy states, not {state:#x}"
+                );
+            }
+        }
+        drop(prelude);
+        drop(mine);
+        drop(list);
+        drop(src);
+        drop(dst);
+        crate::shadow::unregister(q, q as u64);
+        crate::shadow::unregister(p, p as u64);
+        crate::watch::tests::free(p);
+        crate::watch::tests::free(q);
     }
 
 
