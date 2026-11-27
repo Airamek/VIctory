@@ -1333,7 +1333,7 @@ pub(crate) mod tests {
                     crate::shadow::tests::mark_read(false, 6);
                 }
                 let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-                crate::resource::evict_among(&owned, &read, 1000 + k * idle_frames / 3, 1_000_000 + k * idle_ms / 3, 0);
+                crate::resource::evict_among(&owned, &read, 1000 + k * idle_frames / 3, 1_000_000 + k * idle_ms / 3, 0, None);
                 assert!(crate::resource::made_copy(textures[0]).is_some(), "read every frame: stays (frame {k})");
             }
         }
@@ -2649,6 +2649,13 @@ impl Host {
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
         crate::resource::evict_unused();
+        // While presents stall the gate above never opens; the backstop
+        // gives up textures instead (same site, capped, no new threads).
+        #[cfg(feature = "diagnostics")]
+        let commit = process_memory().0;
+        #[cfg(not(feature = "diagnostics"))]
+        let commit: u64 = 0;
+        crate::resource::evict_pressure_tick(commit);
         // Host copies of title memory past the bound go the same way.
         crate::shadow::evict_unused();
         // Descriptors the title copied into its heaps itself, before the
@@ -7398,6 +7405,7 @@ impl Meter {
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);
                 crate::shadow::log_shadow(report_frames);
+                crate::resource::log_evictions(report_frames);
                 costs::log(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
