@@ -581,9 +581,21 @@ fn upload_plane(list: &HostList, copy: &Arc<crate::resource::HostTexture>, stagi
     if bytes == 0 || len == 0 {
         return;
     }
-    let Some((buffer, base, data)) = take_plane_chunk(bytes as u64) else {
-        once!("no upload buffer for a CPU-written movie plane");
-        return;
+    let (buffer, base, data) = match take_plane_chunk(bytes as u64) {
+        Some(chunk) => chunk,
+        None => {
+            // Pool/pressure exhaustion: never silently drop a movie plane.
+            // Try a dedicated upload buffer (bypasses the shared staging
+            // pool), then fall back to the shared staging path.
+            if let Some((buffer, data)) = host().and_then(|h| h.upload_buffer(bytes as u64)) {
+                PLANES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (buffer, 0, data)
+            } else {
+                once!("no upload buffer for a CPU-written movie plane; falling back to shared staging");
+                list.defer_texture(staging.clone(), copy.clone());
+                return;
+            }
+        }
     };
     let dst = data as usize;
     let plane = staging.clone();

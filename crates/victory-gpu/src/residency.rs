@@ -175,6 +175,11 @@ pub(crate) fn allow_growth() -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_growth_backoff() {
+    RETRY_GROWTH_AT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

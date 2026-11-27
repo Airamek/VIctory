@@ -3659,6 +3659,60 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!((texel[0] - 128.0 / 255.0).abs() < 1e-6, "the new bytes: {texel:?}");
     }
 
+    /// A movie plane must never be silently dropped when upload memory is
+    /// exhausted (pressure/pool exhaustion): the dedicated-chunk path falls
+    /// back to an emergency upload buffer so the plane still reaches the GPU.
+    #[test]
+    fn a_movie_plane_uploads_after_pool_exhaustion() {
+        struct Backoff;
+        impl Drop for Backoff {
+            fn drop(&mut self) {
+                crate::residency::clear_growth_backoff();
+            }
+        }
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = crate::watch::tests::pool(1) as u64;
+        let object = texture_at_address(address, &texture_words(64, 64, 61, 1, 0));
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[61, 4, 0x1688, 0, 0, 1]);
+        let view = View::Shader(object as usize, Some(desc));
+        slots.make(0, &view);
+
+        // Block new staging growth, then exhaust carved chunk space so
+        // take_plane_chunk fails the same way as pressure/pool exhaustion.
+        let _backoff = Backoff;
+        crate::residency::allocation_error(0x8007000Eu32 as i32);
+        let mut held = Vec::new();
+        while let Some((buffer, _, data)) =
+            crate::texture::take_plane_chunk(32 * 1024 * 1024)
+        {
+            held.push(crate::texture::PlaneChunk::new(buffer));
+            // keep mapping/data alive in held? data is raw ptr; buffer in PlaneChunk keeps it
+            let _ = data;
+        }
+
+        // SAFETY: the texture's memory (a 64 KiB page).
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64) };
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Srv), &view, false);
+        run(&list, &slots, &read, 0, Some(&out), (8, 8));
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        // SAFETY: inside the mapped output.
+        let texel = unsafe { (data as *const [f32; 4]).read() };
+        drop(held);
+        assert!(
+            (texel[0] - 64.0 / 255.0).abs() < 1e-6,
+            "movie plane dropped during exhaustion: {texel:?}"
+        );
+    }
+
     /// A list recorded before another whose host copy writes a texture it
     /// reads, but run after it, reads the host's texels: whether its upload
     /// from title memory is still due is decided when its submission is
