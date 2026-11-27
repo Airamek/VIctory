@@ -111,3 +111,4 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+On-disk layout, invalidation, and safe-clear: `docs/asset-policy.md`.

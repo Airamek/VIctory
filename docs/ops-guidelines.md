@@ -115,6 +115,7 @@
   worktrees of merged tasks only after fork-push verified, never touch
   unknown-owner dirs blindly (identify first).
 - Report reclaimed GB in the task-close note (`TRIAGE_PROGRESS.md` section).
+- Cache layout / invalidation / safe-clear: `docs/asset-policy.md` (cache lives in `cache_dir`, saves live in `data_dir`).
 
 ## 6. Crash triage playbook
 - Resume/wedge procedure (frozen box, wedged binary, resume commands):

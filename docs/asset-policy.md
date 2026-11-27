@@ -46,6 +46,73 @@ Outside the repository, configured in `victory.toml`: `game_dir` (the
 user's dump), `test_titles`, and `cache_dir` for everything derived
 (default `%LOCALAPPDATA%\victory\cache`).
 
+## Cache layout (`cache_dir`)
+
+`cache_dir` (env `VICTORY_CACHE_DIR`, else `[paths].cache_dir`) holds
+only derived data: deleting it never loses saves (those live in
+`data_dir`, below). Every writer goes through
+`victory_core::ensure_outside_repo` (`Config::cache_subdir`,
+`Cache::open`, `victory-loader::load`).
+
+* `images/`: prepared title images written out for mapping
+  (`LoadLibraryExW`; rewritten only when changed).
+* `shaders/`: translated shaders, under one folder per translator
+  build (`use_shader_cache`: first 16 hex of the build hash). Inside
+  each, `victory-pipeline` content-addressed entries (`xx/rest` of the
+  key hex). Converter id `shader.dxil`. `victory translate --cache`
+  fills the same entries ahead of a run.
+* `pipelines/`: compiled host pipelines and the title pipelines worth
+  starting early (`use_pipeline_cache`). `early-pipelines.txt` (shared
+  early list) at the root; per-adapter libraries under
+  `adapters/<hardware|software>-<ids>/`: `host-pipelines.bin`, its
+  `host-pipelines.next` pending save, and `prebuilt-pipelines.txt`.
+  A compatible legacy `host-pipelines.bin` at the root is read when no
+  adapter library exists yet and never overwritten by the new layout.
+* Crash dumps (`crash-<rva>.bin`) beside them, at the cache root.
+
+`data_dir` (env `VICTORY_DATA_DIR`, else `[paths].data_dir`) is not a
+cache: `<title-id>/storage` (persistent local storage, game saves)
+and `<title-id>/temp` (the console `T:` drive). Never clear it with
+the cache.
+
+## Invalidation
+
+Nothing is versioned in place; a change makes a new key and the old
+entry is simply never served again.
+
+* Content-addressed entries key on converter id, converter version,
+  and input bytes (`CacheKey::new`). A game update (new container
+  bytes) or a converter version bump leaves the old entry orphaned.
+* Shader builds key on translator (`victory_shader::SOURCE_HASH`),
+  entry encoding (the text of `shader_cache.rs`), and translation
+  settings (the loop limit): any change opens a new `shaders/<build>`
+  folder, so older translators' folders can be deleted whole. A
+  damaged entry is a miss (translated and stored again); a container
+  that does not translate is stored with its reason, so it is not
+  tried again on every run.
+* Host pipeline entries are named by a hash of the full host
+  description (translated shader code, root signature, graphics
+  state); the host refuses a library from another driver and an entry
+  whose description differs. An adapter or driver change lands in a
+  new `adapters/<...>/` directory and leaves the old one orphaned.
+  The prebuilt list holds only for the exact library bytes (tag) and
+  the exact naming (translator, pipeline modules); otherwise it is
+  ignored and rebuilt.
+* All publishes are write-then-rename (staging `.tmp-<pid>-<n>`
+  beside the target); readers never see a partial entry. Abandoned
+  staging files of ended processes are removed on next start.
+
+## Safe-clear
+
+Any or all of `cache_dir` may be deleted; the next run rebuilds what
+it needs (`victory translate --cache --pipelines` warms both caches
+without running the title). To save space instead of a full clear,
+delete whole stale `shaders/<build>` folders and orphaned
+`pipelines/adapters/<...>/` directories. Stop every `victory`
+process first: the pipeline library file stays mapped and images stay
+mapped while running. Never delete `data_dir` as part of a cache
+clear.
+
 ## Enforcement
 
 1. `.gitignore` keeps common data types out of `git status`.
