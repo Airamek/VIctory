@@ -1630,6 +1630,12 @@ pub(crate) fn evict_unused() {
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
     evict(frame, now_ms(), over);
+    // Placed shells past their own high marks are let go of least recently
+    // used first, in this same once-per-presented-frame slot.
+    let (placed_bytes, placed_shells) = placed_over();
+    if placed_bytes > 0 || placed_shells > 0 {
+        evict_placed(frame, now_ms(), placed_bytes, placed_shells);
+    }
 }
 
 /// A host texture and the title textures (resource objects) holding it.
@@ -2057,21 +2063,63 @@ pub(crate) extern "system" fn create_at_address(
     )
 }
 
+/// A placed texture shell: the title address and resource description
+/// words ([`texture_at`]) it was made for.
+#[cfg(windows)]
+type PlacedKey = (u64, [u32; 14]);
+
 /// Textures the title placed in its own memory and views without a
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
 /// interface textures), by address and description: a resource at that
-/// address, made the first time a draw reads one.
-/// shortcut: never released (one host texture per distinct address and
-/// description viewed); release them when the title unmaps or reuses the
-/// memory once streaming grows VRAM use.
+/// address, made the first time a draw reads one, and the console bytes it
+/// holds.
+/// Past [`PLACED_HIGH_BYTES`] or [`PLACED_HIGH_COUNT`] shells, the least
+/// recently used shells the title alone feeds are let go of until use is
+/// back under the low marks, at misses ([`texture_at`]) and once per
+/// presented frame ([`evict_unused`]); what nothing may let go of grows
+/// through (a warning once). A shell let go of is made again from title
+/// memory on its next read, which is exact.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<PlacedKey, (usize, u64)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Console bytes of the placed textures [`texture_at`] made (they are never
-/// released).
+/// Console bytes of the placed textures [`texture_at`] made, minus those
+/// of the shells [`evict_placed`] let go of.
 #[cfg(windows)]
 pub(crate) static PLACED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Past this many console bytes (or shells) of placed textures, the least
+/// recently used evictable shells are let go of until use is back under
+/// the low mark (hysteresis, as [`BUDGET_HIGH`] and [`BUDGET_LOW`]): 1.5 GB
+/// and 4096 shells are headroom, not correctness (a long streaming stretch
+/// grew 18 shells to 573, +555 MB, toward a 24 GB commit).
+#[cfg(windows)]
+const PLACED_HIGH_BYTES: u64 = 1_500_000_000;
+#[cfg(windows)]
+const PLACED_LOW_BYTES: u64 = (PLACED_HIGH_BYTES as f64 * 0.85) as u64;
+#[cfg(windows)]
+const PLACED_HIGH_COUNT: u64 = 4096;
+#[cfg(windows)]
+const PLACED_LOW_COUNT: u64 = (PLACED_HIGH_COUNT as f64 * 0.85) as u64;
+
+/// Placed texture shells let go of, their console bytes, those made again
+/// since, and those made again within [`SOON_FRAMES`].
+#[cfg(windows)]
+pub(crate) static PLACED_EVICTIONS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Placed texture shells made and let go of since the last frame-rate line
+/// (counts, console bytes): whether the shell count grows because the title
+/// streams (made with nothing let go of) or churns (both high).
+#[cfg(windows)]
+static PLACED_MADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+#[cfg(windows)]
+static PLACED_FREED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Shells let go of, with the frame it was: a shell made again for one
+/// counts as remade ([`PLACED_EVICTIONS`]).
+#[cfg(windows)]
+static PLACED_GIVEN_UP: std::sync::Mutex<Option<std::collections::HashMap<PlacedKey, u64>>> =
+    std::sync::Mutex::new(None);
 
 /// Console bytes of a texture of resource description `desc` (as words).
 #[cfg(windows)]
@@ -2085,24 +2133,30 @@ pub(crate) fn placed_size(desc: &[u32; 14]) -> Option<u64> {
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // Words 1 and 13 are padding (stack bytes in the title's records).
     let mut desc = *desc;
     (desc[1], desc[13]) = (0, 0);
     let desc = &desc;
-    // A resource whose memory's host texture was replaced since (one with
-    // more uses) is made again, sharing the new one.
-    // shortcut: the old one is kept (view heap slots made from it view its
-    // host texture until the title rewrites them).
-    if let Some(&r) = map.get(&(address, *desc))
-        && current(r as This)
-    {
-        return Some(r as This);
+    if let Some(hit) = placed_hit(address, desc) {
+        return Some(hit);
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
+    }
+    // Admission: past the high marks, let go of the least recently used
+    // evictable shells until back under the low ones, then make this one.
+    // The map is not held: letting go takes it. What nothing may let go of
+    // grows through (never `None` for a title-fed texture: `None` would
+    // read as zeros).
+    placed_admit(placed_size(desc).unwrap_or(0));
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    // Made meanwhile by another thread (misses make side by side).
+    if let Some(hit) = map.get(&(address, *desc)).map(|&(r, _)| r as This)
+        && current(hit)
+    {
+        return Some(hit);
     }
     let mut out = std::ptr::null();
     let made = create_at_address(
@@ -2117,12 +2171,244 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
-    PLACED_BYTES.fetch_add(placed_size(desc).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
-    map.insert((address, *desc), out as usize);
+    let size = placed_size(desc).unwrap_or(0);
+    PLACED_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+    PLACED_MADE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PLACED_MADE[1].fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+    placed_remade(&(address, *desc));
+    map.insert((address, *desc), (out as usize, size));
     // Its host texture is made without the map's lock: the textures of the
     // slots a submission's shaders read are made several at a time.
     drop(map);
     resource(out).host().is_some().then_some(out)
+}
+
+/// The live resource for a texture placed at `address` with description
+/// `desc`, if one is mapped.
+#[cfg(windows)]
+fn placed_hit(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    // A resource whose memory's host texture was replaced since (one with
+    // more uses) is made again, sharing the new one.
+    // shortcut: the old one is kept (view heap slots made from it view its
+    // host texture until the title rewrites them).
+    let &(r, _) = map.get(&(address, *desc))?;
+    current(r as This).then_some(r as This)
+}
+
+/// Console bytes and shells of placed textures to let go of for `live`
+/// bytes in `count` shells with `add` bytes (`shells` shells) about to be
+/// held: past a high mark, down to the low one; nothing otherwise.
+#[cfg(windows)]
+fn placed_excess(live: u64, count: u64, add: u64, shells: u64) -> (u64, u64) {
+    (
+        if live.saturating_add(add) > PLACED_HIGH_BYTES {
+            live.saturating_add(add).saturating_sub(PLACED_LOW_BYTES)
+        } else {
+            0
+        },
+        if count.saturating_add(shells) > PLACED_HIGH_COUNT {
+            count.saturating_add(shells).saturating_sub(PLACED_LOW_COUNT)
+        } else {
+            0
+        },
+    )
+}
+
+/// Console bytes and shells of placed textures to let go of for the use
+/// now: past a high mark, down to the low one; nothing otherwise.
+#[cfg(windows)]
+fn placed_over() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    placed_excess(
+        PLACED_BYTES.load(Relaxed),
+        PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64,
+        0,
+        0,
+    )
+}
+
+/// Makes room for `size` console bytes (one shell) of placed texture: past
+/// a high mark, lets go of the least recently used evictable shells until
+/// back under the low one.
+#[cfg(windows)]
+fn placed_admit(size: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let live = PLACED_BYTES.load(Relaxed);
+    let count = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
+    let (over_bytes, over_count) = placed_excess(live, count, size, 1);
+    if over_bytes == 0 && over_count == 0 {
+        return;
+    }
+    let frame = crate::queue::presented();
+    evict_placed(frame, now_ms(), over_bytes, over_count);
+    let (live, count) = (
+        PLACED_BYTES.load(Relaxed),
+        PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64,
+    );
+    if placed_excess(live, count, 0, 0) != (0, 0) {
+        static GREW_THROUGH: std::sync::Once = std::sync::Once::new();
+        GREW_THROUGH.call_once(|| {
+            tracing::warn!(
+                live,
+                count,
+                size,
+                "placed textures past the high marks with none evictable: growing through"
+            );
+        });
+    }
+}
+
+/// A placed shell is made for `key`: counted if one was let go of.
+#[cfg(windows)]
+fn placed_remade(key: &PlacedKey) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut given = PLACED_GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = given.as_mut().and_then(|g| g.remove(key)) {
+        PLACED_EVICTIONS[2].fetch_add(1, Relaxed);
+        if crate::queue::presented().saturating_sub(at) <= SOON_FRAMES {
+            PLACED_EVICTIONS[3].fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// Placed texture shells live, and their console bytes.
+#[cfg(windows)]
+pub(crate) fn placed_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64,
+        PLACED_BYTES.load(Relaxed),
+    )
+}
+
+/// Placed shells made and let go of since the last call (counts, console
+/// bytes): the frame-rate line's companion, as [`texture_flow`].
+#[cfg(windows)]
+pub(crate) fn placed_flow() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PLACED_MADE[0].swap(0, Relaxed),
+        PLACED_MADE[1].swap(0, Relaxed),
+        PLACED_FREED[0].swap(0, Relaxed),
+        PLACED_FREED[1].swap(0, Relaxed),
+    )
+}
+
+/// Placed shells made again since a shell was let go of, and those made
+/// again within [`SOON_FRAMES`].
+#[cfg(windows)]
+pub(crate) fn placed_remade_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (PLACED_EVICTIONS[2].load(Relaxed), PLACED_EVICTIONS[3].load(Relaxed))
+}
+
+/// Lets go of placed texture shells ([`PLACED_TEXTURES`]) until `over_bytes`
+/// fewer console bytes and `over_count` fewer shells are held: idle ones
+/// first ([`IDLE_FRAMES`] and [`IDLE_MS`]), then the least recently used
+/// ([`choose`]), among shells the title alone feeds ([`evictable`]) unused
+/// this presented frame and the last ([`used_recently`]); GPU-written
+/// shells are never let go of. Returns how many shells and their console
+/// bytes.
+/// Slots viewing a shell get a null view first (made again from title
+/// memory when read, which is exact), then its map entries go and its bytes
+/// with them; the last Arc frees its host texture (staging with it; heap
+/// ranges go back with [`placement::free`]).
+/// shortcut: a use racing this (a title thread reading) may view the shell
+/// made again in a list that moved the one let go of; only shells unused
+/// for a while, or the least recently used, are let go of.
+#[cfg(windows)]
+fn evict_placed(frame: u64, now: u64, over_bytes: u64, over_count: u64) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // The shells, with their host textures held: the map is not held while
+    // slots are nulled below (which takes the heap locks, as `give_up` does
+    // before the texture maps; `make_read` takes the heap locks around
+    // making these shells).
+    let shells: Vec<(PlacedKey, usize, u64, Option<std::sync::Arc<HostTexture>>)> = {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter().map(|(k, &(r, bytes))| (*k, r, bytes, made(resource(r as This)))).collect()
+    };
+    // Shells with no host texture are free to let go of (nothing views
+    // them); others as `evict` lets go of them.
+    let mut pick: Vec<usize> = Vec::new();
+    let mut uses: Vec<(u64, u64, u64)> = Vec::new();
+    let mut ones: Vec<(u64, u64, u64)> = Vec::new();
+    for (i, (_, _, bytes, host)) in shells.iter().enumerate() {
+        let (last, ok) = match host {
+            None => ((0, 0), true),
+            Some(t) => (
+                (t.last[0].load(Relaxed), t.last[1].load(Relaxed)),
+                evictable(t) && !t.used_recently(),
+            ),
+        };
+        if ok {
+            pick.push(i);
+            uses.push((last.0, last.1, *bytes));
+            ones.push((last.0, last.1, 1));
+        }
+    }
+    let mut gone: std::collections::HashSet<usize> = choose(&uses, frame, now, over_bytes).into_iter().collect();
+    if (gone.len() as u64) < over_count {
+        gone.extend(choose(&ones, frame, now, over_count - gone.len() as u64));
+    }
+    if gone.is_empty() {
+        return (0, 0);
+    }
+    let gone: Vec<usize> = gone.into_iter().map(|i| pick[i]).collect();
+    {
+        use windows::core::Interface;
+        let raws = gone
+            .iter()
+            .filter_map(|&i| shells[i].3.as_ref().map(|t| t.texture.as_raw() as usize))
+            .collect();
+        crate::descriptor::evict(&raws);
+    }
+    // Entries still mapping a shell to what was snapshotted go; one mapped
+    // again meanwhile (made side by side) is left to its maker.
+    let mut victims: Vec<(PlacedKey, usize, u64)> = Vec::new();
+    {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        for &i in &gone {
+            let (k, r, size, _) = &shells[i];
+            if map.get(k).is_some_and(|&(rr, _)| rr == *r) {
+                map.remove(k);
+                victims.push((*k, *r, *size));
+            }
+        }
+    }
+    if victims.is_empty() {
+        return (0, 0);
+    }
+    {
+        let mut at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+        for ((addr, _), r, _) in &victims {
+            if let Some(list) = at.get_mut(addr) {
+                list.retain(|&x| x != *r);
+                if list.is_empty() {
+                    at.remove(addr);
+                }
+            }
+        }
+    }
+    let freed = victims.len() as u64;
+    let bytes = victims.iter().map(|(_, _, size)| size).sum();
+    PLACED_BYTES.fetch_sub(bytes, Relaxed);
+    PLACED_FREED[0].fetch_add(freed, Relaxed);
+    PLACED_FREED[1].fetch_add(bytes, Relaxed);
+    PLACED_EVICTIONS[0].fetch_add(freed, Relaxed);
+    PLACED_EVICTIONS[1].fetch_add(bytes, Relaxed);
+    {
+        let mut given = PLACED_GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
+        let given = given.get_or_insert_with(Default::default);
+        given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
+        for (k, _, _) in &victims {
+            given.insert(*k, frame);
+        }
+    }
+    for (_, r, _) in victims {
+        object::release_boxed::<Resource>(r as This);
+    }
+    (freed, bytes)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -2534,6 +2820,23 @@ mod tests {
         assert_eq!(choose(&uses, frame, now, 1 << 20), vec![1, 2, 0], "all of them if need be");
         let early = (frame - 1, now - IDLE_MS, 10);
         assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
+    }
+
+    /// Placed shells are let go of past a high mark down to the low one,
+    /// for the incoming shell's bytes and shell alike; nothing below the
+    /// marks.
+    #[test]
+    fn placed_pressure_is_hysteresis_to_the_low_marks() {
+        assert_eq!(placed_excess(0, 0, 0, 0), (0, 0));
+        assert_eq!(placed_excess(PLACED_HIGH_BYTES - 1, PLACED_HIGH_COUNT - 1, 0, 0), (0, 0));
+        assert_eq!(
+            placed_excess(PLACED_HIGH_BYTES, PLACED_HIGH_COUNT - 1, 1, 0),
+            (PLACED_HIGH_BYTES + 1 - PLACED_LOW_BYTES, 0)
+        );
+        assert_eq!(
+            placed_excess(PLACED_HIGH_BYTES - 1, PLACED_HIGH_COUNT - 1, 0, 2),
+            (0, PLACED_HIGH_COUNT + 1 - PLACED_LOW_COUNT)
+        );
     }
 
     /// Title textures of one memory share a key in any format of the same

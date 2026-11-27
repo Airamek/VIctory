@@ -7326,14 +7326,24 @@ impl Meter {
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
                     let (commit, working_set) = process_memory();
+                    let (placed_shells, placed_live) = crate::resource::placed_counts();
+                    let (placed_made, placed_made_bytes, placed_freed, placed_freed_bytes) =
+                        crate::resource::placed_flow();
+                    let (placed_remade, placed_soon) = crate::resource::placed_remade_counts();
                     tracing::info!(
                         "video memory: {local:.0} MB of a {budget:.0} MB budget on the card, \
                          {system:.0} MB of {system_budget:.0} MB in system memory; process commit {:.0} MB, \
-                         working set {:.0} MB; Rust heap {:.0} MB; placed textures made {:.0} MB; list upload memory {} blocks {:.0} MB",
+                         working set {:.0} MB; Rust heap {:.0} MB; placed textures {placed_shells} shells ({:.0} MB live, \
+                         made {:.1}/frame ({:.1} MB/frame), let go of {:.1}/frame ({:.1} MB/frame), remade {placed_remade} ({placed_soon} soon)); \
+                         list upload memory {} blocks {:.0} MB",
                         commit as f64 / 1e6,
                         working_set as f64 / 1e6,
                         crate::copystat::HEAP_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
-                        crate::resource::PLACED_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+                        placed_live as f64 / 1e6,
+                        placed_made as f64 / report_frames,
+                        placed_made_bytes as f64 / 1e6 / report_frames,
+                        placed_freed as f64 / report_frames,
+                        placed_freed_bytes as f64 / 1e6 / report_frames,
                         crate::list::UPLOADS[0].load(Ordering::Relaxed),
                         crate::list::UPLOADS[1].load(Ordering::Relaxed) as f64 / 1e6,
                     );
