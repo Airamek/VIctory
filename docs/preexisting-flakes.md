@@ -127,6 +127,26 @@ abort's own mechanism is proven.
 - COPY-list legality aborts (timestamp queries §63, buffer 0xC1 §65): retail
   deterministic aborts, each fixed by its fix team. Real bugs, not flakes.
 
+## Deterministic hardware-only failures (gate exceptions, NOT census)
+
+Census = fails in-suite but passes alone. A test that fails SOLO,
+identically on base and branch, is not a flake: it is expected-red on that
+hardware until fixed upstream. These stay OUT of the census table, get NO
+`#[ignore]`/skip (the test still guards other adapters), and are recorded
+here so gates adjudicate them without rerun tax.
+
+- `pipeline::depth_bounds_test::depth_bounds_control_a_title_draw`
+  (`crates/victory-gpu/src/pipeline/depth_bounds_test.rs:281`): DETERMINISTIC
+  solo fail on AMD RX 6600 XT (`depth_bounds_supported=true`), identical on
+  base `ec1f0607` and branch tip (3+3 solo runs, all
+  `depth readback (fresh, excluded, included, reset): [0.0, 0.0, 0.0, 0.0]`
+  vs expected `[0.25, 0.5, 0.25, 0.25]`). Sibling
+  `depth_bounds_flag_changes_the_stream_state` passes solo 3+3 (CPU-only).
+  Mechanism (TRIAGE §80): the fixture maps the readback without waiting for
+  the async queue (passes with a drain); masked on RTX/WARP where bounds are
+  unsupported. Do NOT absorb into the tree - flagged upstream. Expected-red
+  on AMD hardware gates; green-alone elsewhere still guards regressions.
+
 ## Gates for this doc commit
 
 - `cargo xtask policy` must pass (doc-only change).
