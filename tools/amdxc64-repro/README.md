@@ -80,6 +80,26 @@ Verdicts per candidate: `PASS` (exit 0, pipeline created),
 `SETUP-FAILED` (exit 3, bad container/hash/device),
 `TIMED-OUT` (killed at 600 s), else `EXIT-<code>`.
 
+## Workaround (bf72 quarantine)
+
+Result (runs in `D:\victory-target\amdxc64-repro\runs\`):
+
+- `vs9975+psbf72-near`: `CRASH-0xC0000005` (dies at the "creating graphics
+  pipeline" marker — reproduces diag31).
+- `vs9975+ps7637-prime`, `vs9975+ps9763-near`: `PASS`.
+
+Same vertex shader and same 6-sampler shape in all three, so the crash is
+the bf72 pixel DXIL (`PS_MIRROR_PBR_MATERIAL_GLINTS`), not the vertex
+shader or the pattern. A solo in-process `CreateGraphicsPipelineState`
+crashes, so no serialisation or retry avoids it.
+
+`crates/victory-gpu/src/pipeline.rs` hard-codes a quarantine for container
+hash `bf7278cd8d6d6ff3` (`QUARANTINED_SHADERS`): pipelines holding it are
+never queued or compiled — their draws are dropped like an untranslated
+shader's, logged loudly once (`note_quarantined`), never wrong pixels.
+Deliberately unconditional (not `VICTORY_SKIP_PIPELINES`, which is
+diagnostics-gated): every build must avoid the crashing compile.
+
 ## Fidelity notes / limitations
 
 - The repro translates with the same function and options the shader

@@ -77,9 +77,20 @@ impl Pending {
             format!("{shaders:?}\t{state}")
         });
         let screen = graphics.as_ref().is_some_and(|g| g.screen_pass());
-        #[cfg(feature = "diagnostics")]
-        let skipped_shader = super::skipped_shader(&shaders, skip_hashes).map(str::to_owned);
+        // A quarantined shader's compile crashes the driver inside our own
+        // process (the amdxc64 repro crashes solo, so no serialisation or
+        // retry avoids it): never queued or made. Its draws are dropped like
+        // an untranslated shader's — logged loudly, never wrong pixels.
+        let quarantined = super::quarantined_shader(&shaders).map(str::to_owned);
         let made = OnceLock::new();
+        if let Some(hash) = &quarantined {
+            super::note_quarantined(&key, hash);
+            let _ = made.set(None);
+        }
+        #[cfg(feature = "diagnostics")]
+        let skipped_shader = super::skipped_shader(&shaders, skip_hashes)
+            .map(str::to_owned)
+            .or(quarantined);
         // Publish the completed result before the pipeline can be queued.
         #[cfg(feature = "diagnostics")]
         if skipped_shader.is_some() {
@@ -977,6 +988,47 @@ mod tests {
         );
         assert!(matches!(cold.made.get(), Some(None)));
         assert!(matches!(warm.made.get(), Some(None)));
+        assert!(shader.translated.get().is_none());
+    }
+
+    /// A first use is queued by the worker; a quarantined shader (bf72 GLINTS:
+    /// amdxc64 repro crashes solo in CreateGraphicsPipelineState at
+    /// amdxc64.dll+0x671f78, primes pass) is never queued or compiled —
+    /// its draws are dropped, never wrong pixels, and the process survives.
+    #[test]
+    fn quarantine_matches_only_bf72_glints() {
+        // The crasher: PS_MIRROR_PBR_MATERIAL_GLINTS.
+        assert!(crate::pipeline::quarantined_hash("bf7278cd8d6d6ff3"));
+        // The repro's passing controls: same VS, sibling 6-sampler pixels.
+        assert!(!crate::pipeline::quarantined_hash("76376a2ee6c53ffe"));
+        assert!(!crate::pipeline::quarantined_hash("9763863ad4cd2579"));
+        assert!(!crate::pipeline::quarantined_hash("9975d5335335cc9c"));
+        // Near-misses: wrong length, non-hex, empty.
+        assert!(!crate::pipeline::quarantined_hash("bf7278cd8d6d6ff"));
+        assert!(!crate::pipeline::quarantined_hash("bf7278cd8d6d6ff3 "));
+        assert!(!crate::pipeline::quarantined_hash(""));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quarantined_pipeline_stays_off_the_queue() {
+        let shader = Arc::new(Shader {
+            stage: "pixel",
+            hash: "bf7278cd8d6d6ff3".into(),
+            container: Vec::new(),
+            translated: OnceLock::new(),
+        });
+        let p = Arc::new(Pending::new(
+            vec![shader.clone()],
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        assert!(ready(&p).is_none());
+        // Never queued for a worker (a compile would crash the process),
+        // so no translation was ever consulted either.
+        assert!(!p.queued.load(Ordering::Relaxed));
+        assert!(matches!(p.made.get(), Some(None)));
         assert!(shader.translated.get().is_none());
     }
 }
