@@ -127,6 +127,13 @@ pub(crate) fn translated_for_test(
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
+    /// The compute group size, when a compute program declares one (for
+    /// partial dispatches: title thread counts convert to group counts).
+    pub(crate) compute_threads: Option<[u32; 3]>,
+    /// The translation guards threads past the host's real X thread count
+    /// (`USER_DISPATCH_THREADS_X` user data): dispatches with the console's
+    /// thread-count flag convert to group counts and set it.
+    pub(crate) partial_dispatch: bool,
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
@@ -198,7 +205,29 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     let crate::shader_cache::Cached { shader, used, hit } =
         crate::shader_cache::host_shader(container);
-    (shader.map(|host| Translated { host, used }), hit)
+    (
+        shader.map(|host| {
+            let compute_threads = victory_shader::Container::parse(container)
+                .ok()
+                .and_then(|c| {
+                    let part = c.part(victory_shader::FourCC::DXIL).or(c.part(victory_shader::FourCC::ACCC))?;
+                    victory_shader::native_programs(part.data).ok()
+                })
+                .and_then(|programs| {
+                    programs.iter().find_map(|p| match &p.io {
+                        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => {
+                            Some(cs.threads)
+                        }
+                        _ => None,
+                    })
+                });
+            let partial_dispatch = host.user_data.iter().any(|u| {
+                u.root == victory_shader::RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)
+            });
+            Translated { host, used, compute_threads, partial_dispatch }
+        }),
+        hit,
+    )
 }
 
 #[repr(C)]

@@ -30,6 +30,8 @@ pub mod device;
 #[cfg(all(test, windows))]
 mod dirty_pages_test;
 #[cfg(windows)]
+mod dirty_ranges;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 #[cfg(windows)]

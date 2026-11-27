@@ -1289,3 +1289,56 @@
             Err(crate::ShaderError::Unsupported { what: "GDS", .. })
         ));
     }
+
+    /// A partial dispatch guards its tail: the entry block branches around
+    /// the body past the host's real X thread count (upstream #3426,
+    /// dispatch-threads half).
+    #[test]
+    fn partial_dispatch_guards_threads_past_the_tail() {
+        use std::collections::HashMap;
+
+        use super::{Lower, Term};
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [64, 1, 1],
+            }),
+            code: S_ENDPGM.to_le_bytes().to_vec(),
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let bad = HashMap::new();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        };
+        let mut l = Lower::new(&parts, &bad);
+        let original = l.s.entry;
+        l.partial_dispatch_prologue(true);
+        let u = l
+            .user_reads
+            .values()
+            .find(|u| u.root == RootType::Other(super::super::shader::USER_DISPATCH_THREADS_X))
+            .expect("the real X thread count");
+        assert_eq!((u.slot, u.dword, u.index), (0, 64, 0));
+        let Some(Term::CondBr(_, body, done)) = l.s.m.block_term(original) else {
+            panic!("the entry block must branch around the tail");
+        };
+        assert_eq!(l.s.entry, body);
+        assert!(matches!(l.s.m.block_term(done), Some(Term::Ret)));
+    }

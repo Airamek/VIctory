@@ -82,6 +82,8 @@ fn store_shader() -> Arc<Shader> {
         translated: OnceLock::from(Some(Translated {
             host,
             used: native.used,
+            compute_threads: None,
+            partial_dispatch: false,
         })),
     })
 }
@@ -185,7 +187,7 @@ fn placed_uav_dispatch_writes_its_texture() {
     state.set_constants(true, 0, &expected.map(f32::to_bits), 0);
     state.set_table(true, 1, handle);
     let dispatched = crate::draw::dispatched();
-    state.dispatch(&list, 1, 1, 1);
+    state.dispatch(&list, 1, 1, 1, None);
     assert!(
         crate::draw::dispatched() > dispatched,
         "dispatch did not record"

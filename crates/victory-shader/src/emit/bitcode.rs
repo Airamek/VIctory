@@ -578,6 +578,12 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// A block's terminator (tests).
+    #[cfg(test)]
+    pub(crate) fn block_term(&self, block: usize) -> Option<Term> {
+        self.blocks[block].term
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)

@@ -1735,17 +1735,42 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// gets copies of the aligned windows it touches: idle ones are given up by
 /// [`evict_unused`] and remade whole on next use (this supersedes the old
 /// never-free shortcut).
-const WINDOW: u64 = 4 << 20;
+/// 1 MiB windows (a const, no knob) keep rounding slack down on scattered
+/// small regions outside buffer objects.
+/// Copies of title memory outside buffers, by (start, length); a request
+/// inside an already-allocated window reuses it instead of allocating a
+/// duplicate overlapping buffer.
+const LOOSE_WINDOW: u64 = 1 << 20;
+
+fn loose_span(address: u64, end: u64) -> (u64, u64) {
+    let start = address & !(LOOSE_WINDOW - 1);
+    let len = end.next_multiple_of(LOOSE_WINDOW).saturating_sub(start).max(LOOSE_WINDOW);
+    (start, len)
+}
+
+/// An allocated loose shadow whose `[s_start, s_start + s_len)` already
+/// covers `[address, end)`, avoiding a duplicate overlapping host buffer.
+fn find_containing_loose<T>(map: &BTreeMap<(u64, u64), T>, address: u64, end: u64) -> Option<&T> {
+    map.range(..=(address, u64::MAX))
+        .rev()
+        .find(|&(&(s_start, s_len), _)| s_start <= address && s_start.saturating_add(s_len) >= end)
+        .map(|(_, v)| v)
+}
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
-    if let Some(shadow) = LOOSE.lock().unwrap_or_else(|e| e.into_inner()).get(&(start, len)) {
-        shadow.touch();
-        return Some(shadow.clone());
+    let (start, len) = loose_span(address, end);
+    {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = map
+            .get(&(start, len))
+            .or_else(|| find_containing_loose(&map, address, end))
+        {
+            shadow.touch();
+            return Some(shadow.clone());
+        }
     }
     if pressured(len) {
         // The evict pass takes the registries itself: never under one.
@@ -1763,7 +1788,10 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         return transient_dedicated(start, len);
     }
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    if let Some(shadow) = map
+        .get(&(start, len))
+        .or_else(|| find_containing_loose(&map, address, end))
+    {
         shadow.touch();
         return Some(shadow.clone());
     }
@@ -2822,6 +2850,27 @@ pub(crate) mod tests {
         copy.copy_back(p + 128, 64);
         assert!(copy.before.lock().unwrap().0.is_empty());
         unregister(p, p as u64);
+    }
+
+    /// Loose windows are 1 MiB and aligned; a request inside an allocated
+    /// window reuses it instead of allocating a duplicate overlapping one
+    /// (upstream #3437, knob-free: const, no `VICTORY_LOOSE_WINDOW_KB`).
+    #[test]
+    fn loose_windows_are_1_mib_and_reuse_containing_spans() {
+        assert_eq!(LOOSE_WINDOW, 1 << 20);
+        let w = LOOSE_WINDOW;
+        assert_eq!(loose_span(0x10_0040, 0x10_1000), (0x10_0000, w));
+        assert_eq!(loose_span(0x1f_ff00, 0x20_0100), (0x10_0000, 2 * w));
+
+        let mut map = BTreeMap::new();
+        map.insert((0x10_0000u64, 2 * w), "two-mib");
+        // Sub-ranges inside an already-allocated 2 MiB loose shadow reuse it
+        // instead of allocating a duplicate overlapping 1 MiB shadow buffer.
+        assert_eq!(find_containing_loose(&map, 0x10_0000, 0x18_0000), Some(&"two-mib"));
+        assert_eq!(find_containing_loose(&map, 0x20_0000, 0x2f_ffff), Some(&"two-mib"));
+        // Out-of-bounds ranges do not match.
+        assert_eq!(find_containing_loose(&map, 0x20_0000, 0x31_0000), None);
+        assert_eq!(find_containing_loose(&map, 0x0f_0000, 0x12_0000), None);
     }
 
 }
