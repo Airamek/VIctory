@@ -124,7 +124,14 @@ const KEPT_BYTES: u64 = 64 << 20;
 /// offload, a submission is finished once both queues ran it: buffers are
 /// free once the direct value passed `completed` and the copy value passed
 /// `copy_completed` (with no copy work, the copy check always passes).
+///
+/// Also the per-submission sweep hook for [`crate::residency`]: samples host
+/// memory pressure (internally throttled to once a second) and, while
+/// pressured, lets idle staging go entirely instead of keeping
+/// `KEPT_BYTES`/`CHUNKS_KEPT` of it.
 pub(crate) fn recycle() {
+    crate::residency::refresh();
+    let pressured = crate::residency::pressured();
     let (reached, copy_reached) = crate::host::host()
         .map_or((u64::MAX, u64::MAX), |h| (h.completed(), h.copy_completed()));
     {
@@ -142,7 +149,13 @@ pub(crate) fn recycle() {
             // being prepared carves afresh after this). Needs both queues
             // done (both completeds past every mark, checked above).
             (c.current, c.used) = (0, 0);
-            c.all.truncate(CHUNKS_KEPT);
+            if pressured {
+                // Idle chunks are let go entirely under pressure; the next
+                // submission carves afresh once growth is allowed again.
+                c.all.clear();
+            } else {
+                c.all.truncate(CHUNKS_KEPT);
+            }
         }
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -157,10 +170,16 @@ pub(crate) fn recycle() {
         }
     }
     b.used = kept;
-    while b.free_bytes > KEPT_BYTES
-        && let Some((n, ..)) = b.free.pop_front()
-    {
-        b.free_bytes -= n;
+    if pressured {
+        // Under pressure no idle staging is kept: every free buffer drops.
+        b.free.clear();
+        b.free_bytes = 0;
+    } else {
+        while b.free_bytes > KEPT_BYTES
+            && let Some((n, ..)) = b.free.pop_front()
+        {
+            b.free_bytes -= n;
+        }
     }
 }
 
@@ -197,9 +216,15 @@ fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         i.and_then(|i| b.free.remove(i)).inspect(|_| b.free_bytes -= class)
     };
     // Made without the pool's lock (refreshes run on several threads).
+    // No new block while growth is held (refused allocation, or too little
+    // commit left): the free list above still serves. The upload stays due
+    // for a later submission.
     let e = match taken {
         Some(e) => e,
         None => {
+            if !crate::residency::allow_growth() {
+                return None;
+            }
             let (buffer, data) = host()?.upload_buffer(class)?;
             crate::host::name(&buffer, || "texture staging".into());
             (class, buffer, data as usize)
@@ -258,6 +283,12 @@ fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
             }
             (c.current, c.used) = (c.current + 1, 0);
             continue;
+        }
+        // A refused pool must not ask the driver again for each texture:
+        // existing chunks keep carving while new ones wait out the backoff
+        // (or for commit to recover). The upload stays due meanwhile.
+        if !crate::residency::allow_growth() {
+            return None;
         }
         let (buffer, data) = host()?.upload_buffer(CHUNK)?;
         crate::host::name(&buffer, || "texture staging chunk".into());

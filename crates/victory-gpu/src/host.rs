@@ -1942,12 +1942,16 @@ fn take_spare_upload(size: u64) -> Option<(ID3D12Resource, *mut u8, usize)> {
 }
 
 /// Keeps finished upload buffers for reuse, bounded in count and bytes;
-/// the rest drop (their committed resources are freed).
+/// the rest drop (their committed resources are freed). Under host memory
+/// pressure the byte bound shrinks to the prefetch cap, so idle spares are
+/// let go instead of held (`crate::residency`).
 fn return_spare_uploads(uploads: Vec<(ID3D12Resource, usize, usize)>) {
+    let max_bytes =
+        crate::residency::prefetch_limit(SPARE_UPLOADS_BYTES, crate::residency::pressured());
     let mut pool = pool(&SPARE_UPLOADS);
     for (buffer, data, cap) in uploads {
         let total: u64 = pool.iter().map(|(_, _, c)| *c as u64).sum();
-        if pool.len() >= SPARE_UPLOADS_MAX || total.saturating_add(cap as u64) > SPARE_UPLOADS_BYTES {
+        if pool.len() >= SPARE_UPLOADS_MAX || total.saturating_add(cap as u64) > max_bytes {
             continue;
         }
         pool.push((buffer, data, cap));
@@ -6887,6 +6891,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(e.code().0);
                 tracing::warn!(error = %e, size, "no list buffer");
                 None
             }
@@ -6938,6 +6943,11 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                if !readback {
+                    // Readback heaps are never pooled upload memory; only a
+                    // refused *upload* allocation holds staging growth.
+                    crate::residency::allocation_error(e.code().0);
+                }
                 tracing::warn!(error = %e, size, readback, "no mapped buffer");
                 None
             }
