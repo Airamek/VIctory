@@ -51,6 +51,8 @@
   reached, crash signature (HRESULT + debug-layer line), log filename.
 
 ## 5. Storage hygiene (after EVERY task completes)
+- Full survival policy (five catastrophes, persist/resume, timers,
+  no-infinite-spin, floors): `docs/catastrophe-prep.md`.
 - Check: `D:\victory-target\*` sizes, `D:/dev/VIctory-*` worktrees,
   `$env:TEMP\victory-diag*.log`, `C:\vct` scratch.
 - Reclaim: delete stale target dirs of merged/abandoned tasks, Pols… no —
@@ -60,6 +62,8 @@
 - Report reclaimed GB in the task-close note (`TRIAGE_PROGRESS.md` section).
 
 ## 6. Crash triage playbook
+- Resume/wedge procedure (frozen box, wedged binary, resume commands):
+  `docs/catastrophe-prep.md` §§1/3/5.
 1. Log first: tail `victory-diagNN.log` for `device removed` + HRESULT +
    debug-layer verdict; compare against last known-good signature.
 2. Parallelize: (a) locate creation site, (b) bisect vs base tip,

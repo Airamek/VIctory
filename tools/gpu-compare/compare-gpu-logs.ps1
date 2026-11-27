@@ -38,7 +38,7 @@ $ErrorActionPreference = 'Stop'
 [System.Threading.Thread]::CurrentThread.CurrentUICulture = [cultureinfo]::InvariantCulture
 
 function Get-Median([double[]]$v) {
-  if ($v.Count -eq 0) { return [double]::NaN }
+  if ($null -eq $v -or $v.Count -eq 0) { return [double]::NaN }
   $s = $v | Sort-Object
   $n = $s.Count
   if ($n % 2 -eq 1) { return $s[[int]($n / 2)] }
@@ -139,14 +139,14 @@ function Merge-Side([string[]]$Files) {
     }
   }
   $med = @{}
-  foreach ($k in $agg.Scalars.Keys) { $med[$k] = Get-Median $agg.Scalars[$k].ToArray() }
+  foreach ($k in $agg.Scalars.Keys) { $med[$k] = Get-Median ([double[]]$agg.Scalars[$k].ToArray()) }
   $rows = @{}
   foreach ($key in $agg.Rows.Keys) {
     $ss = $agg.Rows[$key]
     $rows[$key] = @{
-      Ms = Get-Median @($ss | ForEach-Object { $_.Ms })
-      N  = Get-Median @($ss | ForEach-Object { $_.N })
-      Us = Get-Median @($ss | ForEach-Object { $_.Us })
+      Ms = Get-Median ([double[]]@($ss | ForEach-Object { $_.Ms }))
+      N  = Get-Median ([double[]]@($ss | ForEach-Object { $_.N }))
+      Us = Get-Median ([double[]]@($ss | ForEach-Object { $_.Us }))
     }
   }
   return @{ Files = $Files; Med = $med; Rows = $rows }
