@@ -952,4 +952,65 @@ mod tests {
         assert!(matches!(warm.made.get(), Some(None)));
         assert!(shader.translated.get().is_none());
     }
+
+    /// What the [`COMPILE_PERMITS`] cap costs: the permit itself (an
+    /// uncontended acquire/release, the only added work per compile), then
+    /// the queueing shape with a modelled compile hold and more workers than
+    /// slots. The second part is a model, not a driver measurement: it shows
+    /// how a batch of compiles serialises, which the real path cannot show
+    /// without a title and a GPU. Run alone (the permits are global):
+    /// `cargo test --release -p victory-gpu --lib -- --ignored --nocapture --test-threads=1 benchmark_compile_permit`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn benchmark_compile_permit() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // Phase 1: the permit's own cost, uncontended.
+        const ACQUIRES: u32 = 1_000_000;
+        let mut samples = [0.0; 9];
+        for sample in &mut samples {
+            let start = Instant::now();
+            for _ in 0..ACQUIRES {
+                drop(black_box(CompileGuard::take()));
+            }
+            *sample = start.elapsed().as_secs_f64() * 1e9 / ACQUIRES as f64;
+        }
+        samples.sort_by(f64::total_cmp);
+        println!("permit acquire+release: {:6.1} ns median", samples[4]);
+
+        // Phase 2: 10 workers (the real pool's max: 8 + 2 screen) each making
+        // a batch of compiles, against the cap. Each compile holds a slot for
+        // a modelled 200 us (a driver compile is seconds; the model keeps it
+        // cheap and the same for every worker count).
+        const HOLD: std::time::Duration = std::time::Duration::from_micros(200);
+        const COMPILES: u32 = 16;
+        for workers in [1usize, 3, 6, 10] {
+            let start = Instant::now();
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| {
+                        for _ in 0..COMPILES {
+                            let _slot = CompileGuard::take();
+                            let held = Instant::now();
+                            while held.elapsed() < HOLD {
+                                std::hint::spin_loop();
+                            }
+                        }
+                    });
+                }
+            });
+            let wall = start.elapsed().as_secs_f64() * 1e3;
+            // The least time the same work can take: as many compiles at a
+            // time as there are workers or slots, whichever is fewer.
+            let ideal = COMPILES as f64
+                * HOLD.as_secs_f64()
+                * 1e3
+                * (workers as f64 / workers.min(COMPILE_PERMITS) as f64);
+            println!(
+                "{workers:2} workers x {COMPILES} compiles: {wall:6.2} ms wall, {ideal:6.2} ms ideal ({:+.0}% queueing)",
+                (wall / ideal - 1.0) * 100.0
+            );
+        }
+    }
 }

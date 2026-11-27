@@ -1889,32 +1889,46 @@ fn evictable(shadow: &Arc<Shadow>, victim: &Victim) -> bool {
     true
 }
 
+/// Of copies last used at (frame, ms) and taking (bytes) each, those to give
+/// up at (`frame`, `now`): every one idle for [`crate::resource::IDLE_FRAMES`]
+/// and [`crate::resource::IDLE_MS`], then the least recently used others until
+/// `over` bytes are gone (indices into `uses`). The planning half of
+/// [`evict`], apart from the registries so it can be measured
+/// (`benchmark_evict_plan`).
+fn plan(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
+    use crate::resource::{IDLE_FRAMES, IDLE_MS};
+    let idle = |&(f, ms, _): &(u64, u64, u64)| {
+        frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS
+    };
+    let (mut gone, mut rest): (Vec<usize>, Vec<usize>) =
+        (0..uses.len()).partition(|&i| idle(&uses[i]));
+    let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
+    rest.sort_by_key(|&i| uses[i].1);
+    for i in rest {
+        if over == 0 {
+            break;
+        }
+        over = over.saturating_sub(uses[i].2);
+        gone.push(i);
+    }
+    gone
+}
+
 /// Gives up the copies the title has not used for [`crate::resource::IDLE_MS`]
 /// and [`crate::resource::IDLE_FRAMES`] at (`frame`, `now` ms), then the least
 /// recently used ones until `over` bytes are gone. Returns how many and their
 /// bytes.
 fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    use crate::resource::{IDLE_FRAMES, IDLE_MS};
     // Trailing fully free chunks go first (no title bytes in them), so the
     // pass below only gives up copies holding title bytes.
     arena().release_empty();
-    let idle = |s: &Arc<Shadow>| {
-        frame.saturating_sub(s.last[0].load(Relaxed)) >= IDLE_FRAMES
-            && now.saturating_sub(s.last[1].load(Relaxed)) >= IDLE_MS
-    };
     let found = candidates();
-    let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..found.len()).partition(|&i| idle(&found[i].0));
-    let bytes = |i: &usize| found[*i].0.len;
-    let mut over = over.saturating_sub(gone.iter().map(bytes).sum());
-    rest.sort_by_key(|&i| found[i].0.last[1].load(Relaxed));
-    for i in rest {
-        if over == 0 {
-            break;
-        }
-        over = over.saturating_sub(bytes(&i));
-        gone.push(i);
-    }
+    let uses: Vec<(u64, u64, u64)> = found
+        .iter()
+        .map(|(s, _)| (s.last[0].load(Relaxed), s.last[1].load(Relaxed), s.len))
+        .collect();
+    let gone = plan(&uses, frame, now, over);
     let mut count = 0u64;
     let mut freed = 0u64;
     for i in gone {
@@ -2008,18 +2022,24 @@ static SPARE_TRANSIENT: Mutex<Vec<(ID3D12Resource, usize, u64, u64)>> = Mutex::n
 const SPARE_TRANSIENT_MAX: usize = 16;
 const SPARE_TRANSIENT_BYTES: u64 = 64 << 20;
 
+/// The pooled buffer to reuse for `size` bytes: the smallest capacity that is
+/// at least `size` and within twice it (best fit), if any. The scan of the
+/// pool ([`SPARE_TRANSIENT_MAX`] entries at most) is the CPU cost of a
+/// pressure-served copy (`benchmark_spare_transient_fit`).
+fn spare_fit(caps: impl Iterator<Item = u64>, size: u64) -> Option<usize> {
+    let size = size.max(1);
+    let max_fit = size.saturating_mul(2);
+    caps.enumerate()
+        .filter(|(_, cap)| *cap >= size && *cap <= max_fit)
+        .min_by_key(|(_, cap)| *cap)
+        .map(|(i, _)| i)
+}
+
 /// A pooled transient buffer of at least `size` bytes (capacity within
 /// twice that, best fit): still charged to [`SHADOW_BYTES`] while pooled.
 fn take_transient_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8, u64, u64)> {
-    let size = size.max(1);
-    let max_fit = size.saturating_mul(2);
     let mut pool = SPARE_TRANSIENT.lock().unwrap_or_else(|e| e.into_inner());
-    let idx = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, _, _, cap))| *cap >= size && *cap <= max_fit)
-        .min_by_key(|(_, (_, _, _, cap))| *cap)
-        .map(|(i, _)| i)?;
+    let idx = spare_fit(pool.iter().map(|(_, _, _, cap)| *cap), size)?;
     let (buffer, data, gpu, cap) = pool.swap_remove(idx);
     Some((buffer, data as *mut u8, gpu, cap))
 }
@@ -2794,4 +2814,86 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+    /// Cost of the CPU half of [`evict`] ([`plan`]): idle partition plus LRU
+    /// sort over the copies a frame's registry holds. Isolates the new bound's
+    /// per-frame bookkeeping from the driver calls that make/free the copies.
+    /// Run with
+    /// `cargo test --release -p victory-gpu --lib -- --ignored --nocapture benchmark_evict_plan`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn benchmark_evict_plan() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        use crate::resource::{IDLE_FRAMES, IDLE_MS};
+        // A pass well after the idle thresholds: three candidates in four
+        // used recently, one idle for longer than both thresholds. The
+        // budget asks for about a tenth of the bytes (a pressure pass).
+        let (frame, now) = (10_000u64, 600_000u64);
+        let (idle_frame, idle_ms) = (frame - IDLE_FRAMES - 1, now - IDLE_MS - 1);
+        for count in [1024usize, 4096, 16_384] {
+            let uses: Vec<(u64, u64, u64)> = (0..count)
+                .map(|i| {
+                    let bytes = 2048 + (i as u64 % 32) * 1024;
+                    if i % 4 == 0 {
+                        (idle_frame, idle_ms, bytes)
+                    } else {
+                        (frame - (i as u64 % 60), now - (i as u64 % 20_000), bytes)
+                    }
+                })
+                .collect();
+            let total: u64 = uses.iter().map(|u| u.2).sum();
+            let over = total / 10;
+            let batch = (64 * 1024 / count).max(1);
+            let mut samples = [0.0; 9];
+            for sample in &mut samples {
+                let start = Instant::now();
+                for _ in 0..batch {
+                    black_box(plan(black_box(&uses), frame, now, over));
+                }
+                *sample = start.elapsed().as_secs_f64() * 1e9 / batch as f64;
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "{count:6} candidates: {:8.1} ns/pass median ({} chosen)",
+                samples[4],
+                plan(&uses, frame, now, over).len()
+            );
+        }
+    }
+
+    /// Cost of the CPU half of a pressure-served copy: the pool's best-fit
+    /// scan ([`spare_fit`], at most [`SPARE_TRANSIENT_MAX`] entries), against
+    /// the buffer make/copy that dominates the path. Run with
+    /// `cargo test --release -p victory-gpu --lib -- --ignored --nocapture benchmark_spare_transient_fit`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn benchmark_spare_transient_fit() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // A full pool, capacities spread as the copy sizes are (a few KB up
+        // to tens of MB).
+        let caps: Vec<u64> = (0..SPARE_TRANSIENT_MAX)
+            .map(|i| 4096u64 << (i % 13))
+            .collect();
+        for size in [2048u64, 8192, 1 << 20, 8 << 20] {
+            let mut samples = [0.0; 9];
+            for sample in &mut samples {
+                const CALLS: u32 = 200_000;
+                let start = Instant::now();
+                for _ in 0..CALLS {
+                    black_box(spare_fit(black_box(caps.iter().copied()), black_box(size)));
+                }
+                *sample = start.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "{size:8} bytes over {} pooled: {:6.1} ns/call median (fit: {:?})",
+                caps.len(),
+                samples[4],
+                spare_fit(caps.iter().copied(), size)
+            );
+        }
+    }
 }
