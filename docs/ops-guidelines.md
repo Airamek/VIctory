@@ -60,8 +60,13 @@
 
 ## 3. Task pattern
 1. Split: one task = one branch / one question / one gate. No mega-tasks.
-2. Assign: worktree per task (`D:/dev/VIctory-*`), target dir per task
-   (`D:\victory-target\<name>`, D: only — C: is system-volatile).
+2. Assign: worktree per task (`D:/dev/VIctory-*`); target dir per task —
+   cold storage on D: (`D:\victory-target\<name>`), but HOT-LOOP testing
+   (serial 10x, parallel measurement, heavy gates) belongs on the SSD in a
+   short path (`C:\vt\<name>` — faster link + test-binary load on NVMe).
+   SSD targets are scratch: delete them when the task closes and report
+   reclaimed GB; NEVER let C: below 30 GB free; `C:\Games` is exempt, never
+   touched by cleanup.
 3. Prove: gates per merge (workspace serial `--jobs 1` + clippy
    all-targets/all-features `-D warnings` + policy; census adjudication for
    flakes: solo + base-solo + group-decider; parallel-only proven flakes get
