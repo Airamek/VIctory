@@ -246,6 +246,7 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn descriptions_keep_the_pc_layout() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(std::mem::size_of::<Desc>(), 40);
         assert_eq!(std::mem::offset_of!(Desc, parameter_count), 0);
         assert_eq!(std::mem::offset_of!(Desc, parameters), 8);
@@ -259,6 +260,7 @@ mod tests {
 
     #[test]
     fn console_flags_are_dropped_and_the_rest_kept() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(CONSOLE_FLAGS, 0xff00_0000);
         let desc = Desc {
             parameter_count: 2,
@@ -284,6 +286,7 @@ mod tests {
 
     #[test]
     fn serializers_reject_a_null_description() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut blob = std::ptr::null_mut();
         let mut error = std::ptr::null_mut();
         assert_eq!(
@@ -301,6 +304,7 @@ mod tests {
     /// (an access violation in `d3d12.dll`); an empty blob is malformed.
     #[test]
     fn deserializer_creation_rejects_missing_arguments() {
+        let _gpu = crate::host::gpu_test_lock();
         let iid = ROOT_SIGNATURE_IIDS[0];
         let mut out = std::ptr::null_mut();
         assert_eq!(
@@ -324,6 +328,7 @@ mod tests {
 
     #[test]
     fn creating_a_root_signature_checks_its_arguments() {
+        let _gpu = crate::host::gpu_test_lock();
         let iid = ROOT_SIGNATURE_IIDS[0];
         let mut out = std::ptr::null();
         assert_eq!(
@@ -385,6 +390,7 @@ mod tests {
 
     #[test]
     fn every_known_interface_creates_a_working_object() {
+        let _gpu = crate::host::gpu_test_lock();
         let root = created(&ROOT_SIGNATURE_IIDS[0]);
         let query = slot::<extern "system" fn(This, *const Iid, *mut This) -> HRESULT>(root, 0);
         for iid in &ROOT_SIGNATURE_IIDS {
@@ -406,6 +412,7 @@ mod tests {
 
     #[test]
     fn the_table_has_the_object_and_device_child_slots() {
+        let _gpu = crate::host::gpu_test_lock();
         let root = created(&ROOT_SIGNATURE_IIDS[1]);
         // SetPrivateDataInterface is the one object method left out.
         assert_eq!(
@@ -435,6 +442,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn host_serialized_blobs_create_root_signatures() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
             D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY_ALL,
@@ -477,6 +485,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn our_blobs_deserialize_on_the_host() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::Win32::Graphics::Direct3D12::ID3D12RootSignatureDeserializer;
         use windows::core::Interface;
         let desc = VersionedDesc {
@@ -515,6 +524,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn versioned_descriptions_serialize_on_the_host() {
+        let _gpu = crate::host::gpu_test_lock();
         let desc = VersionedDesc {
             version: 1,
             desc: Desc {
@@ -541,6 +551,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn malformed_blobs_are_rejected_by_the_host() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::Win32::Graphics::Direct3D12::ID3D12RootSignatureDeserializer;
         use windows::core::Interface;
         let desc = VersionedDesc {

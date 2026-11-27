@@ -230,6 +230,7 @@ mod tests {
     /// its resource (a view's slot, a list), and is once nothing does.
     #[test]
     fn a_range_is_reused_only_once_nothing_holds_its_texture() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::Win32::Graphics::Dxgi::Common::*;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -264,6 +265,7 @@ mod tests {
 
     #[test]
     fn ranges_are_taken_first_fit_and_joined_when_given_back() {
+        let _gpu = crate::host::gpu_test_lock();
         let k = 64 << 10;
         let mut free = BTreeMap::from([(0, 10 * k)]);
         let a = take(&mut free, 3 * k, k).unwrap();

@@ -511,6 +511,7 @@ mod tests {
 
     #[test]
     fn translations_come_back_from_the_cache() {
+        let _gpu = crate::host::gpu_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];
@@ -572,6 +573,7 @@ mod tests {
     /// a file now) is handed back as it was made, not made again.
     #[test]
     fn a_translation_is_made_once_when_its_entry_cannot_be_written() {
+        let _gpu = crate::host::gpu_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("cache");
         let cache = Cache::open(&root).unwrap();
@@ -592,6 +594,7 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
+        let _gpu = crate::host::gpu_test_lock();
         let k = key("0123456789abcdef", b"encoding", 1 << 20);
         assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
         assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
@@ -627,6 +630,7 @@ mod tests {
 
     #[test]
     fn entries_round_trip_and_reject_damage() {
+        let _gpu = crate::host::gpu_test_lock();
         let bytes = encode(&Ok(shader()), &used());
         assert_eq!(decode(&bytes), Some((Ok(shader()), used())));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);

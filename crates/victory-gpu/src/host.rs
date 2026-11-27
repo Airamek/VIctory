@@ -24,7 +24,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+#[cfg(not(test))]
+use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
@@ -229,7 +231,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 /// host fence instead, and the completion thread finishes what has run).
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Waited {
+pub(crate) enum Waited {
     /// The host signalled the submission's fence.
     Done,
     /// The device was removed while the submission ran.
@@ -242,12 +244,12 @@ enum Waited {
 /// How long one wait for a submission lasts before the device is asked
 /// whether it is still there.
 #[cfg(test)]
-const WAIT_SLICE_MS: u32 = 250;
+pub(crate) const WAIT_SLICE_MS: u32 = 250;
 
 /// A submission still running after this many seconds is said so, and again
 /// each time that time has doubled.
 #[cfg(test)]
-const LONG_WAIT_SECS: u64 = 10;
+pub(crate) const LONG_WAIT_SECS: u64 = 10;
 
 /// A submission still running after this many seconds is given up. A host
 /// whose GPU faults may neither finish the work nor report the device
@@ -259,7 +261,7 @@ const LONG_WAIT_SECS: u64 = 10;
 /// never finishes brings about; this is below that, so the run ends with
 /// our report of the cause and not with the title's.
 #[cfg(test)]
-const STALL_SECS: u64 = 25;
+pub(crate) const STALL_SECS: u64 = 25;
 
 /// Waits for a submission: `signalled` waits one slice ([`WAIT_SLICE_MS`])
 /// for its fence and says whether it came. Between slices `removed` asks
@@ -270,7 +272,7 @@ const STALL_SECS: u64 = 25;
 /// `long` is told the seconds waited so far, at [`LONG_WAIT_SECS`] and each
 /// doubling of it; at [`STALL_SECS`] the wait is given up.
 #[cfg(test)]
-fn wait_for_submission(
+pub(crate) fn wait_for_submission(
     mut signalled: impl FnMut() -> bool,
     mut removed: impl FnMut() -> bool,
     mut long: impl FnMut(u64),
@@ -294,6 +296,24 @@ fn wait_for_submission(
             report_at *= 2;
         }
     }
+}
+
+/// Serializes GPU-touching tests process-wide (determinism item 3): every
+/// test in this crate holds it for its whole body, so two tests' GPU work
+/// and process-global state (registries, guard pages, title memory, the
+/// compiler DLL) never overlap. This generalizes `submissions::GATE_LOCK`
+/// and the snapshot single-test lock, which it replaces: one lock means no
+/// lock ordering to get wrong. Poison-tolerant, so a failed test never
+/// wedges the suite. Production code never takes it, and tests never call
+/// other tests, so it cannot deadlock.
+#[cfg(test)]
+pub(crate) static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds [`GPU_TEST_LOCK`] for a whole test body: the first line of every
+/// test in this crate.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
@@ -612,6 +632,7 @@ pub(crate) mod tests {
     /// gone and the fence never will.
     #[test]
     fn a_wait_for_a_submission_ends_when_the_device_is_removed() {
+        let _gpu = crate::host::gpu_test_lock();
         use super::{LONG_WAIT_SECS, STALL_SECS, WAIT_SLICE_MS, Waited, wait_for_submission};
         let slices_per_sec = 1000 / u64::from(WAIT_SLICE_MS);
         // The fence comes in the third slice: the device is asked twice.
@@ -698,6 +719,7 @@ pub(crate) mod tests {
 
     #[test]
     fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
+        let _gpu = crate::host::gpu_test_lock();
         use super::{Duration, Instant, SwapChainRetry};
 
         let start = Instant::now();
@@ -726,6 +748,7 @@ pub(crate) mod tests {
     /// prelude/first `move_texture(SHADER_RESOURCE)`.
     #[test]
     fn copy_queue_barrier_order_leaves_textures_readable() {
+        let _gpu = crate::host::gpu_test_lock();
         const COMMON: u32 = 0;
         const COPY_DEST: u32 = 0x400;
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
@@ -768,6 +791,7 @@ pub(crate) mod tests {
     /// `record_upload` (COPY entries start at COMMON).
     #[test]
     fn copy_prelude_records_no_shader_resource_side_transitions() {
+        let _gpu = crate::host::gpu_test_lock();
         const COMMON: u32 = 0;
         const CODE_COMMON: u32 = 0x1;
         const COPY_DEST: u32 = 0x400;
@@ -846,6 +870,7 @@ pub(crate) mod tests {
     /// and `replay`'s before-state chaining.
     #[test]
     fn copy_prelude_names_reuploads_through_common() {
+        let _gpu = crate::host::gpu_test_lock();
         const COMMON: u32 = 0;
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
@@ -943,6 +968,7 @@ pub(crate) mod tests {
     /// byte-exactness proves the copies ran where the barriers say.
     #[test]
     fn copy_engine_uploads_leave_common_and_read_back_exact() {
+        let _gpu = crate::host::gpu_test_lock();
         use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::core::Interface;
@@ -1144,6 +1170,7 @@ pub(crate) mod tests {
     /// unaffected: they are recorded for both kinds.
     #[test]
     fn copy_lists_emit_no_gpu_timing_queries() {
+        let _gpu = crate::host::gpu_test_lock();
         // One list's query-heap operations for `notes` noted commands, in
         // order: the busy-pair start stamp, one timestamp per noted
         // command, and `close`'s end stamp, its resolve, and the busy-pair
@@ -1197,6 +1224,7 @@ pub(crate) mod tests {
     /// other host tests do).
     #[test]
     fn copy_queue_offload_is_gated_and_timeline_waits_for_both_queues() {
+        let _gpu = crate::host::gpu_test_lock();
         // Rollout switch: default off (no `VICTORY_COPY_QUEUE` in the test
         // environment). When on, uploads move to the copy list; when off,
         // they stay on the direct queue exactly as before.
@@ -1236,6 +1264,7 @@ pub(crate) mod tests {
     /// forgotten, and a forgotten slot's next read is taken again.
     #[test]
     fn read_marks_of_both_bitmaps_are_taken() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else { return };
         // No submission takes the marks meanwhile.
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1258,6 +1287,7 @@ pub(crate) mod tests {
     /// only once), and the marks are cleared for the next.
     #[test]
     fn heap_reads_since_the_last_pass_name_their_textures() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else { return };
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
@@ -1295,6 +1325,7 @@ pub(crate) mod tests {
     /// as used; a list of ours (uploads) does not.
     #[test]
     fn textures_read_every_frame_stay_and_title_lists_stamp_theirs() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else { return };
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
@@ -1357,6 +1388,7 @@ pub(crate) mod tests {
     /// uploaded; read in the last pass, it is.
     #[test]
     fn heap_textures_unread_lately_are_not_brought_up() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else { return };
         let address = crate::watch::tests::pool(1) as u64;
         let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
@@ -1385,6 +1417,7 @@ pub(crate) mod tests {
     /// side, each into its own staging and its own upload.
     #[test]
     fn heap_textures_brought_up_together_each_get_their_upload() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else { return };
         let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
         let pool = crate::watch::tests::pool(6);
@@ -1419,6 +1452,7 @@ pub(crate) mod tests {
 
     #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         let first = list.scratch(1).unwrap();
@@ -1445,6 +1479,7 @@ pub(crate) mod tests {
 
     #[test]
     fn present_compositor_builds_both_pipeline_states() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else {
             eprintln!("skipping compositor initialization: no D3D12 device");
             return;
@@ -1456,6 +1491,7 @@ pub(crate) mod tests {
 
     #[test]
     fn warp_adapter_accepts_only_software() {
+        let _gpu = crate::host::gpu_test_lock();
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
         let raw = unsafe {
@@ -1485,6 +1521,7 @@ pub(crate) mod tests {
     /// different list or an unnamed node never matches.
     #[test]
     fn a_breadcrumb_node_is_found_by_pointer_or_by_name() {
+        let _gpu = crate::host::gpu_test_lock();
         let ours = [0x1000, 0x1008];
         let name = list_name(7);
         let is = |pointer, text| node_is_list(pointer, text, &ours, &name);
@@ -1513,6 +1550,7 @@ pub(crate) mod tests {
     /// are all there, and another list's are not.
     #[test]
     fn a_list_knows_every_pointer_it_answers_with() {
+        let _gpu = crate::host::gpu_test_lock();
         // SAFETY: plain device and list creation on the software adapter.
         unsafe {
             let Ok(adapter) = warp_adapter() else { return };
@@ -1554,6 +1592,7 @@ pub(crate) mod tests {
     /// list the runtime records under another object.
     #[test]
     fn is_node_reads_the_name_the_runtime_copied() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else { return };
         let Ok(list) = host.new_list() else { return };
         let mut wide: Vec<u16> = list_name(list.id).encode_utf16().collect();
@@ -3377,21 +3416,76 @@ impl Host {
                 return;
             }
             let started = std::time::Instant::now();
-            let waited = EVENT.with(|e| {
-                self.fence
-                    .SetEventOnCompletion(value, e.0)
-                    .map(|()| WaitForSingleObject(e.0, INFINITE))
-            });
-            if let Err(e) = waited {
-                tracing::warn!(error = %e, "host fence wait failed; polling");
-                while self.fence.GetCompletedValue() < value {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+            // Tests never wait without an end: a lost device or a hung
+            // submission fails the test instead of piling every test thread
+            // behind an INFINITE wait (freeze-class post-mortem §137-138).
+            #[cfg(test)]
+            match self.wait_gpu_test(value) {
+                Waited::Done => {}
+                Waited::Removed => fail(format_args!(
+                    "host GPU device removed while waiting for submission {value}"
+                )),
+                Waited::Stalled => fail(format_args!(
+                    "submission {value} stalled: no fence and no removal after {STALL_SECS}s"
+                )),
+            }
+            #[cfg(not(test))]
+            {
+                let waited = EVENT.with(|e| {
+                    self.fence
+                        .SetEventOnCompletion(value, e.0)
+                        .map(|()| WaitForSingleObject(e.0, INFINITE))
+                });
+                if let Err(e) = waited {
+                    tracing::warn!(error = %e, "host fence wait failed; polling");
+                    while self.fence.GetCompletedValue() < value {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
             }
             if counted {
                 SUBMISSION_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Tests: the direct queue's fence `value` on bounded slices. Each slice
+    /// parks this thread for [`WAIT_SLICE_MS`], then re-checks the fence and
+    /// the device, so a removed device or an exhausted [`STALL_SECS`]
+    /// budget ends the wait. The caller fails the test on anything but
+    /// [`Waited::Done`].
+    #[cfg(test)]
+    fn wait_gpu_test(&self, value: u64) -> Waited {
+        // SAFETY: plain calls on our fence and this thread's event.
+        unsafe {
+            EVENT.with(|e| {
+                let _ = self.fence.SetEventOnCompletion(value, e.0);
+                wait_for_submission(
+                    || {
+                        if self.fence.GetCompletedValue() >= value {
+                            return true;
+                        }
+                        // One slice of the stall budget: park this thread on
+                        // the fence event, then re-check.
+                        let _signalled = WaitForSingleObject(e.0, WAIT_SLICE_MS);
+                        self.fence.GetCompletedValue() >= value
+                    },
+                    || self.removed(),
+                    |secs| {
+                        tracing::warn!(
+                            "still waiting for submission {value} after {secs}s (stall budget {STALL_SECS}s)"
+                        );
+                    },
+                )
+            })
+        }
+    }
+
+    /// Tests: whether the device was removed (a plain query).
+    #[cfg(test)]
+    pub(crate) fn removed(&self) -> bool {
+        // SAFETY: a plain query.
+        unsafe { self.device.GetDeviceRemovedReason().is_err() }
     }
 
     /// Blocks until the copy engine has run what signals `value` (no-op
@@ -3407,20 +3501,65 @@ impl Host {
                 return;
             }
             let started = std::time::Instant::now();
-            let waited = EVENT.with(|e| {
-                fence
-                    .SetEventOnCompletion(value, e.0)
-                    .map(|()| WaitForSingleObject(e.0, INFINITE))
-            });
-            if let Err(e) = waited {
-                tracing::warn!(error = %e, "host copy fence wait failed; polling");
-                while fence.GetCompletedValue() < value {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+            // Tests never wait without an end: as above, a lost device or a
+            // hung submission fails the test instead of wedging the suite.
+            #[cfg(test)]
+            match self.wait_copy_test(fence, value) {
+                Waited::Done => {}
+                Waited::Removed => fail(format_args!(
+                    "host GPU device removed while waiting for copy submission {value}"
+                )),
+                Waited::Stalled => fail(format_args!(
+                    "copy submission {value} stalled: no fence and no removal after {STALL_SECS}s"
+                )),
+            }
+            #[cfg(not(test))]
+            {
+                let waited = EVENT.with(|e| {
+                    fence
+                        .SetEventOnCompletion(value, e.0)
+                        .map(|()| WaitForSingleObject(e.0, INFINITE))
+                });
+                if let Err(e) = waited {
+                    tracing::warn!(error = %e, "host copy fence wait failed; polling");
+                    while fence.GetCompletedValue() < value {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
             }
             if counted {
                 SUBMISSION_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// Tests: the copy queue's fence `value` on bounded slices, as
+    /// [`Host::wait_gpu_test`]: the caller fails the test on anything but
+    /// [`Waited::Done`].
+    #[cfg(test)]
+    fn wait_copy_test(&self, fence: &ID3D12Fence, value: u64) -> Waited {
+        // SAFETY: plain calls on our fence and this thread's event.
+        unsafe {
+            EVENT.with(|e| {
+                let _ = fence.SetEventOnCompletion(value, e.0);
+                wait_for_submission(
+                    || {
+                        if fence.GetCompletedValue() >= value {
+                            return true;
+                        }
+                        // One slice of the stall budget: park this thread on
+                        // the fence event, then re-check.
+                        let _signalled = WaitForSingleObject(e.0, WAIT_SLICE_MS);
+                        fence.GetCompletedValue() >= value
+                    },
+                    || self.removed(),
+                    |secs| {
+                        tracing::warn!(
+                            "still waiting for copy submission {value} after {secs}s (stall budget {STALL_SECS}s)"
+                        );
+                    },
+                )
+            })
         }
     }
 
@@ -6628,6 +6767,7 @@ mod title_copies {
 
     #[test]
     fn title_copies_reach_mapped_destinations_and_stop_at_unmapped_pages() {
+        let _gpu = crate::host::gpu_test_lock();
         let from = pattern();
         // All mapped: copied, through a destination that was never asked.
         let to = holed(0xee);
@@ -6652,6 +6792,7 @@ mod title_copies {
 
     #[test]
     fn copy_back_writes_mapped_pages_only() {
+        let _gpu = crate::host::gpu_test_lock();
         let from = pattern();
         let to = holed(0xee);
         write_mapped(to, from.as_ptr(), 3 * BLOCK);
@@ -6681,6 +6822,7 @@ mod title_copies {
 
     #[test]
     fn safe_copy_handles_valid_unaligned_and_unmapped_memory() {
+        let _gpu = crate::host::gpu_test_lock();
         for len in [0usize, 1, 7, 8, 15, 16, 31, 63, 64, 65, 129, 4096, 70_000] {
             let src: Vec<u8> = (0..len).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
             let mut dst = vec![0xAAu8; len];
@@ -6739,6 +6881,7 @@ mod title_copies {
     /// `PAGE_GUARD`. Mirrors `title_copy`'s `guard_pages_stay_guarded`.
     #[test]
     fn safe_copy_keeps_armed_guard_pages_armed() {
+        let _gpu = crate::host::gpu_test_lock();
         for (start, len) in [
             (PAGE, 1),
             (PAGE + 2000, 100),
@@ -8763,6 +8906,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// GPU: the merge is decided on addresses alone.
     #[test]
     fn adjacent_copy_steps_merge_into_one_contiguous_run() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut steps: Vec<Step> = Vec::new();
         HostList::push_copy(&mut steps, 0x1000, 0x2000, 0, true);
         assert!(steps.is_empty(), "a zero-length copy records nothing");
@@ -8808,6 +8952,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// itself stays with the caller.
     #[test]
     fn waits_cover_everything_up_to_the_newest_one_waited_for() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut settled = 0;
         assert_eq!(wait_for(&mut settled, None), None);
         assert_eq!(settled, 0, "nothing in flight: nothing waited");
@@ -8826,6 +8971,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// addresses alone.
     #[test]
     fn only_a_redirecting_repeat_splits_the_call() {
+        let _gpu = crate::host::gpu_test_lock();
         assert!(!needs_cut(false, false), "a first run never splits");
         assert!(
             !needs_cut(false, true),
@@ -8848,6 +8994,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// with no snapshot).
     #[test]
     fn pending_pins_its_lists_and_reports_submit_time_pipelines() {
+        let _gpu = crate::host::gpu_test_lock();
         use std::sync::Arc;
         // The contract the fix establishes on the real types: submissions
         // are built from `Arc`s, and name `Arc`s plus a pipelines snapshot.
@@ -8905,6 +9052,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// between them. Needs no GPU: the merge is decided on addresses alone.
     #[test]
     fn ranges_of_a_copy_stay_disjoint() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut rs = vec![];
         push_range(&mut rs, COALESCE, 0x1_0000, 0x1_1000);
         push_range(&mut rs, COALESCE, 0x40_0000, 0x40_1000);
@@ -8946,6 +9094,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// copied pages 0 and 2 and skipped 1).
     #[test]
     fn the_gap_between_copied_ranges_is_not_covered() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut copied = vec![(0x1_0000, 0x1_1000)];
         push_copied(&mut copied, 0x2_1000, 0x2_2000);
         // A page apart: not joined, the gap between them stays pending.
@@ -8986,6 +9135,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// without one.
     #[test]
     fn distant_refreshes_of_a_copy_are_copied_apart() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let p = crate::watch::tests::pool(8);
         let len = 8 * PAGE;
@@ -9014,6 +9164,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// of #2473). Needs a host GPU; passes by without one.
     #[test]
     fn a_page_copied_in_two_halves_is_refreshed_whole() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
@@ -9041,6 +9192,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// passes by without one.
     #[test]
     fn a_page_between_flushed_ranges_is_refreshed_when_asked_for() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
@@ -9066,6 +9218,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// generation and dirtiness) hits; anything else misses.
     #[test]
     fn hull_cache_hits_only_covered_repeats_at_the_same_generation() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut hull = HullCache::default();
         assert!(!hull.hit(7, 100, 50, 3, true), "nothing queued yet");
         hull.note(7, 100, 50, 3, true);
@@ -9093,6 +9246,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// passes by without one, like the batch test above.
     #[test]
     fn cached_hull_ranges_queue_once_until_a_title_write() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
@@ -9127,6 +9281,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// passes by without one.
     #[test]
     fn upload_buffers_are_pooled_across_list_resets() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::core::Interface;
         let Some(host) = super::host() else {
             return; // no host GPU here
@@ -9156,6 +9311,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// its pool window clear of the 4 KiB upload-pool test's.
     #[test]
     fn readback_buffers_are_never_pooled_as_uploads() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::core::Interface;
         let Some(host) = super::host() else {
             return; // no host GPU here
@@ -9187,6 +9343,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// without one.
     #[test]
     fn readback_buffers_are_not_retired_into_the_upload_pool() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::core::Interface;
         let Some(host) = super::host() else {
             return; // no host GPU here
@@ -9237,6 +9394,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// only after a step that writes title memory.
     #[test]
     fn a_copy_is_refreshed_once_per_submission_by_the_pages_written() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
@@ -9274,6 +9432,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// share the guard lock, so threads convoyed — see `Batch::flush`).
     #[test]
     fn flush_copies_each_copy_once() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         const COPIES: usize = 20;
         let mut pools = Vec::with_capacity(COPIES);
@@ -9329,9 +9488,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// the snapshots' test lock: the block is one for all copies.
     #[test]
     fn parallel_copy_back_goes_back_in_every_range() {
-        let _one = crate::shadow::snapshot_tests::ONE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         const COPIES: usize = 16;
         let mut pools = Vec::with_capacity(COPIES);
@@ -9391,6 +9548,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// Copy threads stay serial under the threshold and fan out above it.
     #[test]
     fn copy_threads_fan_out_above_the_threshold() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(copy_threads(0), 1);
         assert_eq!(copy_threads(PARALLEL_ENTRIES - 1), 1);
         assert!(copy_threads(PARALLEL_ENTRIES) >= 2);
@@ -9401,6 +9559,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// Needs no GPU: the queue and drop checks below run on these.
     #[test]
     fn copy_ranges_overlap_by_their_bytes() {
+        let _gpu = crate::host::gpu_test_lock();
         assert!(ranges_overlap(&[(100, 200)], 150, 10), "inside");
         assert!(ranges_overlap(&[(100, 200)], 90, 20), "reaching in from below");
         assert!(ranges_overlap(&[(100, 200)], 190, 20), "reaching in from above");
@@ -9419,6 +9578,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// over them. Needs a host GPU; passes by without one.
     #[test]
     fn buffer_copies_queue_for_the_gpu_until_a_step_touches_them() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -9527,6 +9687,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// by without one.
     #[test]
     fn buffer_copies_sharing_a_buffer_in_opposite_roles_are_refused() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -9616,6 +9777,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// without one.
     #[test]
     fn buffer_copies_from_non_copy_states_stay_on_the_cpu() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -9725,6 +9887,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
     /// here. Needs a host GPU; passes by without one.
     #[test]
     fn buffer_copies_with_non_copy_states_fall_back_whole_batch_to_direct() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -9831,6 +9994,7 @@ mod withholding {
     /// along.
     #[test]
     fn only_programs_using_title_memory_are_withheld() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let Some(host) = super::host() else {
             return; // no host GPU here
@@ -9876,15 +10040,9 @@ mod withholding {
 
 #[cfg(test)]
 mod submissions {
-    use std::sync::Mutex;
-
     use windows::Win32::Graphics::Direct3D12::{D3D12_FENCE_FLAG_NONE, ID3D12Fence};
 
     use crate::queue::Written;
-
-    /// Serializes tests that temporarily gate the shared host queue so two
-    /// gates never overlap.
-    static GATE_LOCK: Mutex<()> = Mutex::new(());
 
     /// Private fence armed via `Host::execute_gated`; always signalled on drop
     /// so even a test panic cannot leave the shared host queue stalled.
@@ -9913,8 +10071,8 @@ mod submissions {
 
     #[test]
     fn a_list_reset_while_it_runs_records_into_fresh_memory() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = super::host() else { return }; // no host GPU here
-        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let list = host.new_list().unwrap();
         let (first, second) = (Box::new(0u64), Box::new(0u64));
         list.defer_write((&raw const *first).cast_mut().cast(), Written::Value(7), 8);
@@ -9950,10 +10108,10 @@ mod submissions {
     /// submit-time set. Needs a host GPU; passes by without one.
     #[test]
     fn an_in_flight_submission_pins_its_list_against_recycling() {
+        let _gpu = crate::host::gpu_test_lock();
         use std::sync::Arc;
         use std::time::Duration;
         let Some(host) = super::host() else { return }; // no host GPU here
-        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         host.drain();
         let list = host.new_list().unwrap();
         list.used_pipeline("submit-time-pipe");
@@ -10023,8 +10181,8 @@ mod submissions {
     /// finished (bottom-of-pipe write included) once the next one begins.
     #[test]
     fn a_present_waits_for_the_previous_frame_not_its_own() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = super::host() else { return }; // no host GPU here
-        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let word = Box::new(0u64);
         let list = host.new_list().unwrap();
         list.defer_write((&raw const *word).cast_mut().cast(), Written::Value(5), 8);
@@ -10050,9 +10208,9 @@ mod submissions {
     /// run with their own barriers, and nothing waits on the CPU.
     #[test]
     fn a_list_named_twice_in_a_submission_has_two_preludes() {
+        let _gpu = crate::host::gpu_test_lock();
         use std::sync::atomic::Ordering;
         let Some(host) = super::host() else { return };
-        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         let iid = crate::object::guid(
             0x696442be,
@@ -10111,8 +10269,8 @@ mod submissions {
 
     #[test]
     fn a_repeated_list_reads_its_own_upload_memory() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = super::host() else { return };
-        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (word, later) = (Box::new(0x1111_1111u32), Box::new(0x2222_2222u32));
         let (out, seen) = host.shared_buffer(256).unwrap();
         // SAFETY: our mapped buffer of 256 bytes.
@@ -10162,9 +10320,9 @@ mod submissions {
     /// the CPU path runs without a host GPU, when this returns early).
     #[test]
     fn deferred_buffer_copies_reach_title_memory_and_their_shadows() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let Some(host) = super::host() else { return };
-        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (p, q) = (crate::watch::tests::pool(1), crate::watch::tests::pool(1));
         crate::shadow::register(p, p as u64, PAGE as u64);
         crate::shadow::register(q, q as u64, PAGE as u64);
@@ -10213,6 +10371,7 @@ mod submissions {
 
     #[test]
     fn signals_follow_the_writes_of_earlier_submissions() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = super::host() else { return };
         let list = host.new_list().unwrap();
         let word: &'static mut u64 = Box::leak(Box::new(0));
@@ -10233,8 +10392,8 @@ mod submissions {
 
     #[test]
     fn a_step_reading_what_an_earlier_submission_writes_waits_for_it() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = super::host() else { return };
-        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (first, second) = (host.new_list().unwrap(), host.new_list().unwrap());
         let word = Box::new(0u64);
         let at = (&raw const *word).cast_mut().cast::<u8>();
@@ -10267,8 +10426,8 @@ mod submissions {
 
     #[test]
     fn a_plane_fill_reading_what_an_earlier_submission_writes_waits_for_it() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = super::host() else { return };
-        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (first, second) = (host.new_list().unwrap(), host.new_list().unwrap());
         let word = Box::new(0u64);
         let at = (&raw const *word).cast_mut().cast::<u8>();
@@ -10316,11 +10475,11 @@ mod submissions {
 
     #[test]
     fn dynamic_descriptor_leases_stay_held_until_async_submission_finishes() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::descriptor::{HeapDesc, create_heap, heap};
         use crate::object::{S_OK, This, guid, slot};
 
         let Some(host) = super::host() else { return };
-        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         #[repr(C)]
         struct ExtendedHeapDesc {
             words: [u32; 4], // kind=0 (views), count=8, flags=1 (shader visible), nodes=0
@@ -10392,6 +10551,7 @@ mod timing_report {
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn stamps_leave_room_for_the_busy_pair() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(STAMPS, 16384);
         assert_eq!(BUSY_START, STAMPS - 2);
         assert_eq!(BUSY_END, STAMPS - 1);
@@ -10401,6 +10561,7 @@ mod timing_report {
 
     #[test]
     fn cost_rows_split_kind_then_pipeline() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(cost_kind("draw 36x1 [vs ab, ps cd] | u0=0x1"), "draw");
         assert_eq!(cost_kind("indexed 6x2 [vs ab, ps cd]"), "indexed");
         assert_eq!(cost_kind("dispatch 4x2x2 [cs ab]"), "dispatch");
@@ -10417,6 +10578,7 @@ mod timing_report {
 
     #[test]
     fn draws_count_instances_and_groups() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(parse_draws("draw 36x1 [vs ab]"), 1);
         assert_eq!(parse_draws("indexed 6x3 [vs ab]"), 3);
         assert_eq!(parse_draws("dispatch 4x2x2 [cs ab]"), 16);
@@ -10427,6 +10589,7 @@ mod timing_report {
 
     #[test]
     fn cuts_groups_hold_their_runs() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(group_members(&[0, 2], &[0, 4]), vec![vec![0, 1]]);
         assert_eq!(group_members(&[0, 2, 3], &[0, 2, 4]), vec![vec![0], vec![1, 2]]);
         assert_eq!(group_members(&[], &[0]), Vec::<Vec<usize>>::new());
@@ -10434,6 +10597,7 @@ mod timing_report {
 
     #[test]
     fn residual_is_busy_minus_noted_clamped() {
+        let _gpu = crate::host::gpu_test_lock();
         let residual = |busy: f64, noted: f64| (busy - noted).max(0.0);
         assert_eq!(residual(3.0, 2.0), 1.0);
         assert_eq!(residual(2.0, 2.0), 0.0);
@@ -10459,6 +10623,7 @@ mod fills {
     /// read as zeros while its mapped ones are copied.
     #[test]
     fn steps_run_in_order_and_unmapped_pages_read_as_zeros() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(list) = list() else {
             return; // no host GPU
         };
@@ -10540,6 +10705,7 @@ mod copy_order {
     /// and its destination order against the declared writes.
     #[test]
     fn a_copy_past_a_gpu_write_sees_what_it_wrote() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let Some(host) = super::host() else {
             return; // no host GPU here
@@ -10594,6 +10760,7 @@ mod present_plane_tests {
 
     #[test]
     fn compositor_failure_presents_primary_in_the_same_frame() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else {
             eprintln!("skipping PresentX recovery: no D3D12 device");
             return;

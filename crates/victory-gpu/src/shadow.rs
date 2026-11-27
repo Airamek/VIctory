@@ -42,6 +42,7 @@ fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
 
 #[test]
 fn writeback_merge_matches_bytewise_oracle() {
+    let _gpu = crate::host::gpu_test_lock();
     for len in [0, 1, 63, 64, 65, 193, 65_536] {
         let old = vec![0x11; len];
         for stride in [1, 5, 67, len + 1] {
@@ -2369,6 +2370,7 @@ pub(crate) mod tests {
     /// goes back, and a title write made after the refresh is not undone.
     #[test]
     fn title_writes_under_a_busy_range_are_copied() {
+        let _gpu = crate::host::gpu_test_lock();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -2405,6 +2407,7 @@ pub(crate) mod tests {
     /// the title changes it.
     #[test]
     fn bytes_off_the_runtimes_memory_are_copied_at_each_use() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::tests::{MEM_WRITE_WATCH, free};
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
@@ -2466,6 +2469,7 @@ pub(crate) mod tests {
     /// 256 bytes) in, do not overlap, and join again when given back.
     #[test]
     fn arena_runs_are_aligned_to_their_elements_and_join_again() {
+        let _gpu = crate::host::gpu_test_lock();
         if host().is_none() {
             return; // no host GPU here
         }
@@ -2492,7 +2496,7 @@ pub(crate) mod tests {
     /// ranges declared it, and nothing else does.
     #[test]
     fn snapshots_cover_the_declared_ranges_and_writes_go_back_once() {
-        let _one = snapshot_tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _gpu = crate::host::gpu_test_lock();
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
         register(p, p as u64, len as u64);
@@ -2527,6 +2531,7 @@ pub(crate) mod tests {
 
     #[test]
     fn buffer_states_follow_submission_order_and_combine_reads() {
+        let _gpu = crate::host::gpu_test_lock();
         use std::sync::atomic::Ordering;
         let Some(host) = host() else { return };
         let Some((buffer, data)) = host.shared_buffer(256) else {
@@ -2573,6 +2578,7 @@ pub(crate) mod tests {
     /// byte there (no mark) is not put back. The bits are cleared.
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
+        let _gpu = crate::host::gpu_test_lock();
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
@@ -2620,6 +2626,7 @@ pub(crate) mod tests {
     /// marks of the same submission go back.
     #[test]
     fn marks_of_shaders_using_title_memory_are_held_back() {
+        let _gpu = crate::host::gpu_test_lock();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -2655,6 +2662,7 @@ pub(crate) mod tests {
     /// an inner buffer's copy of the same pages alike.
     #[test]
     fn what_a_frame_withholds_leaves_the_copies_at_its_end() {
+        let _gpu = crate::host::gpu_test_lock();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         // SAFETY: a byte of our pool.
@@ -2695,6 +2703,7 @@ pub(crate) mod tests {
     /// back to the pre-fault value.
     #[test]
     fn partial_refresh_under_marked_range_updates_saved_bytes() {
+        let _gpu = crate::host::gpu_test_lock();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -2734,6 +2743,7 @@ pub(crate) mod tests {
     /// Mark bits are handed out in runs and come back joined.
     #[test]
     fn mark_runs_are_reused_and_joined() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut m = Marks::default();
         assert_eq!((m.take(3), m.take(2)), (Some(0), Some(3)));
         m.give_back(0, 3);
@@ -2752,7 +2762,7 @@ pub(crate) mod tests {
     /// now, so what went back meanwhile is not taken for the GPU's again.
     #[test]
     fn snapshot_stays_fresh_across_disjoint_in_flight_submissions() {
-        let _one = snapshot_tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _gpu = crate::host::gpu_test_lock();
         let p = crate::watch::tests::pool(1);
         register(p, p as u64, 256);
         let Some(copy) = find(p as u64, 256) else {

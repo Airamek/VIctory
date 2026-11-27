@@ -290,6 +290,7 @@ mod tests {
 
     #[test]
     fn comparisons_test_the_masked_value() {
+        let _gpu = crate::host::gpu_test_lock();
         let read = |_, _| Some(0x1_0000_0005);
         let w = |comparison, reference| ValueWait { address: 8, bytes: 4, comparison, reference, mask: 0xffff_ffff };
         let expect = [(NEVER, false), (LESS, false), (EQUAL, true), (LESS_EQUAL, true), (GREATER, false), (NOT_EQUAL, false), (GREATER_EQUAL, true), (ALWAYS, true)];
@@ -307,6 +308,7 @@ mod tests {
     /// writes at its end: it runs after it.
     #[test]
     fn a_list_waits_for_another_queues_write() {
+        let _gpu = crate::host::gpu_test_lock();
         let fake = RefCell::new(Fake::default());
         fake.borrow_mut().writes.insert("draw", vec![(0x100, 7)]);
         let mut held = Held::default();
@@ -324,6 +326,7 @@ mod tests {
 
     #[test]
     fn a_wait_that_holds_defers_nothing() {
+        let _gpu = crate::host::gpu_test_lock();
         let fake = RefCell::new(Fake::default());
         fake.borrow_mut().memory.insert(0x100, 9);
         let mut held = Held::default();
@@ -336,6 +339,7 @@ mod tests {
 
     #[test]
     fn a_wait_for_the_value_overwritten_by_its_queue_stays_held() {
+        let _gpu = crate::host::gpu_test_lock();
         let fake = RefCell::new(Fake::default());
         {
             let mut f = fake.borrow_mut();
@@ -356,6 +360,7 @@ mod tests {
 
     #[test]
     fn a_wait_for_its_queues_write_holds_on_the_first_check() {
+        let _gpu = crate::host::gpu_test_lock();
         let fake = RefCell::new(Fake::default());
         fake.borrow_mut().writes.insert("write", vec![(0x100, 8)]);
         let mut held = Held::default();
@@ -375,6 +380,7 @@ mod tests {
     /// both make progress.
     #[test]
     fn chained_waits_across_two_queues() {
+        let _gpu = crate::host::gpu_test_lock();
         let fake = RefCell::new(Fake::default());
         {
             let mut f = fake.borrow_mut();
@@ -400,6 +406,7 @@ mod tests {
     /// does not pass a held one.
     #[test]
     fn a_queue_keeps_its_order() {
+        let _gpu = crate::host::gpu_test_lock();
         let fake = RefCell::new(Fake::default());
         let mut held = Held::default();
         held.push(2, Item::Segment("first", vec![ge(0x100, 1)]));
@@ -415,6 +422,7 @@ mod tests {
     /// (and its memory) does not move before the work ran.
     #[test]
     fn a_signal_waits_for_the_work_before_it() {
+        let _gpu = crate::host::gpu_test_lock();
         let fake = RefCell::new(Fake::default());
         let mut held = Held::default();
         held.push(2, Item::Segment("work", vec![ge(0x100, 1)]));
@@ -429,6 +437,7 @@ mod tests {
 
     #[test]
     fn a_fence_wait_holds_its_queue() {
+        let _gpu = crate::host::gpu_test_lock();
         let fake = RefCell::new(Fake::default());
         let mut held = Held::default();
         held.push(2, Item::FenceWait(5, 2));
@@ -444,6 +453,7 @@ mod tests {
     /// the next frame's write releases it.
     #[test]
     fn work_held_at_the_frames_end_stays_held() {
+        let _gpu = crate::host::gpu_test_lock();
         let fake = RefCell::new(Fake::default());
         let mut held = Held::default();
         held.push(2, Item::Segment("late", vec![ge(0x100, 2)]));
@@ -461,6 +471,7 @@ mod tests {
 
     #[test]
     fn unknown_comparisons_are_counted_and_do_not_hold_work() {
+        let _gpu = crate::host::gpu_test_lock();
         let fake = RefCell::new(Fake::default());
         let mut held = Held::default();
         let odd = ValueWait { address: 0x100, bytes: 4, comparison: 12, reference: 1, mask: 0xffff_ffff };
@@ -471,6 +482,7 @@ mod tests {
 
     #[test]
     fn the_valve_releases_only_old_heads() {
+        let _gpu = crate::host::gpu_test_lock();
         let fake = RefCell::new(Fake::default());
         let mut held = Held::default();
         held.push(2, Item::Segment("stuck", vec![ge(0x100, 1)]));

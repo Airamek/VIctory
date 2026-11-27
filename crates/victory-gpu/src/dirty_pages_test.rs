@@ -254,6 +254,7 @@ fn exercise(device: ID3D12Device, adapter: &DXGI_ADAPTER_DESC1, label: &str) -> 
 
 #[test]
 fn warp_dirty_pages() -> Result<()> {
+    let _gpu = crate::host::gpu_test_lock();
     // SAFETY: plain DXGI calls with valid out pointers and a live adapter.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
@@ -272,6 +273,7 @@ fn warp_dirty_pages() -> Result<()> {
 
 #[test]
 fn hardware_dirty_pages() -> Result<()> {
+    let _gpu = crate::host::gpu_test_lock();
     // SAFETY: plain DXGI calls with valid out pointers and live adapters.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;

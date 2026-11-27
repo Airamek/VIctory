@@ -233,6 +233,7 @@ mod tests {
     /// Every length and alignment: the bytes of the range and no others.
     #[test]
     fn copies_exactly_the_range() {
+        let _gpu = crate::host::gpu_test_lock();
         let from: Vec<u8> = (0..1024u32).map(|i| (i * 7 + i / 256) as u8).collect();
         for len in (0..=330).chain([511, 512, 513, 640, 900]) {
             for (a, b) in [(0, 0), (1, 0), (0, 3), (5, 9), (15, 1), (16, 8)] {
@@ -249,6 +250,7 @@ mod tests {
     /// that reaches into the page fails as the kernel's copy does.
     #[test]
     fn agrees_with_the_kernel_at_inaccessible_pages() {
+        let _gpu = crate::host::gpu_test_lock();
         for decommitted in [false, true] {
             let at = pages(3);
             if decommitted {
@@ -292,6 +294,7 @@ mod tests {
     /// and an unwritable destination fail without ending the process.
     #[test]
     fn protections_are_honoured() {
+        let _gpu = crate::host::gpu_test_lock();
         let (from, to) = (pages(1), pages(1));
         protect(from, 0, PAGE_READONLY);
         // SAFETY: a page each.
@@ -325,6 +328,7 @@ mod tests {
     /// (zeros for the page), however it lies over the page.
     #[test]
     fn guard_pages_stay_guarded() {
+        let _gpu = crate::host::gpu_test_lock();
         for other in [PAGE_READWRITE, PAGE_READONLY, PAGE_EXECUTE_READ] {
             for (start, len) in [
                 (PAGE, 1),
@@ -367,6 +371,7 @@ mod tests {
     /// and the page is a guard page when both are done.
     #[test]
     fn two_copies_of_a_guard_page() {
+        let _gpu = crate::host::gpu_test_lock();
         let at = pages(1) as usize;
         protect(at as *mut u8, 0, PAGE_READWRITE | PAGE_GUARD);
         std::thread::scope(|s| {
@@ -389,6 +394,7 @@ mod tests {
     /// but for those that meet a copy, and the page ends as a guard page.
     #[test]
     fn a_guard_page_the_title_touches_meanwhile() {
+        let _gpu = crate::host::gpu_test_lock();
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use windows_sys::Win32::System::Diagnostics::Debug::{
             AddVectoredExceptionHandler, EXCEPTION_POINTERS, RemoveVectoredExceptionHandler,
@@ -449,6 +455,7 @@ mod tests {
     /// succeeds or fails, none ends the process.
     #[test]
     fn memory_unmapped_meanwhile_does_not_fault() {
+        let _gpu = crate::host::gpu_test_lock();
         use std::sync::atomic::{AtomicBool, Ordering};
         let at = pages(4) as usize;
         let stop = AtomicBool::new(false);
@@ -482,6 +489,7 @@ mod tests {
     /// Only memory faults of the routine itself are taken.
     #[test]
     fn other_faults_are_left_alone() {
+        let _gpu = crate::host::gpu_test_lock();
         let begin = &raw const victory_title_copy_begin as usize;
         let end = &raw const victory_title_copy_end as usize;
         let exit = &raw const victory_title_copy_failed as usize;

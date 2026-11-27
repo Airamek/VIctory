@@ -631,6 +631,7 @@ mod tests {
     /// next frame writes it through unordered views again.
     #[test]
     fn copies_follow_the_side_each_use_needs() {
+        let _gpu = crate::host::gpu_test_lock();
         // List 1: unordered write first (the prelude copies the depth side
         // over, newer since the last frame), a read (copy back now), a
         // write again.
@@ -658,6 +659,7 @@ mod tests {
     /// compatible for the copy, which WARP would not prove.
     #[test]
     fn a_d32_twin_copies_directly_and_takes_no_scratch() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else {
             return; // no host GPU
         };
@@ -843,6 +845,7 @@ mod tests {
     /// copy started from the states the list leaves).
     #[test]
     fn prelude_copies_start_from_the_real_states() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::host::tests::{issued, replay};
         use windows::core::Interface;
         let Some(host) = host() else {

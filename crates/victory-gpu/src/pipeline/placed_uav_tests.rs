@@ -100,6 +100,7 @@ static BACKING: [u8; 2 * TEXTURE_ALIGNMENT] = [0; 2 * TEXTURE_ALIGNMENT];
 
 #[test]
 fn placed_uav_dispatch_writes_its_texture() {
+    let _gpu = crate::host::gpu_test_lock();
     let Some(host) = crate::host::host() else {
         return;
     };

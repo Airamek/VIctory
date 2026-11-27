@@ -149,6 +149,7 @@ mod tests {
 
     #[test]
     fn null_descriptions_are_rejected() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut heap = std::ptr::null();
         assert_eq!(
             create(std::ptr::null(), std::ptr::null(), &HEAP_IIDS[0], &mut heap),
@@ -170,6 +171,7 @@ mod tests {
 
     #[test]
     fn creation_without_an_out_pointer_only_probes() {
+        let _gpu = crate::host::gpu_test_lock();
         let desc = Desc {
             kind: 1, // timestamps
             count: 64,
@@ -192,6 +194,7 @@ mod tests {
 
     #[test]
     fn heaps_answer_their_interfaces_and_count_references() {
+        let _gpu = crate::host::gpu_test_lock();
         let desc = Desc {
             kind: 0, // occlusion
             count: 8,

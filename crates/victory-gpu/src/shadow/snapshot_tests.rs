@@ -1,11 +1,9 @@
 use super::*;
 
-/// The snapshots are one for all copies: one test at a time.
-pub(crate) static ONE: Mutex<()> = Mutex::new(());
-
 /// Parts kept of a copy, against a byte-by-byte model.
 #[test]
 fn snapshots_keep_each_declared_byte_once() {
+    let _gpu = crate::host::gpu_test_lock();
     const LEN: usize = 300;
     let mut seed = 0x2545_f491_4f6c_dd1du64;
     let mut random = |n: usize| {
@@ -42,7 +40,7 @@ fn snapshots_keep_each_declared_byte_once() {
 /// still goes back exactly, and the block is empty with the last range.
 #[test]
 fn big_snapshot_fills_in_parallel() {
-    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let _gpu = crate::host::gpu_test_lock();
     let len: usize = 32 * PAGE;
     let mut title = vec![0x44u8; len + PAGE];
     let start = (title.as_mut_ptr() as usize).next_multiple_of(PAGE);
@@ -137,7 +135,7 @@ fn snapshot_fill_throughput() {
 /// changed outside every declared range does not go back.
 #[test]
 fn copies_back_what_changed_in_declared_ranges() {
-    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let _gpu = crate::host::gpu_test_lock();
     const LEN: usize = 8 * PAGE;
     let mut title = vec![0x11u8; LEN + PAGE];
     let start = (title.as_mut_ptr() as usize).next_multiple_of(PAGE);
@@ -200,7 +198,7 @@ fn all_kept() -> (usize, usize) {
 /// A copy dropped with ranges never copied back gives its snapshots up.
 #[test]
 fn a_dropped_copy_leaves_no_snapshot() {
-    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let _gpu = crate::host::gpu_test_lock();
     let title = vec![0x11u8; 2 * PAGE];
     let Some(a) = copy_of(&title) else {
         return; // no host GPU here
@@ -216,7 +214,7 @@ fn a_dropped_copy_leaves_no_snapshot() {
 /// back its own bytes, also after the other is gone.
 #[test]
 fn two_copies_keep_their_snapshots_apart() {
-    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let _gpu = crate::host::gpu_test_lock();
     let (first, second) = (vec![0x11u8; 2 * PAGE], vec![0x22u8; 2 * PAGE]);
     let (Some(a), Some(b)) = (copy_of(&first), copy_of(&second)) else {
         return; // no host GPU here

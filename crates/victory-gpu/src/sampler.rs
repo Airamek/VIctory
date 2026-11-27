@@ -153,6 +153,7 @@ mod tests {
 
     #[test]
     fn console_descriptions_decode() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut w = [0u32; 27];
         w[1] = 1; // bilinear magnification
         w[2] = 0; // point minification
@@ -180,6 +181,7 @@ mod tests {
     /// stay.
     #[test]
     fn anisotropic_samplers_keep_point_mips_where_the_host_can() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut w = [0u32; 27];
         w[1] = 3; // anisotropic bilinear magnification
         w[2] = 3; // and minification
@@ -218,6 +220,7 @@ mod tests {
     /// without a device says it was skipped).
     #[test]
     fn the_host_takes_its_anisotropic_samplers() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             eprintln!("skipped: no host GPU here");
             return;
@@ -248,6 +251,7 @@ mod tests {
 
     #[test]
     fn mip_none_clamps_to_min_lod_and_inverted_lod_range_clamps() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut w = [0u32; 27];
         w[3] = 0; // mip none
         w[9] = 3.0f32.to_bits();
@@ -292,6 +296,7 @@ mod tests {
 
     #[test]
     fn bias_address_and_comparison_stay_in_host_bounds() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut w = [0u32; 27];
         w[6..9].copy_from_slice(&[0, 6, 3]);
         w[11] = 24.0f32.to_bits();

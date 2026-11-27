@@ -862,12 +862,14 @@ mod tests {
     /// A size the host cannot give is refused, not fatal; others are zeros.
     #[test]
     fn a_save_buffer_the_host_cannot_give_is_refused() {
+        let _gpu = crate::host::gpu_test_lock();
         assert!(zeroed(usize::MAX / 2).is_err());
         assert_eq!(zeroed(100).unwrap(), vec![0u8; 100]);
     }
 
     #[test]
     fn adapter_caches_keep_their_own_library() {
+        let _gpu = crate::host::gpu_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let nvidia = adapter_cache_dir(
@@ -909,6 +911,7 @@ mod tests {
 
     #[test]
     fn warp_device_uses_its_dxgi_adapter() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 
         // SAFETY: the factory and adapter stay live while creating the device.
@@ -969,6 +972,7 @@ mod tests {
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
+        let _gpu = crate::host::gpu_test_lock();
         let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
         assert_eq!(a, name("graphics", b"root", &[b"vs", b"ps"], "state"));
         assert_ne!(a, name("graphics", b"root", &[b"vs", b"ps2"], "state"));
@@ -982,6 +986,7 @@ mod tests {
     /// This run's keys stay in the list; earlier runs' fill it up to the cap.
     #[test]
     fn the_early_list_keeps_this_run_first() {
+        let _gpu = crate::host::gpu_test_lock();
         let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
         let before = keys(0..EARLY_MAX).into_iter().enumerate().map(|(i, k)| (k, i)).collect();
         let used = Used { before, now: keys(EARLY_MAX - 10..EARLY_MAX + 10) };
@@ -995,6 +1000,7 @@ mod tests {
     /// order across saves.
     #[test]
     fn a_full_early_list_drops_the_oldest_runs_keys() {
+        let _gpu = crate::host::gpu_test_lock();
         let key = |i: usize| format!("{i:032x}");
         // As saved: the last run's keys, then the run before's.
         let saved: Vec<String> = (0..EARLY_MAX).map(key).collect();
@@ -1017,6 +1023,7 @@ mod tests {
     /// saved with.
     #[test]
     fn the_prebuilt_list_holds_for_its_library_only() {
+        let _gpu = crate::host::gpu_test_lock();
         let keys: HashSet<String> = ["a".repeat(32), "b".repeat(32)].into();
         let saved = list(&tag(b"library"), &keys);
         assert_eq!(listed(saved.as_bytes(), &tag(b"library")), keys);
@@ -1026,6 +1033,7 @@ mod tests {
 
     #[test]
     fn different_names_are_held_at_the_same_time() {
+        let _gpu = crate::host::gpu_test_lock();
         static NAMES: Names = Names::new();
         // Each thread holds its name until every thread holds its own.
         let all = std::sync::Barrier::new(8);
@@ -1044,6 +1052,7 @@ mod tests {
 
     #[test]
     fn one_name_is_held_by_one_thread_at_a_time() {
+        let _gpu = crate::host::gpu_test_lock();
         static NAMES: Names = Names::new();
         static INSIDE: AtomicU64 = AtomicU64::new(0);
         std::thread::scope(|s| {
@@ -1072,6 +1081,7 @@ mod tests {
     /// stored and the library is serialised.
     #[test]
     fn pipelines_load_on_many_threads_at_once() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::core::s;
         const N: usize = 48;
@@ -1198,6 +1208,7 @@ mod tests {
     /// serialises the whole library, for seconds in the world).
     #[test]
     fn a_pipeline_loads_while_a_save_holds_the_library() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::core::s;
         let (Some(device), Some(library)) = (
@@ -1291,6 +1302,7 @@ mod tests {
 
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
@@ -1307,6 +1319,7 @@ mod tests {
     /// reads the new one.
     #[test]
     fn the_library_file_is_mapped_and_replaced() {
+        let _gpu = crate::host::gpu_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LIBRARY_FILE);
         assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
@@ -1357,6 +1370,7 @@ mod tests {
     /// reads the newest library saved, not an older pending one.
     #[test]
     fn the_next_start_reads_the_library_saved_last() {
+        let _gpu = crate::host::gpu_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let (path, next) = (dir.path().join(LIBRARY_FILE), dir.path().join(NEXT_FILE));
         let save = |byte: u8| {
@@ -1407,6 +1421,7 @@ mod tests {
     /// A save buffer the host cannot give is an error, not an abort.
     #[test]
     fn a_save_buffer_the_host_cannot_give_is_an_error() {
+        let _gpu = crate::host::gpu_test_lock();
         let refused = zeroed(usize::MAX / 2).expect_err("no such memory");
         assert_eq!(refused.kind(), std::io::ErrorKind::OutOfMemory);
         assert_eq!(zeroed(100).unwrap(), [0u8; 100]);
@@ -1459,6 +1474,7 @@ mod tests {
     /// they read as zeros, which the host would take for pipelines).
     #[test]
     fn a_replaced_library_file_still_reads_from_the_disk() {
+        let _gpu = crate::host::gpu_test_lock();
         const LEN: usize = 8 << 20;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LIBRARY_FILE);
@@ -1489,6 +1505,7 @@ mod tests {
     /// and a save renaming a new library over it, still work.
     #[test]
     fn a_mapped_library_file_cannot_be_written_meanwhile() {
+        let _gpu = crate::host::gpu_test_lock();
         const SHARING_VIOLATION: i32 = 32;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LIBRARY_FILE);
@@ -1526,6 +1543,7 @@ mod tests {
     /// only.
     #[test]
     fn staging_names_give_their_process() {
+        let _gpu = crate::host::gpu_test_lock();
         let dir = std::path::Path::new("d");
         let name = |p: &std::path::Path| p.file_name().unwrap().to_str().unwrap().to_owned();
         for file in [LIBRARY_FILE, EARLY_FILE, PREBUILT_FILE] {
@@ -1553,6 +1571,7 @@ mod tests {
     /// an ended run (IDs are multiples of four from a table far smaller).
     #[test]
     fn staging_files_of_ended_runs_are_removed() {
+        let _gpu = crate::host::gpu_test_lock();
         const GONE: u32 = u32::MAX - 3;
         assert!(ended(GONE), "no such process");
         assert!(!ended(std::process::id()), "this one, running");
@@ -1628,6 +1647,7 @@ mod tests {
 
     #[test]
     fn concurrent_write_atomically_never_fails_or_truncates() {
+        let _gpu = crate::host::gpu_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("host-pipelines.bin");
         let threads: Vec<_> = (0..4)

@@ -730,6 +730,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
 
 #[test]
 fn signed_32_bit_color_captures_decode_negative_components() {
+    let _gpu = crate::host::gpu_test_lock();
     let rg = [-(1 << 30), 1 << 29, i32::MAX, 1 << 28, -(1 << 29), i32::MAX];
     let rgba = [
         -(1 << 30), 1 << 29, -(1 << 28), i32::MAX, i32::MAX,
@@ -928,6 +929,7 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 mod tests {
     #[test]
     fn half_classifies_special_and_finite_values() {
+        let _gpu = crate::host::gpu_test_lock();
         use super::half;
 
         assert!(half(0x7c01).is_nan());
@@ -942,6 +944,7 @@ mod tests {
 
     #[test]
     fn packed_float_classifies_special_and_finite_values() {
+        let _gpu = crate::host::gpu_test_lock();
         use super::small_float;
 
         for mantissa_bits in [5, 6] {
@@ -957,6 +960,7 @@ mod tests {
 
     #[test]
     fn hdr_targets_render_nan_and_infinity_as_distinct_channel_values() {
+        let _gpu = crate::host::gpu_test_lock();
         // R16G16B16A16_FLOAT: [NaN, +Inf, NaN], [1, 0.5, 0].
         let half = [0x7c01u16, 0x7c00, 0xfe00, 0, 0x3c00, 0x3800, 0, 0];
         let half: Vec<_> = half.into_iter().flat_map(u16::to_le_bytes).collect();
@@ -978,6 +982,7 @@ mod tests {
 
     #[test]
     fn crc_matches_the_png_check_value() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
     }
 
@@ -985,6 +990,7 @@ mod tests {
     /// not B8G8R8A8.
     #[test]
     fn unorm16_and_xr_bias_targets_decode_as_their_formats() {
+        let _gpu = crate::host::gpu_test_lock();
         // Red 0x8000 (a half-float -0), green 0x4000, blue 0.
         let unorm16 = [0x00, 0x80, 0x00, 0x40, 0, 0, 0xff, 0xff];
         assert_eq!(super::to_rgba(11, 1, 1, 8, &unorm16), Some(vec![255, 127, 0, 255]));
@@ -1000,6 +1006,7 @@ mod tests {
 mod r32_tests {
     #[test]
     fn r32_integer_captures_scale_numeric_values() {
+        let _gpu = crate::host::gpu_test_lock();
         let unsigned = [1u32, 2, 3].map(u32::to_le_bytes).concat();
         let signed = [-2i32, -1, 0].map(i32::to_le_bytes).concat();
         let expected = Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
@@ -1010,6 +1017,7 @@ mod r32_tests {
 
     #[test]
     fn r32_integer_captures_keep_adjacent_contrast() {
+        let _gpu = crate::host::gpu_test_lock();
         let unsigned = [16_777_216u32, 16_777_217].map(u32::to_le_bytes).concat();
         let signed = [-16_777_217i32, -16_777_216].map(i32::to_le_bytes).concat();
         let expected = Some(vec![0, 0, 0, 255, 255, 255, 255, 255]);
@@ -1020,6 +1028,7 @@ mod r32_tests {
 
     #[test]
     fn r32_integer_captures_handle_full_range_and_row_pitch() {
+        let _gpu = crate::host::gpu_test_lock();
         let signed = [i32::MIN, -1, i32::MIN, 0, i32::MAX].map(i32::to_le_bytes).concat();
         let expected = Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
 
@@ -1028,18 +1037,21 @@ mod r32_tests {
 
     #[test]
     fn r32_integer_captures_constant_uint_is_white() {
+        let _gpu = crate::host::gpu_test_lock();
         let rows = [7u32; 2].map(u32::to_le_bytes).concat();
         assert_eq!(super::to_rgba(42, 2, 1, 8, &rows), Some(vec![255; 8]));
     }
 
     #[test]
     fn r32_integer_captures_constant_sint_is_white() {
+        let _gpu = crate::host::gpu_test_lock();
         let rows = [-7i32; 2].map(i32::to_le_bytes).concat();
         assert_eq!(super::to_rgba(43, 2, 1, 8, &rows), Some(vec![255; 8]));
     }
 
     #[test]
     fn r32_integer_captures_constant_zero_is_black() {
+        let _gpu = crate::host::gpu_test_lock();
         let expected = Some([0, 0, 0, 255].repeat(2));
         assert_eq!(super::to_rgba(42, 2, 1, 8, &[0; 8]), expected);
         assert_eq!(super::to_rgba(43, 2, 1, 8, &[0; 8]), expected);

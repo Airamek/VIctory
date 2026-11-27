@@ -1019,6 +1019,7 @@ mod tests {
     /// identical logical states produce byte-identical D3D12 structs.
     #[test]
     fn cleaned_graphics_descs_zero_padding_bytes() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut raw_depth = [0xAAu8; size_of::<D3D12_DEPTH_STENCIL_DESC>()];
         let base = D3D12_DEPTH_STENCIL_DESC {
             DepthEnable: true.into(),
@@ -1078,6 +1079,7 @@ mod tests {
 
     #[test]
     fn integer_targets_do_not_blend() {
+        let _gpu = crate::host::gpu_test_lock();
         let t = targets(&[
             DXGI_FORMAT_R8G8B8A8_UNORM,
             DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -1097,6 +1099,7 @@ mod tests {
 
     #[test]
     fn blend_states_without_integer_blending_are_kept() {
+        let _gpu = crate::host::gpu_test_lock();
         // No integer target.
         let b = blending(false);
         let t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R11G11B10_FLOAT]);
@@ -1136,6 +1139,7 @@ mod tests {
     /// read its vertices from the wrong bytes.
     #[test]
     fn appended_elements_are_aligned() {
+        let _gpu = crate::host::gpu_test_lock();
         const APPEND: u32 = D3D12_APPEND_ALIGNED_ELEMENT;
         // RG8 (2 bytes) then RG32 float: 4, not 2.
         let a = [
@@ -1163,6 +1167,7 @@ mod tests {
     /// (a panic in debug builds).
     #[test]
     fn a_huge_explicit_offset_does_not_overflow() {
+        let _gpu = crate::host::gpu_test_lock();
         let inputs = [
             element(DXGI_FORMAT_R32G32B32A32_FLOAT, u32::MAX - 8),
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
@@ -1174,6 +1179,7 @@ mod tests {
     /// title enables it anyway) and stays on for float targets.
     #[test]
     fn no_blending_on_integer_render_targets() {
+        let _gpu = crate::host::gpu_test_lock();
         let enabled = || D3D12_RENDER_TARGET_BLEND_DESC {
             BlendEnable: true.into(),
             RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,

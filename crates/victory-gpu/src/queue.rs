@@ -772,6 +772,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn aliased_present_planes_preserve_the_host_texture_state() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_RENDER_TARGET;
 
         let Some(host) = crate::host::host() else {
@@ -857,6 +858,7 @@ mod tests {
 
     #[test]
     fn queue_signals_complete_at_once() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let desc = QueueDesc {
             kind: 0,
@@ -892,6 +894,7 @@ mod tests {
     /// Grand Theft Auto VI's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
     #[test]
     fn console_queues_are_created_as_on_pc() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let desc = QueueDescX {
             kind: 2,
@@ -908,6 +911,7 @@ mod tests {
 
     #[test]
     fn newer_queues_have_their_methods_two_slots_later() {
+        let _gpu = crate::host::gpu_test_lock();
         let (old, new) = (queue_table(false), queue_table(true));
         assert_eq!(old[10], new[10]); // submission stays at 0x50
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
@@ -917,6 +921,7 @@ mod tests {
 
     #[test]
     fn timestamps_and_values_are_written() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut at = [0u64; 2];
         Written::Value(0x1_0000_0002).write(at.as_mut_ptr().cast(), 4);
         assert_eq!(at[0], 2);

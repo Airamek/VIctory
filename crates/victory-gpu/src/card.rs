@@ -40,7 +40,9 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+#[cfg(not(test))]
+use windows::Win32::System::Threading::INFINITE;
 use windows::core::Interface;
 
 use crate::host::Host;
@@ -602,10 +604,56 @@ impl CardEngine {
         };
         match waited {
             Ok(()) => {
+                // Tests never wait without an end: a lost device or a hung
+                // fetch fails the test instead of wedging the suite.
+                #[cfg(test)]
+                self.wait_fetch_test(host, value);
                 // SAFETY: our own event, signalled above.
-                unsafe { WaitForSingleObject(self.event, INFINITE) };
+                #[cfg(not(test))]
+                unsafe {
+                    WaitForSingleObject(self.event, INFINITE)
+                };
             }
             Err(e) => tracing::warn!(error = %e, "card fetch submit failed"),
+        }
+    }
+
+    /// Tests: the completion-time fetch's fence `value` on bounded slices,
+    /// as the host's own waits: a removed device or an exhausted stall
+    /// budget fails the test instead of piling up behind an INFINITE wait.
+    #[cfg(test)]
+    fn wait_fetch_test(&self, host: &Host, value: u64) {
+        let waited = crate::host::wait_for_submission(
+            || {
+                // SAFETY: our fence and event.
+                unsafe {
+                    if self.fence.GetCompletedValue() >= value {
+                        return true;
+                    }
+                    // One slice of the stall budget: park this thread on
+                    // the fence event, then re-check.
+                    let _signalled =
+                        WaitForSingleObject(self.event, crate::host::WAIT_SLICE_MS);
+                    self.fence.GetCompletedValue() >= value
+                }
+            },
+            || host.removed(),
+            |secs| {
+                tracing::warn!(
+                    "still waiting for a card fetch after {secs}s (stall budget {}s)",
+                    crate::host::STALL_SECS
+                );
+            },
+        );
+        match waited {
+            crate::host::Waited::Done => {}
+            crate::host::Waited::Removed => crate::host::fail(format_args!(
+                "host GPU device removed while waiting for a card fetch"
+            )),
+            crate::host::Waited::Stalled => crate::host::fail(format_args!(
+                "card fetch stalled: no fence and no removal after {}s",
+                crate::host::STALL_SECS
+            )),
         }
     }
 
@@ -1168,6 +1216,7 @@ mod tests {
 
     #[test]
     fn range_helpers_merge_and_convert_pieces() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut r = vec![(100, 200), (50, 120), (300, 400), (200, 300)];
         merge_byte_ranges(&mut r);
         assert_eq!(r, vec![(50, 400)]);
@@ -1183,6 +1232,7 @@ mod tests {
     /// staging follows, concurrent CPU writes are reported for re-upload.
     #[test]
     fn card_merge_reports_dirty_spans_and_cpu_writes() {
+        let _gpu = crate::host::gpu_test_lock();
         let n = 32usize;
         let mut title = vec![1u8; n];
         let mut staging = vec![1u8; n];
@@ -1207,6 +1257,7 @@ mod tests {
     /// WARP exercises only the pure tests above).
     #[test]
     fn warp_card_roundtrip_upload_wave64_hash_and_concurrent_merge() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return;
         };

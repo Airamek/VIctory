@@ -741,6 +741,7 @@ mod tests {
     #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
+        let _gpu = crate::host::gpu_test_lock();
         assert!(super::parse_skip_hashes(" , ").is_empty());
         assert_eq!(
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
@@ -755,6 +756,7 @@ mod tests {
     /// 8-aligned: its bytecode is read as it lies.
     #[test]
     fn a_stream_of_any_alignment_is_read() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut backing = [0u64; 5];
         // SAFETY: the 40 bytes of `backing`, one off its (aligned) start.
         let stream = unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
@@ -780,6 +782,7 @@ mod tests {
 
     #[test]
     fn pipelines_keep_their_shaders() {
+        let _gpu = crate::host::gpu_test_lock();
         let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
         let none = || Bytecode {
             code: std::ptr::null(),
@@ -826,6 +829,7 @@ mod tests {
     /// topology, render target and depth formats: 0x2b0 bytes.
     #[test]
     fn streams_yield_their_shaders() {
+        let _gpu = crate::host::gpu_test_lock();
         let (ms, ps) = ([9u8; 7], [4u8; 5]);
         let mut stream = vec![0u8; 0x2b0];
         let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
@@ -879,6 +883,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_prebuild_is_the_pipeline_the_title_creates() {
+        let _gpu = crate::host::gpu_test_lock();
         let (vs, ps) = ([7u8; 9], [5u8; 6]);
         let name = c"TEXCOORD";
         // One input element: name, index 2, format 16, slot 1, offset 8.
@@ -932,6 +937,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn prebuild_key_shortcuts_match_full_prebuild_keys() {
+        let _gpu = crate::host::gpu_test_lock();
         let (vs, ms, ps, cs) = ([7u8; 64], [9u8; 48], [5u8; 32], [3u8; 96]);
         let hex16 = |b: &[u8]| blake3::hash(b).to_hex()[..16].to_owned();
         let (vs_h, ms_h, ps_h, cs_h) = (hex16(&vs), hex16(&ms), hex16(&ps), hex16(&cs));

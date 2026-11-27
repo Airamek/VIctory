@@ -111,12 +111,14 @@ mod tests {
 
     #[test]
     fn off_and_bugcheck_warn() {
+        let _gpu = crate::host::gpu_test_lock();
         assert!(level(Some(0)).warning().unwrap().contains("freezes"));
         assert!(level(Some(1)).warning().unwrap().contains("blue screen"));
     }
 
     #[test]
     fn recovery_and_the_default_do_not_warn() {
+        let _gpu = crate::host::gpu_test_lock();
         for l in [None, Some(2), Some(3)] {
             assert_eq!(level(l).warning(), None, "TdrLevel {l:?}");
         }
@@ -124,6 +126,7 @@ mod tests {
 
     #[test]
     fn delay_alone_does_not_warn() {
+        let _gpu = crate::host::gpu_test_lock();
         let tdr = Tdr {
             level: Some(3),
             delay: Some(60),
@@ -134,11 +137,13 @@ mod tests {
 
     #[test]
     fn a_missing_value_reads_as_the_default() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(dword("VictoryTestNoSuchValue"), None);
     }
 
     #[test]
     fn shown_names_the_default() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(shown(None), "default");
         assert_eq!(shown(Some(60)), "60");
     }

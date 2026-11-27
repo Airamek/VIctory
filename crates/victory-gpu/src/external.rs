@@ -277,6 +277,7 @@ mod tests {
     /// uploads its initial and updated bytes before external host work reads it.
     #[test]
     fn title_written_textures_upload_before_external_reads() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -347,6 +348,7 @@ mod tests {
     /// read, without needing an earlier descriptor view.
     #[test]
     fn aliased_textures_copy_from_their_gpu_writer_on_first_external_read() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -448,6 +450,7 @@ mod tests {
     /// and a shader read copies newer twin writes into the depth texture first.
     #[test]
     fn depth_twins_route_unordered_and_shader_reads_for_external_callers() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -555,6 +558,7 @@ mod tests {
     /// that exact `copy` rather than populating a replacement behind it.
     #[test]
     fn eviction_after_capturing_copy_refreshes_the_held_host_texture() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return;
         };

@@ -22,21 +22,25 @@ mod tests {
 
     #[test]
     fn unset_is_off() {
+        let _gpu = crate::host::gpu_test_lock();
         assert!(!value_is_on(None));
     }
 
     #[test]
     fn zero_is_off() {
+        let _gpu = crate::host::gpu_test_lock();
         assert!(!value_is_on(Some(OsStr::new("0"))));
     }
 
     #[test]
     fn one_is_on() {
+        let _gpu = crate::host::gpu_test_lock();
         assert!(value_is_on(Some(OsStr::new("1"))));
     }
 
     #[test]
     fn other_values_keep_their_old_meaning() {
+        let _gpu = crate::host::gpu_test_lock();
         // Documented as `=1`; anything else that was on before stays on: only `0` is new.
         for value in ["", "true", "yes", "2", "00", " 0", "0 "] {
             assert!(value_is_on(Some(OsStr::new(value))), "{value:?}");

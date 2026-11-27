@@ -2377,6 +2377,7 @@ mod tests {
 
     #[test]
     fn changing_root_signatures_invalidates_only_the_matching_bindings() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut state = State::default();
         let first = std::ptr::without_provenance(1);
         let second = std::ptr::without_provenance(2);
@@ -2405,6 +2406,7 @@ mod tests {
     /// matching records hits, a longer one or changed records misses.
     #[test]
     fn large_table_copies_are_reused_by_record_prefix() {
+        let _gpu = crate::host::gpu_test_lock();
         let made = vec![
             (vec![[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]], 40),
             (vec![[9, 9, 9], [8, 8, 8]], 90),
@@ -2423,6 +2425,7 @@ mod tests {
     /// that binds none, which a compute list that only reads views does.
     #[test]
     fn a_list_without_a_sampler_heap_gets_ours() {
+        let _gpu = crate::host::gpu_test_lock();
         // The title binds both: nothing of ours.
         assert_eq!(State::wanted([0x10, 0x20], false), [0x10, 0x20]);
         // Views only: our sampler heap after them.
@@ -2571,6 +2574,7 @@ void main() {
     /// guest bytes intact.
     #[test]
     fn marked_subpage_uav_writes_copy_back_and_keep_neighbor_bytes() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -2614,6 +2618,7 @@ void main() {
     /// `copy_back_marks` 3-way merges GPU, CPU, and pre-existing bytes.
     #[test]
     fn marked_subpage_uav_and_cpu_disjoint_write_three_way_merge() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -2658,6 +2663,7 @@ void main() {
     /// boundary without disturbing surrounding title memory.
     #[test]
     fn marked_subpage_uav_unaligned_and_cross_page_shadow_bounds() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -2731,6 +2737,7 @@ void main() {
     /// same 64 KiB page within one command list all land in title memory.
     #[test]
     fn marked_subpage_uavs_after_copy_in_same_list() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -2778,6 +2785,7 @@ void main() {
     /// their refresh to enclosing 64 KiB page bounds.
     #[test]
     fn marked_unaligned_root_uav_and_bindless_subpage_refresh() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -3036,6 +3044,7 @@ uint ps() : SV_Target { return 1; }
     /// share its view.
     #[test]
     fn root_views_reach_their_copy_and_read_zeros_past_it() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3403,6 +3412,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// bridged by a copy at the read.
     #[test]
     fn a_texture_written_in_one_format_reads_in_another_through_a_placed_view() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3477,6 +3487,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// up to 24 times a frame).
     #[test]
     fn a_texture_is_uploaded_once_per_submission_and_only_when_written() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3523,6 +3534,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// frames never share one.
     #[test]
     fn a_movie_plane_is_uploaded_once_per_list() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3580,6 +3592,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// was recorded.
     #[test]
     fn a_list_run_after_a_host_write_keeps_the_host_texels() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3637,6 +3650,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// makes it again with its bytes from title memory.
     #[test]
     fn a_texture_given_up_is_made_again_with_its_bytes_and_recorded_lists_keep_it() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3679,6 +3693,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// of one upload buffer): each reads its own bytes.
     #[test]
     fn textures_uploaded_together_each_read_their_own_bytes() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3721,6 +3736,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// the same bytes again are uploaded.
     #[test]
     fn a_texture_owning_its_pages_is_uploaded_on_any_write() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3760,6 +3776,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// contents.
     #[test]
     fn a_write_into_one_mip_uploads_that_mip_alone() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3811,6 +3828,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// clear), then used through the unordered view: back in 16 bits.
     #[test]
     fn a_depth_texture_written_through_unordered_views_reads_as_depth() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3972,6 +3990,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     #[test]
     fn compute_view_marks_rebind_after_depth_twin_conversion() {
+        let _gpu = crate::host::gpu_test_lock();
         use victory_shader::emit::{Options, emit_with};
         use victory_shader::native::{ComputeIo, HwStage, NativeProgram, RootParam, StageIo};
         use victory_shader::{Container, io, ir, resource, structure};
@@ -4175,6 +4194,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// every depth slice, -1), and a shader view reads it.
     #[test]
     fn unordered_1d_and_3d_textures_keep_their_writes() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -4237,6 +4257,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// bytes; one on an element views the buffer's copy.
     #[test]
     fn structured_views_off_their_buffers_elements_get_their_own_copy() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -4298,6 +4319,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     #[test]
     fn placed_unordered_textures_write_and_read_back_through_placed_views() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -4413,6 +4435,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     #[test]
     fn explicit_and_placed_rgba8_textures_at_one_address_share_compute_writes() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
