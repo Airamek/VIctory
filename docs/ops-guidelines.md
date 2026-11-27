@@ -18,6 +18,15 @@
   merging (file:line spot-checks are lead work; re-deriving is waste).
   Review-before-merge holds for every feature branch, even lead-written ones
   (a teammate reviews; the lead merges).
+- **Every spawn carries the system prompt.** Each teammate/subagent brief
+  opens by instructing them to read this file (`docs/ops-guidelines.md` §0)
+  *as a subagent/teammate* — so delegation depth, autonomy, parallelism,
+  and hygiene propagate to every level, including subagents a teammate
+  spawns themselves.
+- **Long tests report live.** Any test run expected to exceed ~2 minutes
+  gets a live progress window (tailing its log), opened when the run starts
+  and closed when the task completes. No silent long runs — the lead and
+  the user can always see where a gate stands.
 - **This file + `D:\dev\TRIAGE_PROGRESS.md` are your persistent memory.**
   Both survive context wipes. Update them at every task boundary: tips,
   verdicts, pending queue, resume commands. A fresh session must be able to
