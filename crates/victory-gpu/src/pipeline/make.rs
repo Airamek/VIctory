@@ -77,9 +77,20 @@ impl Pending {
             format!("{shaders:?}\t{state}")
         });
         let screen = graphics.as_ref().is_some_and(|g| g.screen_pass());
-        #[cfg(feature = "diagnostics")]
-        let skipped_shader = super::skipped_shader(&shaders, skip_hashes).map(str::to_owned);
+        // A quarantined shader's compile crashes the driver inside our own
+        // process (the amdxc64 repro crashes solo, so no serialisation or
+        // retry avoids it): never queued or made. Its draws are dropped like
+        // an untranslated shader's — logged loudly, never wrong pixels.
+        let quarantined = super::quarantined_shader(&shaders).map(str::to_owned);
         let made = OnceLock::new();
+        if let Some(hash) = &quarantined {
+            super::note_quarantined(&key, hash);
+            let _ = made.set(None);
+        }
+        #[cfg(feature = "diagnostics")]
+        let skipped_shader = super::skipped_shader(&shaders, skip_hashes)
+            .map(str::to_owned)
+            .or(quarantined);
         // Publish the completed result before the pipeline can be queued.
         #[cfg(feature = "diagnostics")]
         if skipped_shader.is_some() {
@@ -887,10 +898,10 @@ mod tests {
         let mut state = crate::draw::State::default();
         state.set_pipeline(title);
         let zero_demands = [(0, 1, 1), (1, 0, 1), (1, 1, 0)].map(|(x, y, z)| {
-            state.dispatch(&list, x, y, z);
+            state.dispatch(&list, x, y, z, None);
             pending.used.load(Ordering::Relaxed)
         });
-        state.dispatch(&list, 1, 1, 1);
+        state.dispatch(&list, 1, 1, 1, None);
         let nonempty_demand = pending.used.load(Ordering::Relaxed);
         list.close();
         slot::<extern "system" fn(This) -> u32>(title, 0x10)(title);
@@ -899,30 +910,65 @@ mod tests {
     }
 
     /// Huge driver compiles wait for the slot; ordinary ones never do.
+    /// The slot is process-global (shared with the pipeline workers and
+    /// every other test), and on a loaded box the OS may starve either
+    /// thread past any fixed sleep, so the test proves ordering, not wall
+    /// time: the second holder's `take_if` must span the first holder's
+    /// release. An attempt fails only if a runnable thread is not
+    /// rescheduled for the whole settle window, so attempts are retried;
+    /// the assert itself is exact.
     #[test]
     fn huge_compiles_wait_for_the_slot() {
         let _gpu = crate::host::gpu_test_lock();
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         assert!(!huge(0));
         assert!(!huge(HUGE_BYTES - 1));
         assert!(huge(HUGE_BYTES));
-        let _first = HugeGuard::take_if(true);
-        let waited = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let probe = waited.clone();
-        let other = std::thread::spawn(move || {
-            let started = Instant::now();
-            let _second = HugeGuard::take_if(true);
-            probe.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-        });
-        std::thread::sleep(Duration::from_millis(150));
-        drop(_first);
-        other.join().unwrap();
-        assert!(
-            waited.load(Ordering::Relaxed) >= 100,
-            "second huge compile did not wait"
-        );
-        let started = Instant::now();
-        let _plain = HugeGuard::take_if(false);
-        assert!(started.elapsed() < Duration::from_millis(100));
+        let epoch = Instant::now();
+        let (attempted, acquired) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        for _ in 0..5 {
+            let _first = HugeGuard::take_if(true);
+            let seen = Arc::new(AtomicBool::new(false));
+            let (seen_child, attempted_child, acquired_child) =
+                (seen.clone(), attempted.clone(), acquired.clone());
+            let other = std::thread::spawn(move || {
+                seen_child.store(true, Ordering::Release);
+                attempted_child.store(epoch.elapsed().as_nanos() as u64, Ordering::Release);
+                let _second = HugeGuard::take_if(true);
+                acquired_child.store(epoch.elapsed().as_nanos() as u64, Ordering::Release);
+            });
+            // The child is alive (not yet that it entered `take_if`: entering
+            // takes microseconds once scheduled, and only a thread starved
+            // for the whole window below misses it, which the retry covers).
+            let start = Instant::now();
+            while !seen.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(30) {
+                std::thread::yield_now();
+            }
+            assert!(seen.load(Ordering::Acquire), "the waiter thread started");
+            std::thread::sleep(Duration::from_millis(150));
+            let t0 = epoch.elapsed().as_nanos() as u64;
+            drop(_first);
+            other.join().unwrap();
+            let (t_attempt, t_acquire) = (
+                attempted.load(Ordering::Acquire),
+                acquired.load(Ordering::Acquire),
+            );
+            // The waiter's `take_if` was entered before the release (it
+            // signalled first) and returned after it: it spanned the slot,
+            // i.e. it waited. A miss means the OS starved it past the
+            // release, not that the slot failed: retry.
+            if t_attempt <= t0 && t0 <= t_acquire {
+                // The slot is free again now: an ordinary compile never
+                // touches it. Near-instant; the bound is a hang guard only
+                // (this thread itself may wait seconds for a CPU on a
+                // saturated box).
+                let started = Instant::now();
+                let _plain = HugeGuard::take_if(false);
+                assert!(started.elapsed() < Duration::from_secs(10));
+                return;
+            }
+        }
+        panic!("the waiter never spanned the slot release in 5 attempts");
     }
 
     #[cfg(feature = "diagnostics")]
@@ -1012,5 +1058,46 @@ mod tests {
                 (wall / ideal - 1.0) * 100.0
             );
         }
+    }
+
+    /// A first use is queued by the worker; a quarantined shader (bf72 GLINTS:
+    /// amdxc64 repro crashes solo in CreateGraphicsPipelineState at
+    /// amdxc64.dll+0x671f78, primes pass) is never queued or compiled —
+    /// its draws are dropped, never wrong pixels, and the process survives.
+    #[test]
+    fn quarantine_matches_only_bf72_glints() {
+        // The crasher: PS_MIRROR_PBR_MATERIAL_GLINTS.
+        assert!(crate::pipeline::quarantined_hash("bf7278cd8d6d6ff3"));
+        // The repro's passing controls: same VS, sibling 6-sampler pixels.
+        assert!(!crate::pipeline::quarantined_hash("76376a2ee6c53ffe"));
+        assert!(!crate::pipeline::quarantined_hash("9763863ad4cd2579"));
+        assert!(!crate::pipeline::quarantined_hash("9975d5335335cc9c"));
+        // Near-misses: wrong length, non-hex, empty.
+        assert!(!crate::pipeline::quarantined_hash("bf7278cd8d6d6ff"));
+        assert!(!crate::pipeline::quarantined_hash("bf7278cd8d6d6ff3 "));
+        assert!(!crate::pipeline::quarantined_hash(""));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quarantined_pipeline_stays_off_the_queue() {
+        let shader = Arc::new(Shader {
+            stage: "pixel",
+            hash: "bf7278cd8d6d6ff3".into(),
+            container: Vec::new(),
+            translated: OnceLock::new(),
+        });
+        let p = Arc::new(Pending::new(
+            vec![shader.clone()],
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        assert!(ready(&p).is_none());
+        // Never queued for a worker (a compile would crash the process),
+        // so no translation was ever consulted either.
+        assert!(!p.queued.load(Ordering::Relaxed));
+        assert!(matches!(p.made.get(), Some(None)));
+        assert!(shader.translated.get().is_none());
     }
 }

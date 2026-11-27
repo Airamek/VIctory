@@ -38,7 +38,83 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::dirty_ranges::DirtyRanges;
+
 mod page_batch;
+
+/// Guard and remap invalidations since the last presented frame, by title
+/// address range: guard writes ([`writing`] and [`Writing`]'s drop) and
+/// remaps ([`title_memory_remapped`]) land between a texture refresh's read
+/// and its snapshot comparison, and DirectStorage-style writes land in
+/// placed texture bytes the guards never see. [`crate::texture`] asks
+/// whether its range was invalidated since its last refresh, and refreshes
+/// torn reads again instead of detiling half-new bytes.
+static SNAPSHOT_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SPANNED: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
+static PAGE_WRITTEN: Mutex<DirtyRanges<{ 1 << 15 }>> = Mutex::new(DirtyRanges::new());
+static REMAPPED: Mutex<DirtyRanges<{ 1 << 15 }>> = Mutex::new(DirtyRanges::new());
+
+pub(crate) fn snapshot_generation() -> u64 {
+    SNAPSHOT_GENERATION.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub(crate) fn bump_snapshot_generation_for_test() {
+    SNAPSHOT_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn note_invalidated_for_test(at: usize, len: usize) {
+    note_invalidated(at, len, snapshot_generation(), &PAGE_WRITTEN);
+}
+
+fn note_invalidated(at: usize, len: usize, generation: u64, ranges: &Mutex<DirtyRanges<{ 1 << 15 }>>) {
+    let (start, end) = (at as u64, at.saturating_add(len) as u64);
+    if end <= SPANNED[0].load(Ordering::Relaxed) || start >= SPANNED[1].load(Ordering::Relaxed) {
+        return;
+    }
+    let mut ranges = ranges.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.insert(start, end, generation);
+}
+
+#[cfg(test)]
+pub(crate) fn invalidated(from: usize, to: usize) -> bool {
+    if from >= to {
+        return false;
+    }
+    let (from, to) = (from as u64, to as u64);
+    PAGE_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .overlaps(from, to)
+        || REMAPPED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .overlaps(from, to)
+}
+
+pub(crate) fn invalidation_generation_since(from: usize, to: usize, generation: u64) -> Option<u64> {
+    if from >= to {
+        return None;
+    }
+    let (from, to) = (from as u64, to as u64);
+    let written = PAGE_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .newest_since(from, to, generation);
+    let remapped = REMAPPED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .newest_since(from, to, generation);
+    written.max(remapped)
+}
+
+/// At each presented frame: last frame's guard and remap invalidations are
+/// spent (textures that did not refresh on them re-read anyway).
+pub(crate) fn invalidations_done() {
+    let _ = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+    let _ = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+}
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
 /// made the checks of the world's big buffers cost more than the copies
@@ -345,6 +421,8 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     if pages.is_empty() {
         return None;
     }
+    SPANNED[0].fetch_min(start as u64, Ordering::Relaxed);
+    SPANNED[1].fetch_max(end as u64, Ordering::Relaxed);
     install();
     // The rest of the range, as byte runs.
     let mut untracked: Vec<(usize, usize)> = Vec::new();
@@ -592,6 +670,27 @@ impl Tracked {
         clean_bit(self.changed.2)
     }
 
+    /// Marks the tracked pages of `[from, to)` changed again. Used when a
+    /// refresh took them but its upload was discarded (a concurrent remap):
+    /// the next refresh must see them.
+    pub(crate) fn remark(&self, from: usize, to: usize) {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return;
+        }
+        let (first, last) = (from / PAGE, to.div_ceil(PAGE));
+        let mut g = guards();
+        mark_changed(&mut g, first, last, false);
+        let others: Vec<usize> = g
+            .alias_of
+            .range(first..last)
+            .flat_map(|(_, o)| o.iter().copied())
+            .collect();
+        for page in others {
+            mark_changed(&mut g, page, page + 1, false);
+        }
+    }
+
     /// The tracker's bit for [`clean_bit`], for callers that ask about
     /// many trackers at once without touching each (none: never clean).
     pub(crate) fn bit(&self) -> Option<u32> {
@@ -692,6 +791,10 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
     };
     let unmapped = |page: usize| {
+        #[cfg(feature = "diagnostics")]
+        let _querying = Timed(std::time::Instant::now(), crate::copystat::C::QueryUs);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Queries, 1);
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
@@ -839,6 +942,10 @@ impl Drop for Writing {
             g.busy.swap_remove(i);
         }
         changed(&mut g, self.first, self.last, false);
+        drop(g);
+        let (start, end) = (self.first * PAGE, self.last.saturating_mul(PAGE));
+        SNAPSHOT_GENERATION.fetch_add(1, Ordering::Release);
+        note_invalidated(start, end.saturating_sub(start), snapshot_generation(), &PAGE_WRITTEN);
     }
 }
 
@@ -849,6 +956,8 @@ impl Drop for Writing {
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory and DirectStorage's writes to addresses.
 pub fn writing(at: usize, len: usize) -> Writing {
+    SNAPSHOT_GENERATION.fetch_add(1, Ordering::Release);
+    note_invalidated(at, len, snapshot_generation(), &PAGE_WRITTEN);
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
@@ -860,6 +969,8 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    SNAPSHOT_GENERATION.fetch_add(1, Ordering::Release);
+    note_invalidated(at, len, snapshot_generation(), &REMAPPED);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
@@ -1017,6 +1128,13 @@ pub(crate) mod tests {
     };
     pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    /// Serializes the watch tests: the guard/page registries, the hole
+    /// cache, the alias table, and the fault handler are process-global
+    /// (the established single-test-lock pattern), so one watch test runs
+    /// at a time. Cross-module `pool` users keep disjoint pages and stay
+    /// out unless measurement implicates them.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
     /// A write-watched allocation of `pages` pages (as the runtime's pools),
     /// on a 64 KiB boundary (the allocation granularity).
     pub(crate) fn pool(pages: usize) -> usize {
@@ -1041,6 +1159,7 @@ pub(crate) mod tests {
     #[test]
     fn overlapping_kernel_writers_keep_pages_open_until_both_finish() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let p = pool(6);
         let t = track(p, 6 * PAGE, true).expect("tracked pool");
         assert_eq!(t.take(p, p + 6 * PAGE), [(p, p + 6 * PAGE)]);
@@ -1073,6 +1192,7 @@ pub(crate) mod tests {
     #[test]
     fn writes_mark_every_tracker_of_their_page() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let p = pool(4);
         let a = track(p, 4 * PAGE, true).expect("pool memory is tracked");
         let b = track(p + PAGE, 2 * PAGE, true).expect("tracked");
@@ -1112,6 +1232,7 @@ pub(crate) mod tests {
     #[test]
     fn a_range_over_foreign_memory_guards_only_the_runtimes() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
         const WINDOW: usize = 4 << 20;
         // In a free 4 MiB-aligned window: plain committed memory (as the
@@ -1160,6 +1281,7 @@ pub(crate) mod tests {
     #[test]
     fn a_new_tracker_starts_dirty_on_a_bit_given_back() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let p = pool(1);
         let a = track(p, PAGE, true).expect("tracked");
         assert_eq!(a.take(p, p + PAGE).len(), 1);
@@ -1177,6 +1299,7 @@ pub(crate) mod tests {
     #[test]
     fn unmapped_pages_are_taken_apart() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a fresh write-watched reservation of two pages, the first
         // committed; freed below.
         let p = unsafe {
@@ -1192,11 +1315,38 @@ pub(crate) mod tests {
         free(p);
     }
 
+    /// The `VirtualQuery` that finds an unprotectable page is attributed to
+    /// the copy term's *queries*, apart from the move, so the frame line can
+    /// say how much of the copy term is bookkeeping (FIND-49).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_virtual_query_on_an_unprotectable_page_is_counted() {
+        use crate::copystat::{get, C};
+        let before = get(C::Queries);
+        // SAFETY: a fresh write-watched reservation of two pages, the first
+        // committed; freed below.
+        let p = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            assert_ne!(VirtualAlloc(p as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            p
+        };
+        let t = track(p, 2 * PAGE, true).expect("tracked");
+        let _ = t.take_split(p, p + 2 * PAGE);
+        assert!(
+            get(C::Queries) > before,
+            "the unprotectable page's VirtualQuery is attributed to queries"
+        );
+        drop(t);
+        free(p);
+    }
+
     /// A page only partly in the range asked is copied in part and stays
     /// changed; edge pages count whole when the tracked part is covered.
     #[test]
     fn partial_pages_stay_changed() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let p = pool(3);
         let t = track(p + 100, 2 * PAGE, true).expect("tracked");
         assert_eq!(t.take(p + 100, p + PAGE + 10), [(p + 100, p + PAGE + 10)]);
@@ -1305,6 +1455,7 @@ pub(crate) mod tests {
     #[test]
     fn heap_memory_is_not_tracked_and_placeholders_wait_for_mappings() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let plain = vec![0u8; 2 * PAGE];
         assert!(track(plain.as_ptr() as usize, plain.len(), true).is_none());
         // SAFETY: a reservation of ours, freed below.
@@ -1325,6 +1476,7 @@ pub(crate) mod tests {
     #[test]
     fn unmapped_holes_are_cached_until_remapped() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a reservation of ours, freed below.
         let r = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
         assert_ne!(r, 0);
@@ -1357,6 +1509,7 @@ pub(crate) mod tests {
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -1437,6 +1590,7 @@ pub(crate) mod tests {
     #[test]
     fn writes_through_another_mapping_mark_the_tracker() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let (a, b) = twin_views(2);
         let t = track(a, 2 * PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
@@ -1463,6 +1617,7 @@ pub(crate) mod tests {
     #[test]
     fn a_tracker_dropped_on_one_mapping_leaves_the_other_guarded() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let (a, b) = twin_views(1);
         let t = track(a, PAGE, true).expect("views are tracked");
         let u = track(b, PAGE, true).expect("views are tracked");
@@ -1479,6 +1634,7 @@ pub(crate) mod tests {
     #[test]
     fn a_retake_marks_the_copies_and_keeps_the_guard() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
         let protection = |at: usize| {
             // SAFETY: plain data filled in by the query.
@@ -1522,6 +1678,7 @@ pub(crate) mod tests {
     #[test]
     fn a_retake_marks_buffer_copies_alone() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let p = pool(2);
         let copy = track_copy(p, 2 * PAGE, true).expect("pool memory is tracked");
         let texture = track(p, 2 * PAGE, true).expect("pool memory is tracked");
@@ -1577,6 +1734,7 @@ pub(crate) mod tests {
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
         let _gpu = crate::host::gpu_test_lock();
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);

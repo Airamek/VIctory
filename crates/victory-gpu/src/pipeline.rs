@@ -16,9 +16,8 @@
 //! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::offset_of;
-#[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
@@ -128,6 +127,13 @@ pub(crate) fn translated_for_test(
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
+    /// The compute group size, when a compute program declares one (for
+    /// partial dispatches: title thread counts convert to group counts).
+    pub(crate) compute_threads: Option<[u32; 3]>,
+    /// The translation guards threads past the host's real X thread count
+    /// (`USER_DISPATCH_THREADS_X` user data): dispatches with the console's
+    /// thread-count flag convert to group counts and set it.
+    pub(crate) partial_dispatch: bool,
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
@@ -199,7 +205,29 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     let crate::shader_cache::Cached { shader, used, hit } =
         crate::shader_cache::host_shader(container);
-    (shader.map(|host| Translated { host, used }), hit)
+    (
+        shader.map(|host| {
+            let compute_threads = victory_shader::Container::parse(container)
+                .ok()
+                .and_then(|c| {
+                    let part = c.part(victory_shader::FourCC::DXIL).or(c.part(victory_shader::FourCC::ACCC))?;
+                    victory_shader::native_programs(part.data).ok()
+                })
+                .and_then(|programs| {
+                    programs.iter().find_map(|p| match &p.io {
+                        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => {
+                            Some(cs.threads)
+                        }
+                        _ => None,
+                    })
+                });
+            let partial_dispatch = host.user_data.iter().any(|u| {
+                u.root == victory_shader::RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)
+            });
+            Translated { host, used, compute_threads, partial_dispatch }
+        }),
+        hit,
+    )
 }
 
 #[repr(C)]
@@ -269,6 +297,49 @@ pub(crate) fn take_waited_ms() -> f64 {
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Container hashes of shaders the host driver cannot compile: the compile
+/// itself crashes our process (no error to catch or retry), so pipelines
+/// holding them are never made and their draws are dropped.
+///
+/// `bf7278cd8d6d6ff3` is `PS_MIRROR_PBR_MATERIAL_GLINTS_5f34c83e_Wrapped`:
+/// the amdxc64 repro (`tools/amdxc64-repro`,
+/// `apps/victory/examples/amdxc64_repro.rs`) crashes solo inside
+/// `CreateGraphicsPipelineState` at `amdxc64.dll+0x671f78` (0xC0000005) for
+/// vs9975+psbf72, while vs9975+ps7637 and vs9975+ps9763 (same vertex shader,
+/// sibling 6-sampler pixels) pass — the crash is this pixel shader's DXIL.
+/// Hard-coded, not a knob: every build must avoid the crashing compile.
+const QUARANTINED_SHADERS: &[&str] = &["bf7278cd8d6d6ff3"];
+
+/// Whether a container hash is quarantined (see [`QUARANTINED_SHADERS`]).
+fn quarantined_hash(hash: &str) -> bool {
+    QUARANTINED_SHADERS.contains(&hash)
+}
+
+/// The quarantined shader in `shaders`, if any.
+fn quarantined_shader(shaders: &[Arc<Shader>]) -> Option<&str> {
+    shaders
+        .iter()
+        .find(|shader| quarantined_hash(&shader.hash))
+        .map(|shader| shader.hash.as_str())
+}
+
+/// Logs a quarantined pipeline once per shader hash: its draws are dropped
+/// downstream, loudly so the missing draws are never silent.
+fn note_quarantined(key: &str, hash: &str) {
+    static LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut logged = LOGGED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if logged.insert(hash.to_owned()) {
+        tracing::warn!(
+            key,
+            hash,
+            "quarantined crashing shader (amdxc64 0x671f78): pipeline never made, draws dropped"
+        );
+    }
+}
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(feature = "diagnostics", any(windows, test)))]

@@ -1,3 +1,9 @@
+> **See also:** README.md · docs/architecture.md · docs/asset-policy.md
+> · docs/ops-guidelines.md · docs/gpu-profiling-methodology.md
+> · docs/preexisting-flakes.md · docs/eval-survey-followups.md
+> · D:/dev/TRIAGE_PROGRESS.md · D:/dev/ROADMAP_30FPS.md · D:/dev/TASK_QUEUE.md
+> (index only; content below unchanged — doc-linker pass, eval/1828-rebase @ 19062fe)
+
 # Ops guidelines (how this repo gets worked on)
 
 ## 0. Leadership doctrine (system prompt — read first, every session)
@@ -79,7 +85,10 @@
 3. Prove: gates per merge (workspace serial `--jobs 1` + clippy
    all-targets/all-features `-D warnings` + policy; census adjudication for
    flakes: solo + base-solo + group-decider; parallel-only proven flakes get
-   census entries, never gate-weakening or skips).
+   census entries, never gate-weakening or skips). Long gates run under
+   generous timeout wrappers — workspace serial 3600 s, single-crate serial
+   2400 s, solo test 600 s ceilings (tune up, never down; a hang past the
+   ceiling is a bounded-wait violation, not a slow test).
 4. Merge: review-before-merge for feature branches; lead merges to eval.
    Push only to the Airamek fork, never to `origin` (read-only upstream) or
    `triage-merge-queue` (read-only).
@@ -97,6 +106,8 @@
   reached, crash signature (HRESULT + debug-layer line), log filename.
 
 ## 5. Storage hygiene (after EVERY task completes)
+- Full survival policy (five catastrophes, persist/resume, timers,
+  no-infinite-spin, floors): `docs/catastrophe-prep.md`.
 - Check: `D:\victory-target\*` sizes, `D:/dev/VIctory-*` worktrees,
   `$env:TEMP\victory-diag*.log`, `C:\vct` scratch.
 - Reclaim: delete stale target dirs of merged/abandoned tasks, Pols… no —
@@ -104,8 +115,11 @@
   worktrees of merged tasks only after fork-push verified, never touch
   unknown-owner dirs blindly (identify first).
 - Report reclaimed GB in the task-close note (`TRIAGE_PROGRESS.md` section).
+- Cache layout / invalidation / safe-clear: `docs/asset-policy.md` (cache lives in `cache_dir`, saves live in `data_dir`).
 
 ## 6. Crash triage playbook
+- Resume/wedge procedure (frozen box, wedged binary, resume commands):
+  `docs/catastrophe-prep.md` §§1/3/5.
 1. Log first: tail `victory-diagNN.log` for `device removed` + HRESULT +
    debug-layer verdict; compare against last known-good signature.
 2. Parallelize: (a) locate creation site, (b) bisect vs base tip,

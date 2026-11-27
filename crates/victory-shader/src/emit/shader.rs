@@ -15,18 +15,22 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
 /// parameter) of the view-stride table: dword `i` is the byte stride of
 /// the buffer view at view-heap index `i` ([`VIEW_STRIDE_BITS`]), with
-/// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats;
+/// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats
+/// and [`VIEW_SRGB`] for sRGB texture unordered views;
 /// dword `HEAP_VIEWS + i` is its element count (a size query of a structured
 /// buffer from the heap crashes the AMD driver's compiler, so shaders take
 /// the title's own count there).
 pub const VIEW_STRIDES: u8 = 255;
 /// The bits of a view-stride table dword holding the stride.
-pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+pub const VIEW_STRIDE_BITS: u32 = (1 << 29) - 1;
 /// In a view-stride table dword: a typed buffer view of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
+/// In a view-stride table dword: a texture unordered view whose title format
+/// is sRGB (backed by a linear host view; stores encode linear RGB to sRGB).
+pub const VIEW_SRGB: u32 = 1 << 29;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
@@ -55,6 +59,12 @@ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// marks"), after the written pages in the same bitmap: one bit per
 /// resource-heap index, [`HEAP_VIEWS`] of them.
 pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
+/// `RootType::Other` code of the user-data dword the host computes: the
+/// actual X thread count of a one-dimensional partial dispatch. Zero keeps
+/// every thread of every dispatched group active; otherwise threads whose
+/// global X index is at or past it do nothing. The metadata `dword` holds
+/// the group's X width.
+pub const USER_DISPATCH_THREADS_X: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -139,6 +149,9 @@ pub(crate) struct Shader {
     /// are marked, `emit` "Read marks"), and those the instruction being
     /// lowered uses.
     pub texture_index: std::collections::HashMap<V, V>,
+    /// The heap index of each handle of a texture unordered view (stores check
+    /// [`VIEW_SRGB`] in the view-stride table to encode sRGB targets).
+    pub texture_uav_index: std::collections::HashMap<V, V>,
     pub texture_reads: Vec<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
@@ -224,6 +237,7 @@ impl Shader {
             view_writes: None,
             view_index: std::collections::HashMap::new(),
             texture_index: std::collections::HashMap::new(),
+            texture_uav_index: std::collections::HashMap::new(),
             texture_reads: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
@@ -627,7 +641,17 @@ impl Shader {
         if !sampler && props.0 & 0x1000 == 0 && (1..=9).contains(&kind) {
             self.texture_index.insert(h, index);
         }
+        // Texture unordered views (kinds 1-9 with the UAV bit).
+        if !sampler && props.0 & 0x1000 != 0 && (1..=9).contains(&kind) {
+            self.texture_uav_index.insert(h, index);
+        }
         h
+    }
+
+    /// The heap index of a texture unordered view handle, if `handle` came
+    /// from the descriptor heap.
+    pub(super) fn texture_uav_index(&self, handle: V) -> Option<V> {
+        self.texture_uav_index.get(&handle).copied()
     }
 
     /// The finished container.

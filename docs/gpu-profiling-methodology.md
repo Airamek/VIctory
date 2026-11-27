@@ -1,3 +1,9 @@
+> **See also:** README.md · docs/architecture.md · docs/asset-policy.md
+> · docs/ops-guidelines.md · docs/gpu-profiling-methodology.md
+> · docs/preexisting-flakes.md · docs/eval-survey-followups.md
+> · D:/dev/TRIAGE_PROGRESS.md · D:/dev/ROADMAP_30FPS.md · D:/dev/TASK_QUEUE.md
+> (index only; content below unchanged — doc-linker pass, eval/1828-rebase @ 19062fe)
+
 # GPU perf methodology without a GPU (unattended agents)
 
 Branch: `eval/gpu-perf-methodology`. No accuracy changes, no env-knob hacks:
@@ -54,27 +60,44 @@ summed busy + per-kind medians (GPU-side, batching preserved); wall/fps is
 sanity only, and no wall-clock-only win smaller than the distortion band is
 claimable.
 
-### 1.3 Unstamped GPU work (no copy queue exists)
+### 1.3 Unstamped GPU work (copy queue exists, default off)
 
-Correction to the session premise: there is **no copy queue** in the
-codebase. The host device creates exactly one `DIRECT` queue
-(host.rs:330-331); every `ExecuteCommandLists` in the tree targets it.
-The GPU work that lands in the CPU wall but not in busy is:
+Correction (2026-11-27 doc refresh): the premise below is stale — a **copy
+queue exists** since `b7f066bc` (merge of `eval/copy-queue`: texture uploads
+on the D3D12 copy engine behind `VICTORY_COPY_QUEUE`, default off).
+The host device creates the `DIRECT` queue plus, when the gate is on, a
+`COPY` queue and copy fence (host.rs, `copy_queue` field + `CreateCommandQueue`
+in `Host::new`; without a copy queue uploads stay on the direct queue).
+`texture::record_upload` records upload lists of COPY kind; the upload list,
+if any, is submitted on the copy engine while mains stay on DIRECT, and the
+timeline waits for both queues.
 
+Unstamped-by-design work (lands in CPU wall, not in busy):
+
+- COPY-kind lists emit **no GPU-timing timestamp queries** (`eval/copyq-timing`
+  `5be261fc`; host.rs "COPY-kind lists never stamp"): a copy command queue
+  cannot resolve into the timing query heap the same way, so COPY upload GPU
+  time is structurally invisible to busy. Their note labels (markers) are
+  still recorded, so list membership is visible even though durations are not.
 - Prelude lists: transitions only, deliberately not bracketed; their GPU
-  time stays out of busy and inside the wall-minus-busy gap (host.rs:2731-2736
-  comment in `close()`, gap definition host.rs:5081-5085).
-- The present-copy list: `present()` records barriers + `CopyResource` into
-  `p.copy.list` and runs it with `self.execute(&[&p.copy])` on the same
-  direct queue with no timestamps (host.rs:4684-4715).
+  time stays out of busy and inside the wall-minus-busy gap (host.rs `close()`
+  comment, gap definition in `costs`).
+- The present-copy list: `present()` records barriers + `CopyResource` and
+  runs it on the direct queue with no timestamps.
 - Barriers inside otherwise-noted lists (covered by the residual: busy minus
-  noted, clamped at zero, host.rs:2664).
+  noted, clamped at zero).
 
-So "busy excludes copy, wall includes it" is precisely "busy excludes
-preludes + present-copy, wall includes their CPU-side submission + waiting".
-The log already separates this: `noted` vs `residual` vs `gap`
-(host.rs:5126-5138). Any change touching uploads, preludes, or present must
-show noted + residual + gap all flat-or-better (section 3).
+So "busy excludes copy, wall includes it" is literally "busy excludes COPY
+uploads + preludes + present-copy, wall includes their CPU-side submission +
+waiting". The fps line separates this when the gate is on (`f70bef78`: when
+`copy_enabled()`, the per-frame line appends `textures/frame uploaded on COPY
+in N submissions, copy fence signalled/completed, DIRECT waits/frame`).
+Diag discipline: paired A/B (gate off vs `VICTORY_COPY_QUEUE=1`, same binary
+and scene) via `tools/gpu-compare/compare-gpu-logs.ps1`; any change touching
+uploads, preludes, or present must show noted + residual + gap all
+flat-or-better (section 3). The run's gate states are self-identifying in the
+log (`host diagnostics self-id v1`, host.rs). Rollout: default stays OFF until
+a user gameplay run with `VICTORY_COPY_QUEUE=1` validates it.
 
 ### 1.4 Starvation counters and timeline depth
 

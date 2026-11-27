@@ -194,8 +194,9 @@ enum Blob {
 
 impl Blob {
     /// The library file in `dir`: a library a save left beside it
-    /// ([`NEXT_FILE`]) takes its place first.
-    fn of(dir: &std::path::Path) -> Blob {
+    /// ([`NEXT_FILE`]) takes its place first. Returns the blob and the file
+    /// it came from, if any (for its digest's sidecar).
+    fn of(dir: &std::path::Path) -> (Blob, Option<std::path::PathBuf>) {
         remove_abandoned(dir);
         let path = dir.join(LIBRARY_FILE);
         let next = dir.join(NEXT_FILE);
@@ -205,11 +206,11 @@ impl Blob {
             );
         }
         if let Some(file) = Mapped::open(&path) {
-            return Blob::Mapped(file);
+            return (Blob::Mapped(file), Some(path));
         }
         match std::fs::read(&path) {
-            Ok(bytes) if !bytes.is_empty() => Blob::Held(bytes),
-            _ => Blob::None,
+            Ok(bytes) if !bytes.is_empty() => (Blob::Held(bytes), Some(path)),
+            _ => (Blob::None, None),
         }
     }
 
@@ -438,15 +439,20 @@ fn write_library(
     let written = if let Some(mut file) = Mapped::create(&tmp, size) {
         serialize(file.bytes_mut())
             .map_err(failed)
-            .map(|()| tag(file.bytes()))
+            .map(|()| tag(&digest_of(file.bytes())))
     } else {
         zeroed(size).and_then(|mut bytes| {
             serialize(&mut bytes)
                 .map_err(failed)
-                .and_then(|()| std::fs::write(&tmp, &bytes).map(|()| tag(&bytes)))
+                .and_then(|()| std::fs::write(&tmp, &bytes).map(|()| tag(&digest_of(&bytes))))
         })
     };
     let res = written.and_then(|tag| replace_library(dir, &tmp).map(|()| tag));
+    if res.is_ok() {
+        // A replaced library of the same length must not keep the old
+        // bytes' digest: the next load rehashes and rewrites it.
+        let _ = std::fs::remove_file(sidecar(&dir.join(LIBRARY_FILE)));
+    }
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -493,18 +499,19 @@ fn library() -> Option<&'static Shared> {
             // The adapter's library, mapped; a compatible legacy library
             // is read from the root when no adapter library exists yet.
             // The legacy files are never overwritten by the new layout.
-            let (blob, prebuilt) = match cache_dir(root) {
+            let (blob, prebuilt, source) = match cache_dir(root) {
                 Some(adapter) => {
-                    let blob = Blob::of(&adapter);
+                    let (blob, source) = Blob::of(&adapter);
                     if matches!(blob, Blob::None) && !adapter.join(LIBRARY_FILE).exists() {
-                        (Blob::of(root), std::fs::read(root.join(PREBUILT_FILE)).ok())
+                        let (blob, source) = Blob::of(root);
+                        (blob, std::fs::read(root.join(PREBUILT_FILE)).ok(), source)
                     } else {
-                        (blob, std::fs::read(adapter.join(PREBUILT_FILE)).ok())
+                        (blob, std::fs::read(adapter.join(PREBUILT_FILE)).ok(), source)
                     }
                 }
-                None => (Blob::None, None),
+                None => (Blob::None, None, None),
             };
-            let tag = tag(blob.bytes());
+            let tag = tag(&blob_digest(&blob, source.as_deref()));
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
             if let (Some(l), Some(list)) = (library.as_mut(), prebuilt)
@@ -562,15 +569,16 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     })
 }
 
-/// What the pre-build's list holds for: the library's bytes, and what
+/// What the pre-build's list holds for: the library's digest (so that a
+/// mapped library need not be read to know it: [`blob_digest`]), and what
 /// names its pipelines (the translation, as the shader cache keys it; the
 /// host descriptions).
-fn tag(blob: &[u8]) -> String {
+fn tag(digest: &str) -> String {
     let limit = victory_shader::emit::loop_limit().to_le_bytes();
     let translator = victory_shader::SOURCE_HASH.as_bytes();
     let mut h = blake3::Hasher::new();
     for part in [
-        blob,
+        digest.as_bytes(),
         translator,
         include_bytes!("../shader_cache.rs"),
         &limit,
@@ -581,6 +589,46 @@ fn tag(blob: &[u8]) -> String {
         h.update(part);
     }
     h.finalize().to_hex().to_string()
+}
+
+fn digest_of(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// The blob's digest for the pre-build list's tag: from the sidecar a save
+/// left beside a mapped blob (no page of the mapped library is read), else
+/// hashed once (and kept in a sidecar for the next run). A held blob is
+/// already memory, so it hashes directly.
+fn blob_digest(blob: &Blob, source: Option<&std::path::Path>) -> String {
+    match (blob, source) {
+        (Blob::Mapped(file), Some(path)) => {
+            let sidecar = sidecar(path);
+            read_sidecar(&sidecar, file.bytes().len()).unwrap_or_else(|| {
+                let digest = digest_of(file.bytes());
+                let _ = write_sidecar(&sidecar, file.bytes().len(), &digest);
+                digest
+            })
+        }
+        _ => digest_of(blob.bytes()),
+    }
+}
+
+/// The file beside `path` that keeps the digest of its bytes.
+fn sidecar(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".b3");
+    path.with_file_name(name)
+}
+
+/// The digest in `sidecar`, if it was made for a file of `len` bytes.
+fn read_sidecar(sidecar: &std::path::Path, len: usize) -> Option<String> {
+    let text = std::fs::read_to_string(sidecar).ok()?;
+    let (saved_len, digest) = text.trim().split_once(' ')?;
+    (saved_len.parse() == Ok(len) && digest.len() == 64).then(|| digest.to_owned())
+}
+
+fn write_sidecar(sidecar: &std::path::Path, len: usize, digest: &str) -> std::io::Result<()> {
+    write_atomically(sidecar, format!("{len} {digest}").as_bytes())
 }
 
 /// The pre-build's list as saved: the tag it holds for, then its keys.
@@ -639,6 +687,21 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    stored(library, name, &wide, load, create)
+}
+
+/// Loads `name` from `library`, else makes and stores it: a store the
+/// library refuses (a name stored with another description) still yields
+/// the made pipeline. A failed cache write is a miss, not a refused
+/// pipeline (xcl's two-pass tolerate, concept port: no `crates/xcl`
+/// import, the concept reimplemented on our pipeline library).
+fn stored(
+    library: &Shared,
+    name: &str,
+    wide: &HSTRING,
+    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
     let _held = NAMES.hold(name);
     // Outside the lock: loads take up to seconds, and a save holds the lock
     // for as long as it serialises. The library's blob lives as long as it
@@ -895,18 +958,18 @@ mod tests {
         // No adapter library yet: the legacy root library is read.
         std::fs::write(root.join(LIBRARY_FILE), b"old library").unwrap();
         std::fs::write(root.join(PREBUILT_FILE), b"old list").unwrap();
-        assert!(Blob::of(&nvidia).bytes().is_empty());
-        assert_eq!(Blob::of(root).bytes(), b"old library");
+        assert!(Blob::of(&nvidia).0.bytes().is_empty());
+        assert_eq!(Blob::of(root).0.bytes(), b"old library");
         // Once the adapter has its own library, that one wins.
         write_library(&nvidia, 15, |out| {
             out.copy_from_slice(b"nvidia library!");
             Ok(())
         })
         .unwrap();
-        assert_eq!(Blob::of(&nvidia).bytes(), b"nvidia library!");
+        assert_eq!(Blob::of(&nvidia).0.bytes(), b"nvidia library!");
         assert_eq!(std::fs::read(nvidia.join(LIBRARY_FILE)).unwrap(), b"nvidia library!");
         // The legacy files stay as they were.
-        assert_eq!(Blob::of(root).bytes(), b"old library");
+        assert_eq!(Blob::of(root).0.bytes(), b"old library");
     }
 
     #[test]
@@ -1025,10 +1088,51 @@ mod tests {
     fn the_prebuilt_list_holds_for_its_library_only() {
         let _gpu = crate::host::gpu_test_lock();
         let keys: HashSet<String> = ["a".repeat(32), "b".repeat(32)].into();
-        let saved = list(&tag(b"library"), &keys);
-        assert_eq!(listed(saved.as_bytes(), &tag(b"library")), keys);
-        assert!(listed(saved.as_bytes(), &tag(b"library2")).is_empty());
-        assert!(listed(b"", &tag(b"library")).is_empty());
+        let saved = list(&tag(&digest_of(b"library")), &keys);
+        assert_eq!(listed(saved.as_bytes(), &tag(&digest_of(b"library"))), keys);
+        assert!(listed(saved.as_bytes(), &tag(&digest_of(b"library2"))).is_empty());
+        assert!(listed(b"", &tag(&digest_of(b"library"))).is_empty());
+    }
+
+    /// The digest sidecar validates length and shape, round-trips, and a
+    /// mapped blob reuses it without hashing (upstream #3430, knob-free:
+    /// no `VICTORY_PIPELINE_LIB_MMAP`).
+    #[test]
+    fn the_digest_sidecar_validates_and_serves_mapped_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        std::fs::write(&path, b"library-bytes").unwrap();
+        let side = sidecar(&path);
+        assert!(read_sidecar(&side, 13).is_none(), "no sidecar yet");
+        write_sidecar(&side, 13, &digest_of(b"library-bytes")).unwrap();
+        assert_eq!(read_sidecar(&side, 13).as_deref(), Some(digest_of(b"library-bytes").as_str()));
+        assert!(read_sidecar(&side, 14).is_none(), "length mismatch");
+        std::fs::write(&side, "13 short").unwrap();
+        assert!(read_sidecar(&side, 13).is_none(), "short digest rejected");
+        std::fs::write(&side, "not a sidecar").unwrap();
+        assert!(read_sidecar(&side, 13).is_none(), "garbage rejected");
+        // A mapped blob with a valid sidecar never hashes its bytes.
+        write_sidecar(&side, 13, &"0".repeat(64)).unwrap();
+        let mapped = Mapped::open(&path).unwrap();
+        let blob = Blob::Mapped(mapped);
+        assert_eq!(
+            blob_digest(&blob, Some(&path)),
+            "0".repeat(64),
+            "sidecar digest used as-is"
+        );
+        // Without a sidecar the digest is hashed and kept for next time.
+        std::fs::remove_file(&side).unwrap();
+        let mapped = Mapped::open(&path).unwrap();
+        let blob = Blob::Mapped(mapped);
+        assert_eq!(blob_digest(&blob, Some(&path)), digest_of(b"library-bytes"));
+        assert_eq!(
+            read_sidecar(&side, 13).as_deref(),
+            Some(digest_of(b"library-bytes").as_str()),
+            "hashed once, then kept"
+        );
+        // Held blobs hash directly (already memory).
+        let blob = Blob::Held(b"library-bytes".to_vec());
+        assert_eq!(blob_digest(&blob, Some(&path)), digest_of(b"library-bytes"));
     }
 
     #[test]
@@ -1172,7 +1276,7 @@ mod tests {
         // The library again, from its file mapped (as a run opens it).
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(LIBRARY_FILE), made.serialized()).unwrap();
-        let blob = Blob::of(dir.path());
+        let blob = Blob::of(dir.path()).0;
         assert!(matches!(blob, Blob::Mapped(_)));
         let again = open(&device, blob).expect("the library again");
         assert!(
@@ -1300,6 +1404,102 @@ mod tests {
         });
     }
 
+    /// A pipeline the library refuses to store (its name stored with
+    /// another description) is still returned: a failed cache write is a
+    /// miss, not a refused pipeline (xcl two-pass tolerate, concept port).
+    #[test]
+    fn a_store_refused_pipeline_is_still_returned() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
+            return; // no host GPU here
+        };
+        let shader = |i: usize| {
+            let source = format!(
+                "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n\
+                 [RootSignature(RS)] [numthreads(1, 1, 1)] void main() {{ b.Store(0, b.Load(4) * {i} + {i}); }}"
+            );
+            let mut blob = None;
+            // SAFETY: the source outlives the call; the blob is read within it.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    None,
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )
+                .ok()?;
+                let blob = blob?;
+                Some(
+                    std::slice::from_raw_parts(
+                        blob.GetBufferPointer().cast::<u8>(),
+                        blob.GetBufferSize(),
+                    )
+                    .to_vec(),
+                )
+            }
+        };
+        let Some((a, b)) = shader(1).zip(shader(2)) else {
+            return; // no shader compiler here
+        };
+        // SAFETY: the code holds its root signature.
+        let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, &a).unwrap() };
+        let desc = |code: &[u8]| D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
+            },
+            ..Default::default()
+        };
+        let (desc_a, desc_b) = (desc(&a), desc(&b));
+        let library = open(&device, Blob::None).expect("an empty library");
+        let shared = Shared {
+            loads: library.library.clone(),
+            state: Mutex::new(library),
+        };
+        let name = "tolerate: a refused store keeps the made pipeline";
+        let wide = HSTRING::from(name);
+        let make = |desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC| {
+            stored(
+                &shared,
+                name,
+                &wide,
+                // SAFETY: the description points at live data.
+                |library, name| unsafe { library.LoadComputePipeline(name, desc) },
+                // SAFETY: as above.
+                || unsafe { device.CreateComputePipelineState(desc) },
+            )
+        };
+        make(&desc_a).expect("stored");
+        let pso = make(&desc_b).expect("returned despite the refused store");
+        // Usable: it sets on a list. The library still holds the first.
+        // SAFETY: plain creation calls on the live device.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .unwrap();
+            list.SetPipelineState(&pso);
+            list.Close().unwrap();
+            let _: ID3D12PipelineState = shared
+                .loads
+                .LoadComputePipeline(PCWSTR(wide.as_ptr()), &desc_a)
+                .expect("the library still holds the first pipeline");
+        }
+    }
+
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
         let _gpu = crate::host::gpu_test_lock();
@@ -1322,12 +1522,12 @@ mod tests {
         let _gpu = crate::host::gpu_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LIBRARY_FILE);
-        assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
+        assert!(matches!(Blob::of(dir.path()).0, Blob::None), "no file yet");
         std::fs::write(&path, b"").unwrap();
-        assert!(matches!(Blob::of(dir.path()), Blob::None), "an empty file");
+        assert!(matches!(Blob::of(dir.path()).0, Blob::None), "an empty file");
         let old: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
         std::fs::write(&path, &old).unwrap();
-        let blob = Blob::of(dir.path());
+        let blob = Blob::of(dir.path()).0;
         assert!(matches!(blob, Blob::Mapped(_)));
         assert_eq!(blob.bytes(), &old[..]);
         // A save while the old file is mapped.
@@ -1337,7 +1537,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(tag, super::tag(&new), "the tag of the bytes written");
+        assert_eq!(tag, super::tag(&super::digest_of(&new)), "the tag of the bytes written");
         // The mapping still reads the old library; no staging file is left.
         assert_eq!(blob.bytes(), &old[..]);
         let left: Vec<_> = std::fs::read_dir(dir.path())
@@ -1348,7 +1548,7 @@ mod tests {
         assert_eq!(left, [std::ffi::OsString::from(LIBRARY_FILE)], "{left:?}");
         drop(blob);
         // The next start reads the new one, wherever the save left it.
-        assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
+        assert_eq!(Blob::of(dir.path()).0.bytes(), &new[..]);
         assert!(!dir.path().join(NEXT_FILE).exists());
         // A serialisation that fails leaves the library as it was.
         let refused = write_library(dir.path(), 64, |_| {
@@ -1404,7 +1604,7 @@ mod tests {
         save(4).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), [4u8; 4096]);
         assert!(!next.exists(), "an older pending file left");
-        assert_eq!(Blob::of(dir.path()).bytes(), [4u8; 4096]);
+        assert_eq!(Blob::of(dir.path()).0.bytes(), [4u8; 4096]);
         // A pending file that cannot be replaced fails the save, and the
         // one saved before it is what the next start reads.
         let held = hold(&path);
@@ -1412,7 +1612,7 @@ mod tests {
         let pending = hold(&next);
         assert!(save(6).is_err(), "the pending file held");
         drop((held, pending));
-        assert_eq!(Blob::of(dir.path()).bytes(), [5u8; 4096]);
+        assert_eq!(Blob::of(dir.path()).0.bytes(), [5u8; 4096]);
         assert!(!next.exists());
         let left = std::fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(left, 1, "no staging file left");
@@ -1592,7 +1792,7 @@ mod tests {
             file(format!("other.tmp-{GONE}-0")),
             file(LIBRARY_FILE.to_owned()),
         ];
-        let blob = Blob::of(dir.path());
+        let blob = Blob::of(dir.path()).0;
         assert_eq!(blob.bytes(), b"staged", "the library itself");
         for name in &removed {
             assert!(!dir.path().join(name).exists(), "{name} left");

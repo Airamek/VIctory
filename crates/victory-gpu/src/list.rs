@@ -1146,16 +1146,15 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: keep console flags so thread-count
+/// dispatches (`flags & 0x20`, used by the ray-tracing builder) convert to
+/// group counts and populate `USER_DISPATCH_THREADS_X`.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    count_dispatch();
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    state::dispatch_with_flags(this, x, y, z, Some(flags));
     #[cfg(not(windows))]
-    {
-        let _ = (this, x, y, z);
-        count_dispatch();
-    }
+    let _ = (this, x, y, z, flags);
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: an occlusion query marks the
@@ -1315,18 +1314,15 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+    let Ok(size) = usize::try_from(size) else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
-    let Some(block) = Upload::new(len) else {
+    let Some((at, block)) = Upload::alloc(size, align) else {
         return std::ptr::null_mut();
     };
-    let start = block.start();
-    // SAFETY: the offset is below `align`, so `size` bytes fit after it.
-    let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
@@ -1336,86 +1332,265 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// Memory [`allocate_upload`] hands out, zeroed, freed when the list is
 /// reset. On Windows it lies in [4 GiB, 2^40), where translated shaders
 /// find title memory by address (`crate::memory`; the console's GPU
-/// addresses have 40 bits), and is a buffer of its own to the host copies
-/// (`crate::shadow`), so its copy is exactly it.
-struct Upload {
-    #[cfg(windows)]
+/// addresses have 40 bits), and is registered with the host copies
+/// (`crate::shadow`).
+///
+/// Small and medium allocations (`<= UPLOAD_SLAB_MAX_ALLOC`) are bump-carved
+/// from reusable 2 MiB slabs so many tiny uploads share one `VirtualAlloc2`
+/// reservation and one shadow registration instead of rounding each call up
+/// to Windows' 64 KiB granularity (upstream #3434, knob-free: always on,
+/// idle cache capped at a const 16 MiB, no `VICTORY_UPLOAD_SLAB*` knobs).
+/// Larger requests allocate a dedicated `VirtualAlloc2` block released
+/// immediately on drop.
+#[cfg(windows)]
+const UPLOAD_SLAB_BYTES: usize = 2 << 20;
+#[cfg(windows)]
+const UPLOAD_SLAB_MAX_ALLOC: usize = UPLOAD_SLAB_BYTES / 2;
+/// Idle slabs kept for reuse: 8 slabs of 2 MiB = 16 MiB (a const, no knob).
+#[cfg(windows)]
+const UPLOAD_SLAB_MAX_IDLE: usize = 8;
+
+#[cfg(windows)]
+fn alloc_gpu_upload_region(len: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE,
+        MemExtendedParameterAddressRequirements, PAGE_READWRITE, VirtualAlloc2,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: (1usize << 32) as *mut _,
+        HighestEndingAddress: ((1usize << 40) - 1) as *mut _,
+        Alignment: 0,
+    };
+    let mut parameter = MEM_EXTENDED_PARAMETER::default();
+    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+    // Watched like the title's pools: copies take only written pages.
+    // SAFETY: a fresh allocation; the parameter points at `requirements`,
+    // which outlives the call.
+    let at = unsafe {
+        VirtualAlloc2(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            len,
+            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+            PAGE_READWRITE,
+            &mut parameter,
+            1,
+        )
+    } as usize;
+    if at == 0 {
+        return None;
+    }
+    crate::shadow::register(at, at as u64, len as u64);
+    UPLOADS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    UPLOADS[1].fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+    Some(at)
+}
+
+#[cfg(windows)]
+fn free_gpu_upload_region(at: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+    crate::shadow::unregister(at, at as u64);
+    UPLOADS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    UPLOADS[1].fetch_sub(len as u64, std::sync::atomic::Ordering::Relaxed);
+    // Not guarded any more: memory allocated here next is new.
+    crate::watch::title_memory_remapped(at, len);
+    // SAFETY: our allocation; lists that still use its copy hold that.
+    unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct UploadSlab {
     at: usize,
+    used: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(windows)]
+impl UploadSlab {
+    fn new() -> Option<Self> {
+        let at = alloc_gpu_upload_region(UPLOAD_SLAB_BYTES)?;
+        Some(Self {
+            at,
+            used: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for UploadSlab {
+    fn drop(&mut self) {
+        free_gpu_upload_region(self.at, UPLOAD_SLAB_BYTES);
+    }
+}
+
+#[cfg(windows)]
+struct SlabPool {
+    active: Option<(std::sync::Arc<UploadSlab>, usize)>,
+    idle: Vec<UploadSlab>,
+}
+
+#[cfg(windows)]
+type SlabAlloc = (
+    *mut u8,
+    std::sync::Arc<UploadSlab>,
+    Option<std::sync::Arc<UploadSlab>>,
+);
+
+#[cfg(windows)]
+impl SlabPool {
+    const fn new() -> Self {
+        Self {
+            active: None,
+            idle: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self, size: usize, align: usize) -> Option<SlabAlloc> {
+        if let Some((slab, cursor)) = &mut self.active {
+            if let Some((ptr, next)) = carve_from_slab(slab.at, *cursor, size, align) {
+                *cursor = next;
+                slab.used.store(next, std::sync::atomic::Ordering::Relaxed);
+                return Some((ptr, std::sync::Arc::clone(slab), None));
+            }
+            // All lists referencing the active slab have already reset: reuse it in place
+            // instead of discarding it on rollover.
+            if std::sync::Arc::strong_count(slab) == 1 {
+                reset_slab_for_reuse(slab);
+                if let Some((ptr, next)) = carve_from_slab(slab.at, 0, size, align) {
+                    *cursor = next;
+                    slab.used.store(next, std::sync::atomic::Ordering::Relaxed);
+                    return Some((ptr, std::sync::Arc::clone(slab), None));
+                }
+            }
+        }
+        let fresh = match self.idle.pop() {
+            Some(slab) => slab,
+            None => UploadSlab::new()?,
+        };
+        let (ptr, next) = carve_from_slab(fresh.at, 0, size, align)?;
+        fresh.used.store(next, std::sync::atomic::Ordering::Relaxed);
+        let arc = std::sync::Arc::new(fresh);
+        let replaced = self
+            .active
+            .replace((std::sync::Arc::clone(&arc), next))
+            .map(|(old, _)| old);
+        Some((ptr, arc, replaced))
+    }
+
+    fn recycle(&mut self, slab: UploadSlab) -> Option<UploadSlab> {
+        if self.idle.len() < UPLOAD_SLAB_MAX_IDLE {
+            self.idle.push(slab);
+            None
+        } else {
+            // Return excess slab so the caller drops it outside `SLAB_POOL.lock()`.
+            Some(slab)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn reset_slab_for_reuse(slab: &UploadSlab) {
+    let touched = slab.used.swap(0, std::sync::atomic::Ordering::Relaxed).min(UPLOAD_SLAB_BYTES);
+    if touched > 0 {
+        // SAFETY: exclusive ownership of the slab; zeroing restores the
+        // zeroed contract of `allocate_upload` before reuse.
+        unsafe { std::ptr::write_bytes(slab.at as *mut u8, 0, touched) };
+        crate::watch::title_memory_remapped(slab.at, touched);
+    }
+}
+
+#[cfg(windows)]
+fn carve_from_slab(base: usize, cursor: usize, size: usize, align: usize) -> Option<(*mut u8, usize)> {
+    let addr = base.checked_add(cursor)?;
+    let rem = addr & (align - 1);
+    let pad = if rem == 0 { 0 } else { align - rem };
+    let start = cursor.checked_add(pad)?;
+    let next = start.checked_add(size.max(1))?;
+    if next > UPLOAD_SLAB_BYTES {
+        return None;
+    }
+    Some(((base + start) as *mut u8, next))
+}
+
+#[cfg(windows)]
+static SLAB_POOL: std::sync::Mutex<SlabPool> = std::sync::Mutex::new(SlabPool::new());
+
+#[cfg(windows)]
+struct SlabHandle(Option<std::sync::Arc<UploadSlab>>);
+
+#[cfg(windows)]
+impl Drop for SlabHandle {
+    fn drop(&mut self) {
+        let Some(arc) = self.0.take() else {
+            return;
+        };
+        if let Ok(slab) = std::sync::Arc::try_unwrap(arc) {
+            reset_slab_for_reuse(&slab);
+            let excess = SLAB_POOL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .recycle(slab);
+            drop(excess);
+        }
+    }
+}
+
+enum Upload {
     #[cfg(windows)]
-    len: usize,
+    Direct { at: usize, len: usize },
+    #[cfg(windows)]
+    Slab(#[allow(dead_code)] SlabHandle),
     #[cfg(not(windows))]
-    block: Vec<u8>,
+    Owned(#[allow(dead_code)] Vec<u8>),
 }
 
 impl Upload {
     #[cfg(windows)]
-    fn new(len: usize) -> Option<Upload> {
-        use windows_sys::Win32::System::Memory::{
-            MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE,
-            MemExtendedParameterAddressRequirements, PAGE_READWRITE, VirtualAlloc2,
-        };
-        const MEM_WRITE_WATCH: u32 = 0x20_0000;
-        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
-            LowestStartingAddress: (1usize << 32) as *mut _,
-            HighestEndingAddress: ((1usize << 40) - 1) as *mut _,
-            Alignment: 0,
-        };
-        let mut parameter = MEM_EXTENDED_PARAMETER::default();
-        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
-        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
-        // Watched like the title's pools: copies take only written pages.
-        // SAFETY: a fresh allocation; the parameter points at `requirements`,
-        // which outlives the call.
-        let at = unsafe {
-            VirtualAlloc2(
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                len,
-                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
-                PAGE_READWRITE,
-                &mut parameter,
-                1,
-            )
-        } as usize;
-        if at == 0 {
-            return None;
+    fn alloc(size: usize, align: usize) -> Option<(*mut u8, Upload)> {
+        // `VirtualAlloc2` slabs are 64 KiB aligned, so `align <= 64 KiB` guarantees
+        // carving at cursor 0 never fails and never wastes a popped idle slab.
+        if size <= UPLOAD_SLAB_MAX_ALLOC && align <= (64 << 10) {
+            let alloc = {
+                let mut pool = SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner());
+                pool.alloc(size, align)
+            };
+            if let Some((ptr, slab, replaced)) = alloc {
+                // Drop any replaced active slab outside `SLAB_POOL.lock()`.
+                drop(SlabHandle(replaced));
+                return Some((ptr, Upload::Slab(SlabHandle(Some(slab)))));
+            }
         }
-        crate::shadow::register(at, at as u64, len as u64);
-        UPLOADS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        UPLOADS[1].fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
-        Some(Upload { at, len })
+        let len = size.checked_add(align)?;
+        let at = alloc_gpu_upload_region(len)?;
+        let start = at as *mut u8;
+        // SAFETY: the offset is below `align`, so `size` bytes fit after it.
+        let ptr = unsafe { start.add(start.align_offset(align)) };
+        Some((ptr, Upload::Direct { at, len }))
     }
 
     #[cfg(not(windows))]
-    fn new(len: usize) -> Option<Upload> {
-        Some(Upload {
-            block: vec![0; len],
-        })
-    }
-
-    fn start(&self) -> *mut u8 {
-        #[cfg(windows)]
-        return self.at as *mut u8;
-        #[cfg(not(windows))]
-        return self.block.as_ptr().cast_mut();
+    fn alloc(size: usize, align: usize) -> Option<(*mut u8, Upload)> {
+        let len = size.checked_add(align)?;
+        let block = vec![0u8; len];
+        let start = block.as_ptr().cast_mut();
+        // SAFETY: the offset is below `align`, so `size` bytes fit after it.
+        let ptr = unsafe { start.add(start.align_offset(align)) };
+        Some((ptr, Upload::Owned(block)))
     }
 }
 
 #[cfg(windows)]
 impl Drop for Upload {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
-        crate::shadow::unregister(self.at, self.at as u64);
-        UPLOADS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        UPLOADS[1].fetch_sub(self.len as u64, std::sync::atomic::Ordering::Relaxed);
-        // Not guarded any more: memory allocated here next is new.
-        crate::watch::title_memory_remapped(self.at, self.len);
-        // SAFETY: our allocation; lists that still use its copy hold that.
-        unsafe { VirtualFree(self.at as *mut _, 0, MEM_RELEASE) };
+        if let Upload::Direct { at, len } = *self {
+            free_gpu_upload_region(at, len);
+        }
     }
 }
 
-// SAFETY: plain memory, handed out once.
+// SAFETY: plain memory, handed out once (or shared read-only handle until last drop).
 #[cfg(windows)]
 unsafe impl Send for Upload {}
 
@@ -1671,8 +1846,11 @@ mod state {
         super::count_dispatch();
         with_state(this, |list, s| {
             s.flush_indirect(list);
-            s.dispatch(list, x, y, z)
+            s.dispatch(list, x, y, z, None)
         });
+    }
+    pub(super) fn dispatch_with_flags(this: This, x: u32, y: u32, z: u32, flags: Option<u32>) {
+        with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -2240,5 +2418,74 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    /// Small list uploads share 2 MiB slabs (knob-free: always on, const
+    /// 16 MiB idle cap); recycled slabs are zeroed and oversized uploads
+    /// bypass the pool (upstream #3434, no `VICTORY_UPLOAD_SLAB*` knobs).
+    #[cfg(windows)]
+    #[test]
+    fn upload_slab_packs_aligns_recycles_and_bypasses_oversized() {
+        assert_eq!(UPLOAD_SLAB_BYTES, 2 << 20);
+        assert_eq!(UPLOAD_SLAB_MAX_ALLOC, UPLOAD_SLAB_BYTES / 2);
+        assert_eq!(UPLOAD_SLAB_MAX_IDLE * UPLOAD_SLAB_BYTES, 16 << 20);
+
+        let mut pool = SlabPool::new();
+        let (p1, s1, _) = pool.alloc(64, 256).expect("first slab alloc");
+        let (p2, s2, _) = pool.alloc(128, 256).expect("second slab alloc");
+        assert!(std::sync::Arc::ptr_eq(&s1, &s2), "small uploads share one slab");
+        assert!((p1 as usize).is_multiple_of(256));
+        assert!((p2 as usize).is_multiple_of(256));
+        assert!(p2 as usize >= p1 as usize + 64);
+        // SAFETY: 64 bytes were allocated at p1.
+        unsafe { p1.write_bytes(0x5A, 64) };
+
+        // Filling past the slab rolls to a new slab, allowing the first to be recycled once dropped.
+        let (_, s3, _) = pool.alloc(UPLOAD_SLAB_MAX_ALLOC, 64).expect("half slab");
+        let (_, s4, replaced) = pool.alloc(UPLOAD_SLAB_MAX_ALLOC, 64).expect("rolls to new slab");
+        assert!(!std::sync::Arc::ptr_eq(&s1, &s4));
+        drop(replaced);
+        let first_base = s1.at;
+        drop(s2);
+        drop(s3);
+        let unwrapped = std::sync::Arc::try_unwrap(s1).expect("first slab exclusively owned");
+        reset_slab_for_reuse(&unwrapped);
+        assert!(pool.recycle(unwrapped).is_none());
+        assert_eq!(pool.idle.len(), 1);
+        assert_eq!(pool.idle[0].at, first_base);
+        // Recycled slab must be zeroed back to clean state.
+        // SAFETY: first_base is live in pool.idle.
+        let first_bytes = unsafe { std::slice::from_raw_parts(first_base as *const u8, 64) };
+        assert!(first_bytes.iter().all(|&b| b == 0));
+
+        // Reset-before-rollover path: when all external handles drop while `active` still holds
+        // the only reference, a subsequent alloc that does not fit reuses `active` in place.
+        let (_, s4b, _) = pool.alloc(64, 64).expect("push cursor past half slab");
+        let active_base = s4.at;
+        drop(s4);
+        drop(s4b);
+        let (p5, s5, r5) = pool.alloc(UPLOAD_SLAB_MAX_ALLOC, 64).expect("in-place reuse");
+        assert!(r5.is_none());
+        assert_eq!(s5.at, active_base, "active slab reused in place on reset-before-rollover");
+        assert_eq!(p5 as usize, active_base);
+
+        // Recycling keeps slabs up to the const idle cap, and returns the
+        // excess slab to be dropped outside the lock.
+        drop(pool.active.take());
+        let unwrapped5 = std::sync::Arc::try_unwrap(s5).expect("second slab exclusively owned");
+        assert!(pool.recycle(unwrapped5).is_none());
+        while pool.idle.len() < UPLOAD_SLAB_MAX_IDLE {
+            let slab = UploadSlab::new().expect("slab for the idle fill");
+            assert!(pool.recycle(slab).is_none());
+        }
+        let extra = UploadSlab::new().expect("excess slab");
+        assert!(pool.recycle(extra).is_some(), "excess slab returned to drop");
+        assert_eq!(pool.idle.len(), UPLOAD_SLAB_MAX_IDLE, "idle cap enforced");
+
+        // Oversized uploads (> UPLOAD_SLAB_MAX_ALLOC) bypass the slab pool cleanly.
+        let (big_ptr, big) = Upload::alloc(UPLOAD_SLAB_MAX_ALLOC + 4096, 256).expect("oversized upload");
+        assert!(!big_ptr.is_null() && (big_ptr as usize).is_multiple_of(256));
+        assert!(matches!(big, Upload::Direct { .. }));
+        drop(big);
     }
 }

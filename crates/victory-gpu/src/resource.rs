@@ -1612,10 +1612,25 @@ fn evictable(t: &HostTexture) -> bool {
     t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Bytes past [`BUDGET_LOW`] to give up: the card's local use minus the
+/// free space in the heaps of textures (which takes the card's memory but
+/// is not in use: new textures go there first), once past [`BUDGET_HIGH`];
+/// nothing otherwise. Shared by the present-gated pass ([`evict_now`]) and
+/// the submission-pressure backstop ([`evict_pressure_tick`]).
+#[cfg(windows)]
+pub(crate) fn pressure_over() -> u64 {
+    crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+        let used = used - crate::placement::free_bytes() as f64 / 1e6;
+        if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
+    })
+}
+
 /// Once per presented frame, before a submission (`Host::execute`, one at a
 /// time, the last one has run): gives up host textures fed from title memory
 /// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
 /// the card's budget the least recently used ones until [`BUDGET_LOW`].
+/// When presents stall this gate never opens; the submission-pressure
+/// backstop ([`evict_pressure_tick`]) then gives up textures instead.
 #[cfg(windows)]
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1624,19 +1639,182 @@ pub(crate) fn evict_unused() {
     if LAST.swap(frame, Relaxed) == frame {
         return;
     }
-    let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
-        // Free space in the heaps of textures takes the card's memory but
-        // is not in use: new textures go there first.
-        let used = used - crate::placement::free_bytes() as f64 / 1e6;
-        if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
-    });
-    evict(frame, now_ms(), over);
+    evict_now(frame);
     // Placed shells past their own high marks are let go of least recently
-    // used first, in this same once-per-presented-frame slot.
+    // used first, in this same once-per-presented-frame slot (placed-shell
+    // bound), alongside the pressure-gated host-texture pass above. The
+    // `over` that pass uses is [`pressure_over`], the same budget query the
+    // two sides of this merge computed inline.
     let (placed_bytes, placed_shells) = placed_over();
     if placed_bytes > 0 || placed_shells > 0 {
         evict_placed(frame, now_ms(), placed_bytes, placed_shells);
     }
+}
+
+/// The present-gated pass's body at presented frame `frame`: [`evict`],
+/// uncapped (presents pace it: at most one pass per frame).
+#[cfg(windows)]
+fn evict_now(frame: u64) {
+    evict(frame, now_ms(), pressure_over(), None);
+}
+
+/// Submission-pressure backstop cadence: a pass at most this many
+/// submissions, this long, or this much process-commit growth after the
+/// last one (whichever comes first), while presents stall.
+#[cfg(windows)]
+const PRESSURE_EVERY_SUBS: u64 = 32;
+#[cfg(windows)]
+const PRESSURE_EVERY_MS: u64 = 100;
+#[cfg(windows)]
+const PRESSURE_COMMIT_BYTES: u64 = 256 << 20;
+/// A pressure pass gives up at most this many textures and bytes: later
+/// passes (or the present-gated one, which is uncapped) take the rest. The
+/// pass logs when the cap cut it short.
+#[cfg(windows)]
+const PRESSURE_MAX_TEXTURES: usize = 64;
+#[cfg(windows)]
+const PRESSURE_MAX_BYTES: u64 = 256 << 20;
+/// A still-positive video-memory `over` retriggers a pass this soon after
+/// the last one (without waiting for the count above); the query behind it
+/// refreshes at most this often.
+#[cfg(windows)]
+const PRESSURE_OVER_MS: u64 = 20;
+
+/// Submission-pressure passes since the last frame-rate line, capped ones,
+/// idle and least-recently-used textures given up, video-memory `over`
+/// bytes summed, and pass latency: [`log_evictions`] reports them.
+#[cfg(windows)]
+static PRESSURE_STATS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+#[cfg(windows)]
+const PRESSURE_PASSES: usize = 0;
+#[cfg(windows)]
+const PRESSURE_CAPPED: usize = 1;
+#[cfg(windows)]
+const PRESSURE_IDLE: usize = 2;
+#[cfg(windows)]
+const PRESSURE_LRU: usize = 3;
+#[cfg(windows)]
+const PRESSURE_OVER: usize = 4;
+#[cfg(windows)]
+const PRESSURE_LAT_US: usize = 5;
+
+/// Submission-pressure backstop for [`evict_unused`] (same site in
+/// `Host::execute_inner`, beside it): when presents stall, the LAST gate
+/// above never opens and nothing is ever given up, while submissions keep
+/// allocating. Runs a capped [`evict_pressure`] pass once submissions keep
+/// coming without a present: video-memory `over` ([`pressure_over`]),
+/// process-commit growth since the last pass, submission count, or elapsed
+/// time. Lock order unchanged ([`TEXTURES_AT`] then [`GIVEN_UP`] then the
+/// host lock, under the submission lock); no new threads. The shadow path
+/// needs no backstop (allocation-time [`crate::shadow::relieve`] covers it).
+/// `commit` is the process's private bytes (0 when unknown: the count, time
+/// and `over` triggers still fire).
+#[cfg(windows)]
+pub(crate) fn evict_pressure_tick(commit: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static LAST_COMMIT: AtomicU64 = AtomicU64::new(0);
+    static LAST_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static SINCE: AtomicU64 = AtomicU64::new(0);
+    static CACHED_OVER: AtomicU64 = AtomicU64::new(0);
+    static CACHED_AT: AtomicU64 = AtomicU64::new(0);
+    let now = now_ms();
+    let frame = crate::queue::presented();
+    // Presents flowing: the gated pass covers eviction; re-arm the backstop.
+    if LAST_FRAME.swap(frame, Relaxed) != frame {
+        SINCE.store(0, Relaxed);
+        LAST_MS.store(now, Relaxed);
+        LAST_COMMIT.store(commit, Relaxed);
+        return;
+    }
+    let since = SINCE.fetch_add(1, Relaxed) + 1;
+    let last = LAST_MS.load(Relaxed);
+    let growth = commit.saturating_sub(LAST_COMMIT.load(Relaxed));
+    // The video-memory query behind an interval (and the count below): the
+    // cached `over` retriggers while pressure lasts, without a query and a
+    // heap lock per submission.
+    if now.saturating_sub(CACHED_AT.load(Relaxed)) >= PRESSURE_OVER_MS {
+        CACHED_OVER.store(pressure_over(), Relaxed);
+        CACHED_AT.store(now, Relaxed);
+    }
+    let over = CACHED_OVER.load(Relaxed);
+    if since < PRESSURE_EVERY_SUBS
+        && now.saturating_sub(last) < PRESSURE_EVERY_MS
+        && growth < PRESSURE_COMMIT_BYTES
+        && (over == 0 || now.saturating_sub(last) < PRESSURE_OVER_MS)
+    {
+        return;
+    }
+    // The pass's own `over` is fresh (its free-bytes value is this pass's).
+    let over = pressure_over();
+    CACHED_OVER.store(over, Relaxed);
+    CACHED_AT.store(now, Relaxed);
+    evict_pressure(now, over);
+    LAST_MS.store(now, Relaxed);
+    LAST_COMMIT.store(commit, Relaxed);
+    SINCE.store(0, Relaxed);
+}
+
+/// A capped submission-pressure pass at (`now`, `over`): [`evict`] without
+/// the presented-frame LAST gate above (the backstop keeps its own stamps
+/// in [`evict_pressure_tick`]), at most [`PRESSURE_MAX_TEXTURES`] textures
+/// and [`PRESSURE_MAX_BYTES`] bytes. Accumulates the per-pass statistics
+/// the frame-rate line reports ([`log_evictions`]); logs when capped.
+#[cfg(windows)]
+pub(crate) fn evict_pressure(now: u64, over: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    let (n, bytes, idle, lru, capped) = evict(
+        crate::queue::presented(),
+        now,
+        over,
+        Some((PRESSURE_MAX_TEXTURES, PRESSURE_MAX_BYTES)),
+    );
+    PRESSURE_STATS[PRESSURE_PASSES].fetch_add(1, Relaxed);
+    PRESSURE_STATS[PRESSURE_IDLE].fetch_add(idle, Relaxed);
+    PRESSURE_STATS[PRESSURE_LRU].fetch_add(lru, Relaxed);
+    PRESSURE_STATS[PRESSURE_OVER].fetch_add(over, Relaxed);
+    PRESSURE_STATS[PRESSURE_LAT_US].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    if capped {
+        let total = PRESSURE_STATS[PRESSURE_CAPPED].fetch_add(1, Relaxed) + 1;
+        if total.is_power_of_two() {
+            tracing::info!(
+                n,
+                bytes,
+                over,
+                idle,
+                lru,
+                total,
+                "submission-pressure eviction capped: the pass gave up what fit, the rest stays for later passes"
+            );
+        }
+    }
+}
+
+/// Logs [`EVICTIONS`] per frame over `frames`, with the submission-pressure
+/// passes since the last call: beside [`crate::shadow::log_shadow`].
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn log_evictions(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let frames = frames.max(1.0);
+    let [evicted, bytes, remade, soon] = [0, 1, 2, 3].map(|i| EVICTIONS[i].swap(0, Relaxed));
+    let [passes, capped, idle, lru, over, lat_us] =
+        [0, 1, 2, 3, 4, 5].map(|i| PRESSURE_STATS[i].swap(0, Relaxed));
+    let per = |total: u64| if passes > 0 { total as f64 / passes as f64 } else { 0.0 };
+    tracing::info!(
+        "host textures given up: {:.1}/frame ({:.1} MB/frame), {:.1} remade/frame ({:.1} soon/frame); pressure passes {:.0} ({:.0} capped): over {:.1} MB/pass, idle {:.1}/pass, lru {:.1}/pass, {:.2} ms/pass",
+        evicted as f64 / frames,
+        bytes as f64 / frames / 1e6,
+        remade as f64 / frames,
+        soon as f64 / frames,
+        passes as f64,
+        capped as f64,
+        per(over) / 1e6,
+        per(idle),
+        per(lru),
+        per(lat_us) / 1e3,
+    );
 }
 
 /// A host texture and the title textures (resource objects) holding it.
@@ -1646,18 +1824,23 @@ pub(crate) type Owned = (std::sync::Arc<HostTexture>, Vec<usize>);
 /// Gives up the host textures fed from title memory that the title has
 /// not used for [`IDLE_MS`] and [`IDLE_FRAMES`] at (`frame`, `now` ms),
 /// then least recently used ones until `over` bytes are gone
-/// ([`give_up`]). Returns how many and their bytes.
+/// ([`give_up`]). With `cap`, a pressure pass: at most that many textures
+/// and bytes, idle first. Returns how many and their bytes, with the idle
+/// and least-recently-used counts and whether the cap cut the pass short.
 #[cfg(windows)]
-fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
+fn evict(frame: u64, now: u64, over: u64, cap: Option<(usize, u64)>) -> (u64, u64, u64, u64, bool) {
     // Read through the heap since the last pass: used (a slot's read mark is
     // reported as new only once, so its first read alone stamped it; run
     // evict1 gave up and made again hundreds of textures a frame).
     let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-    evict_among(&candidates(), &read, frame, now, over)
+    evict_among(&candidates(), &read, frame, now, over, cap)
 }
 
 /// [`evict`] among `candidates`, with `read` (raw pointers) the host
-/// textures shaders read through the heap since the last pass.
+/// textures shaders read through the heap since the last pass. With `cap`
+/// (a pressure pass: at most that many textures and bytes, idle first).
+/// Returns how many were given up and their bytes, with the idle and
+/// least-recently-used counts and whether the cap cut the pass short.
 #[cfg(windows)]
 pub(crate) fn evict_among(
     candidates: &[Owned],
@@ -1665,7 +1848,8 @@ pub(crate) fn evict_among(
     frame: u64,
     now: u64,
     over: u64,
-) -> (u64, u64) {
+    cap: Option<(usize, u64)>,
+) -> (u64, u64, u64, u64, bool) {
     use std::sync::atomic::Ordering::Relaxed;
     for (t, _) in candidates {
         if read.contains(&(windows::core::Interface::as_raw(&t.texture) as usize)) {
@@ -1674,9 +1858,30 @@ pub(crate) fn evict_among(
     }
     let uses: Vec<(u64, u64, u64)> =
         candidates.iter().map(|(t, _)| (t.last[0].load(Relaxed), t.last[1].load(Relaxed), t.bytes)).collect();
-    let chosen = choose(&uses, frame, now, over);
+    let mut chosen = choose(&uses, frame, now, over);
+    // A capped (pressure) pass takes a prefix of the choice: the first
+    // texture always (progress past even one huge one), then while both
+    // caps hold. The choice is idle first, so idle textures keep priority;
+    // what the cap cuts stays for a later pass (or the present-gated one,
+    // which is uncapped).
+    let mut capped = false;
+    if let Some((max_n, max_bytes)) = cap {
+        let mut bytes = 0u64;
+        let mut end = 0usize;
+        for &i in &chosen {
+            if end > 0 && (end >= max_n || bytes >= max_bytes) {
+                break;
+            }
+            bytes = bytes.saturating_add(uses[i].2);
+            end += 1;
+        }
+        capped = end < chosen.len();
+        chosen.truncate(end);
+    }
+    let idle = chosen.iter().filter(|&&i| is_idle(&uses[i], frame, now)).count() as u64;
     let gone: Vec<Owned> = chosen.into_iter().map(|i| candidates[i].clone()).collect();
-    give_up(&gone, frame)
+    let (n, bytes) = give_up(&gone, frame);
+    (n, bytes, idle, n.saturating_sub(idle), capped)
 }
 
 /// The host textures that may be given up ([`evictable`]), each with the
@@ -1693,13 +1898,19 @@ fn candidates() -> Vec<Owned> {
     by.into_values().collect()
 }
 
+/// Whether a texture last used at (frame, ms) is idle at (`frame`, `now`):
+/// unused for [`IDLE_FRAMES`] presented frames and [`IDLE_MS`] ms.
+#[cfg(windows)]
+fn is_idle(&(f, ms, _): &(u64, u64, u64), frame: u64, now: u64) -> bool {
+    frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS
+}
+
 /// Of textures last used at (frame, ms) taking (bytes) each, those to give
 /// up at (`frame`, `now`): every one idle for [`IDLE_FRAMES`] and
 /// [`IDLE_MS`], then the least recently used others until `over` bytes are
-/// gone (indices).
+/// gone (indices, idle first).
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
-    let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
-    let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
+    let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| is_idle(&uses[i], frame, now));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
     rest.sort_by_key(|&i| uses[i].1);
     for i in rest {

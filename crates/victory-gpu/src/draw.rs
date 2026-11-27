@@ -257,6 +257,23 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// A `DispatchX` thread count and its group size to the groups the host
+/// dispatches, and whether the shader's partial guard applies: only a
+/// guarded compute shader (`partial_dispatch`) with the console's
+/// thread-count flag (`flags & 0x20`, the ray-tracing builder's dispatches)
+/// converts; title group counts pass through untouched.
+fn dispatch_counts(
+    flags: Option<u32>,
+    guarded: bool,
+    threads: Option<[u32; 3]>,
+    counts: [u32; 3],
+) -> ([u32; 3], bool) {
+    let Some(size) = threads.filter(|_| guarded && flags.is_some_and(|f| f & 0x20 != 0)) else {
+        return (counts, false);
+    };
+    (std::array::from_fn(|i| counts[i].div_ceil(size[i])), true)
+}
+
 /// Tables from this many entries on are made once for every length shaders
 /// read them to: copies of the same table at several lengths took most of
 /// the dynamic slots, and heavy frames ran out of them.
@@ -574,6 +591,8 @@ impl State {
             (Some(Root::Constants(c)), RootType::Constants) => {
                 c.get(dword as usize).copied().unwrap_or(0)
             }
+            // The real X thread count is set just before the dispatch.
+            (_, RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)) => 0,
             _ => {
                 once!(
                     slot,
@@ -1207,7 +1226,7 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: Option<u32>) {
         if x == 0 || y == 0 || z == 0 {
             return;
         }
@@ -1238,12 +1257,38 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        // A partial dispatch's real thread count: the shader's guard word
+        // takes the title's X count while its last group runs short.
+        let stage = p.stages.first().map(|s| (s, s.translated()));
+        let tail = stage.filter(|(_, t)| t.partial_dispatch).and_then(|(s, t)| {
+            let (param, _) = s.user_data?;
+            let word = t.host.user_data.iter().find(|u| {
+                u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)
+            })?;
+            Some((param, word.index))
+        });
+        let counts = [x, y, z];
+        let ([x, y, z], converted) = dispatch_counts(
+            flags,
+            tail.is_some(),
+            stage.and_then(|(_, t)| t.compute_threads),
+            counts,
+        );
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // SAFETY: an open list with everything set; `tail` names a declared
+        // root word.
+        unsafe {
+            if let Some((param, word)) = tail.filter(|_| converted) {
+                list.list.SetComputeRoot32BitConstant(param, counts[0], word);
+            }
+            list.list.Dispatch(x, y, z);
+            if let Some((param, word)) = tail.filter(|_| converted) {
+                list.list.SetComputeRoot32BitConstant(param, 0, word);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2375,6 +2420,30 @@ const QUAD_STRIP: u32 = 20;
 mod tests {
     use super::*;
 
+    /// `DispatchX` thread counts convert to group counts only with the
+    /// console's thread-count flag on a guarded partial dispatch.
+    #[test]
+    fn dispatch_x_counts_are_groups_without_a_partial_dispatch_guard() {
+        let sizes = Some([64, 1, 1]);
+        let counts = [129, 1, 1];
+        assert_eq!(
+            dispatch_counts(Some(0x20), true, sizes, counts),
+            ([3, 1, 1], true)
+        );
+        assert_eq!(
+            dispatch_counts(Some(0x20), false, sizes, counts),
+            (counts, false)
+        );
+        assert_eq!(
+            dispatch_counts(None, true, sizes, counts),
+            (counts, false)
+        );
+        assert_eq!(
+            dispatch_counts(Some(0x20), true, None, counts),
+            (counts, false)
+        );
+    }
+
     #[test]
     fn changing_root_signatures_invalidates_only_the_matching_bindings() {
         let _gpu = crate::host::gpu_test_lock();
@@ -3235,6 +3304,8 @@ uint ps() : SV_Target { return 1; }
                     view_marks: false,
                 },
                 used,
+                compute_threads: None,
+                partial_dispatch: false,
             },
         );
         let p = crate::pipeline::host::HostPipeline::new(&[shader], None).expect("a host pipeline");
@@ -3416,6 +3487,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
+        // Measures the process-global alias-copy counter around placed-view
+        // reads: no sibling alias copy may land in a round's window.
+        let _alias = crate::texture::ALIAS_ONE.lock().unwrap_or_else(|e| e.into_inner());
         let slots = Slots::new(4);
         let read = compile_cs(READ);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
@@ -4087,6 +4161,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::pipeline::Translated {
                 host: host_shader,
                 used: used_entries,
+                compute_threads: None,
+                partial_dispatch: false,
             },
         );
         let hp = HostPipeline::new(&[shader], None).expect("compute host pipeline");

@@ -305,7 +305,10 @@ pub(crate) fn wait_for_submission(
 /// and the snapshot single-test lock, which it replaces: one lock means no
 /// lock ordering to get wrong. Poison-tolerant, so a failed test never
 /// wedges the suite. Production code never takes it, and tests never call
-/// other tests, so it cannot deadlock.
+/// other tests, so it cannot deadlock. Also ported from eval/test-determinism
+/// for the heap-shard release-count fix (Held snapshots add_ref heaps;
+/// without serialization a concurrent snapshot inflates a heap's count and
+/// the release==0 assert flakes).
 #[cfg(test)]
 pub(crate) static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1266,8 +1269,14 @@ pub(crate) mod tests {
     fn read_marks_of_both_bitmaps_are_taken() {
         let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else { return };
-        // No submission takes the marks meanwhile.
+        // The read-mark registry and both bitmaps are process-global: no
+        // sibling mark test runs meanwhile, and no submission takes the
+        // marks (lock order: the mark lock first, the submission lock second).
+        let _marks = crate::shadow::tests::MARKS_ONE.lock().unwrap_or_else(|e| e.into_inner());
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Finish in-flight submissions first: their completions drain the
+        // same read marks this test asserts on.
+        host.drain();
         let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
         crate::shadow::tests::mark_read(false, plain);
         crate::shadow::tests::mark_read(true, memory);
@@ -1307,8 +1316,12 @@ pub(crate) mod tests {
         assert!(heap_host.mirror(0, title_heap.start, true).is_some());
         let texture = crate::resource::texture_at(address, &words).expect("its resource");
         let raw = windows::core::Interface::as_raw(&crate::resource::made_copy(texture).unwrap().texture) as usize;
-        // No submission takes the marks meanwhile.
+        // No sibling mark test and no submission takes the marks meanwhile
+        // (lock order: the mark lock first, the submission lock second).
+        let _marks = crate::shadow::tests::MARKS_ONE.lock().unwrap_or_else(|e| e.into_inner());
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Finish in-flight submissions first (as above).
+        host.drain();
         for _ in 0..2 {
             crate::shadow::tests::mark_read(false, 0);
             let slots = crate::shadow::reads_since();
@@ -1355,8 +1368,12 @@ pub(crate) mod tests {
         let owned: Vec<_> = textures.iter().map(|&t| crate::resource::owned(t).expect("may be given up")).collect();
         let (idle_frames, idle_ms) = (crate::resource::IDLE_FRAMES, crate::resource::IDLE_MS);
         {
-            // No submission takes the marks meanwhile.
+            // No sibling mark test and no submission takes the marks meanwhile
+            // (lock order: the mark lock first, the submission lock second).
+            let _marks = crate::shadow::tests::MARKS_ONE.lock().unwrap_or_else(|e| e.into_inner());
             let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            // Finish in-flight submissions first (as above).
+            host.drain();
             // Passes a third of the idle limits apart, over three times them.
             for k in 0..10 {
                 crate::shadow::tests::mark_read(false, 5);
@@ -1364,7 +1381,7 @@ pub(crate) mod tests {
                     crate::shadow::tests::mark_read(false, 6);
                 }
                 let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-                crate::resource::evict_among(&owned, &read, 1000 + k * idle_frames / 3, 1_000_000 + k * idle_ms / 3, 0);
+                crate::resource::evict_among(&owned, &read, 1000 + k * idle_frames / 3, 1_000_000 + k * idle_ms / 3, 0, None);
                 assert!(crate::resource::made_copy(textures[0]).is_some(), "read every frame: stays (frame {k})");
             }
         }
@@ -1981,12 +1998,16 @@ fn take_spare_upload(size: u64) -> Option<(ID3D12Resource, *mut u8, usize)> {
 }
 
 /// Keeps finished upload buffers for reuse, bounded in count and bytes;
-/// the rest drop (their committed resources are freed).
+/// the rest drop (their committed resources are freed). Under host memory
+/// pressure the byte bound shrinks to the prefetch cap, so idle spares are
+/// let go instead of held (`crate::residency`).
 fn return_spare_uploads(uploads: Vec<(ID3D12Resource, usize, usize)>) {
+    let max_bytes =
+        crate::residency::prefetch_limit(SPARE_UPLOADS_BYTES, crate::residency::pressured());
     let mut pool = pool(&SPARE_UPLOADS);
     for (buffer, data, cap) in uploads {
         let total: u64 = pool.iter().map(|(_, _, c)| *c as u64).sum();
-        if pool.len() >= SPARE_UPLOADS_MAX || total.saturating_add(cap as u64) > SPARE_UPLOADS_BYTES {
+        if pool.len() >= SPARE_UPLOADS_MAX || total.saturating_add(cap as u64) > max_bytes {
             continue;
         }
         pool.push((buffer, data, cap));
@@ -2638,6 +2659,17 @@ impl Host {
         self.execute_inner(runs, Some(gate));
     }
 
+    /// Test helper: holds the submission lock, so no submission (and with it
+    /// no submission-driven drain of the process-global read marks, mark
+    /// bitmaps, snapshot block, or eviction pass) runs while the caller
+    /// asserts on that shared state. Callers must not submit while holding
+    /// it; lock order with the test-only family locks is the family lock
+    /// first, this one second.
+    #[cfg(test)]
+    pub(crate) fn submitted_lock(&'static self) -> std::sync::MutexGuard<'static, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn execute_inner(&self, runs: &[&std::sync::Arc<HostList>], #[cfg(test)] gate: Option<&ID3D12Fence>) {
         self.finisher.call_once(|| {
             let spawned = std::thread::Builder::new()
@@ -2684,6 +2716,13 @@ impl Host {
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
         crate::resource::evict_unused();
+        // While presents stall the gate above never opens; the backstop
+        // gives up textures instead (same site, capped, no new threads).
+        #[cfg(feature = "diagnostics")]
+        let commit = process_memory().0;
+        #[cfg(not(feature = "diagnostics"))]
+        let commit: u64 = 0;
+        crate::resource::evict_pressure_tick(commit);
         // Host copies of title memory past the bound go the same way.
         crate::shadow::evict_unused();
         // Descriptors the title copied into its heaps itself, before the
@@ -6487,13 +6526,22 @@ pub(crate) fn copy_mapped_cached(
     // The copy stopped at an unmapped page. One of a title destination ends
     // it: the retries below write the destination themselves (zeros for
     // what cannot be read), and would fault there.
-    if title_dst
-        && !match known {
+    //
+    // `committed` walks the pages with `VirtualQuery`: that, not the move, is
+    // the copy term's per-run bookkeeping, so it is timed into its own bucket
+    // (FIND-49). The frame line already prints "queries … ms".
+    if title_dst {
+        #[cfg(feature = "diagnostics")]
+        let _querying =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::QueryUs);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Queries, 1);
+        if !match known {
             Some(known) => crate::texture::committed_cached(known, dst, len),
             None => crate::texture::committed(dst, len),
+        } {
+            return false;
         }
-    {
-        return false;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
@@ -7030,6 +7078,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(e.code().0);
                 tracing::warn!(error = %e, size, "no list buffer");
                 None
             }
@@ -7081,6 +7130,11 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                if !readback {
+                    // Readback heaps are never pooled upload memory; only a
+                    // refused *upload* allocation holds staging growth.
+                    crate::residency::allocation_error(e.code().0);
+                }
                 tracing::warn!(error = %e, size, readback, "no mapped buffer");
                 None
             }
@@ -7390,6 +7444,7 @@ struct Presenter {
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
+    last_present: windows::core::HRESULT,
     since: std::time::Instant,
     frames: u32,
     report_frames: u64,
@@ -7403,6 +7458,7 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            last_present: windows::Win32::Foundation::S_OK,
             since: now,
             frames: 0,
             report_frames: 0,
@@ -7412,12 +7468,27 @@ impl Meter {
         }
     }
 
+    /// Record a frame once the swap chain has accepted it.
+    fn record_present(&mut self, hwnd: HWND, status: windows::core::HRESULT) -> bool {
+        use windows::Win32::Foundation::S_OK;
+        if status != S_OK && status != self.last_present {
+            tracing::warn!(?status, "swap chain did not present the frame");
+        }
+        self.last_present = status;
+        if status != S_OK {
+            return false;
+        }
+        self.frame(hwnd);
+        true
+    }
+
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
         crate::memory::log_frame();
+        crate::watch::invalidations_done();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         self.report_frames += 1;
@@ -7525,6 +7596,7 @@ impl Meter {
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);
                 crate::shadow::log_shadow(report_frames);
+                crate::resource::log_evictions(report_frames);
                 costs::log(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
@@ -7576,6 +7648,25 @@ impl Meter {
                     }
                 });
         });
+    }
+}
+
+#[cfg(test)]
+mod present_status_tests {
+    use super::{HWND, Meter};
+    use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_FAIL, S_OK};
+
+    #[test]
+    fn the_meter_counts_successful_presents_across_a_failure() {
+        let mut meter = Meter::new();
+        let hwnd = HWND::default();
+        assert!(meter.record_present(hwnd, S_OK));
+        assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
+        assert!(!meter.record_present(hwnd, E_FAIL));
+        assert!(!meter.record_present(hwnd, E_FAIL));
+        assert!(meter.record_present(hwnd, S_OK));
+        assert_eq!(meter.frames, 2);
+        assert_eq!(meter.last_present, S_OK);
     }
 }
 
@@ -7883,7 +7974,7 @@ impl Host {
             };
             p.copy.close();
             self.execute(&[&p.copy]);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.presented = self.frame_done();
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
@@ -7895,7 +7986,10 @@ impl Host {
                 inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            p.meter.frame(p.hwnd);
+            // Count a frame once the swap chain accepts the present (8699d96):
+            // a refused present is warned once per status and yields no frame.
+            let presented = p.meter.record_present(p.hwnd, status);
+            if !presented { return None; }
             #[cfg(feature = "diagnostics")]
             {
                 p.probed = probe.map(|b| (frame, b));

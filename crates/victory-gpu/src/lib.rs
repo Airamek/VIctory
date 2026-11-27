@@ -30,6 +30,8 @@ pub mod device;
 #[cfg(all(test, windows))]
 mod dirty_pages_test;
 #[cfg(windows)]
+mod dirty_ranges;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 #[cfg(windows)]
@@ -54,6 +56,7 @@ mod placement;
 mod primitive;
 pub mod query;
 pub mod queue;
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

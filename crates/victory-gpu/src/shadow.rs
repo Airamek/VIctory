@@ -1736,17 +1736,42 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// gets copies of the aligned windows it touches: idle ones are given up by
 /// [`evict_unused`] and remade whole on next use (this supersedes the old
 /// never-free shortcut).
-const WINDOW: u64 = 4 << 20;
+/// 1 MiB windows (a const, no knob) keep rounding slack down on scattered
+/// small regions outside buffer objects.
+/// Copies of title memory outside buffers, by (start, length); a request
+/// inside an already-allocated window reuses it instead of allocating a
+/// duplicate overlapping buffer.
+const LOOSE_WINDOW: u64 = 1 << 20;
+
+fn loose_span(address: u64, end: u64) -> (u64, u64) {
+    let start = address & !(LOOSE_WINDOW - 1);
+    let len = end.next_multiple_of(LOOSE_WINDOW).saturating_sub(start).max(LOOSE_WINDOW);
+    (start, len)
+}
+
+/// An allocated loose shadow whose `[s_start, s_start + s_len)` already
+/// covers `[address, end)`, avoiding a duplicate overlapping host buffer.
+fn find_containing_loose<T>(map: &BTreeMap<(u64, u64), T>, address: u64, end: u64) -> Option<&T> {
+    map.range(..=(address, u64::MAX))
+        .rev()
+        .find(|&(&(s_start, s_len), _)| s_start <= address && s_start.saturating_add(s_len) >= end)
+        .map(|(_, v)| v)
+}
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
-    if let Some(shadow) = LOOSE.lock().unwrap_or_else(|e| e.into_inner()).get(&(start, len)) {
-        shadow.touch();
-        return Some(shadow.clone());
+    let (start, len) = loose_span(address, end);
+    {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = map
+            .get(&(start, len))
+            .or_else(|| find_containing_loose(&map, address, end))
+        {
+            shadow.touch();
+            return Some(shadow.clone());
+        }
     }
     if pressured(len) {
         // The evict pass takes the registries itself: never under one.
@@ -1764,7 +1789,10 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         return transient_dedicated(start, len);
     }
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    if let Some(shadow) = map
+        .get(&(start, len))
+        .or_else(|| find_containing_loose(&map, address, end))
+    {
         shadow.touch();
         return Some(shadow.clone());
     }
@@ -2374,6 +2402,12 @@ pub(crate) fn near(va: u64) -> String {
 pub(crate) mod tests {
     use super::*;
 
+    /// Serializes the tests that touch the process-global mark state (the
+    /// read-mark registry, the two mark bitmaps, and the mark owners): the
+    /// registry is drained by every submission, so these tests also hold
+    /// the submission lock (family lock first, submission lock second).
+    pub(crate) static MARKS_ONE: Mutex<()> = Mutex::new(());
+
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
     pub(crate) fn mark_read(memory: bool, slot: u32) {
@@ -2391,6 +2425,9 @@ pub(crate) mod tests {
     #[test]
     fn title_writes_under_a_busy_range_are_copied() {
         let _gpu = crate::host::gpu_test_lock();
+        // Touches the process-global snapshot block (declared ranges keep
+        // parts): one snapshot test at a time.
+        let _one = snapshot_tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -2599,6 +2636,18 @@ pub(crate) mod tests {
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
         let _gpu = crate::host::gpu_test_lock();
+        // The mark bitmaps and owner table are process-global (shared with
+        // every submission's mark copy-back), so no submission runs meanwhile.
+        // Lock order: the snapshot lock, the mark lock, the submission lock.
+        let _one = snapshot_tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _marks = MARKS_ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _sub = host.submitted_lock();
+        // Finish in-flight submissions first: their completions drain the
+        // same mark state this test asserts on.
+        host.drain();
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
@@ -2647,6 +2696,16 @@ pub(crate) mod tests {
     #[test]
     fn marks_of_shaders_using_title_memory_are_held_back() {
         let _gpu = crate::host::gpu_test_lock();
+        // As above: the mark bitmaps are process-global.
+        // Lock order: the snapshot lock, the mark lock, the submission lock.
+        let _one = snapshot_tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _marks = MARKS_ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _sub = host.submitted_lock();
+        // Finish in-flight submissions first (as above).
+        host.drain();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -2683,6 +2742,15 @@ pub(crate) mod tests {
     #[test]
     fn what_a_frame_withholds_leaves_the_copies_at_its_end() {
         let _gpu = crate::host::gpu_test_lock();
+        // Declared ranges keep snapshot parts, and the withholding frame is
+        // moved by every submission's completion: one snapshot test at a
+        // time, and no submission meanwhile (drained first, as above).
+        let _one = snapshot_tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _sub = host.submitted_lock();
+        host.drain();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         // SAFETY: a byte of our pool.
@@ -2896,4 +2964,25 @@ pub(crate) mod tests {
             );
         }
     }
+    /// Loose windows are 1 MiB and aligned; a request inside an allocated
+    /// window reuses it instead of allocating a duplicate overlapping one
+    /// (upstream #3437, knob-free: const, no `VICTORY_LOOSE_WINDOW_KB`).
+    #[test]
+    fn loose_windows_are_1_mib_and_reuse_containing_spans() {
+        assert_eq!(LOOSE_WINDOW, 1 << 20);
+        let w = LOOSE_WINDOW;
+        assert_eq!(loose_span(0x10_0040, 0x10_1000), (0x10_0000, w));
+        assert_eq!(loose_span(0x1f_ff00, 0x20_0100), (0x10_0000, 2 * w));
+
+        let mut map = BTreeMap::new();
+        map.insert((0x10_0000u64, 2 * w), "two-mib");
+        // Sub-ranges inside an already-allocated 2 MiB loose shadow reuse it
+        // instead of allocating a duplicate overlapping 1 MiB shadow buffer.
+        assert_eq!(find_containing_loose(&map, 0x10_0000, 0x18_0000), Some(&"two-mib"));
+        assert_eq!(find_containing_loose(&map, 0x20_0000, 0x2f_ffff), Some(&"two-mib"));
+        // Out-of-bounds ranges do not match.
+        assert_eq!(find_containing_loose(&map, 0x20_0000, 0x31_0000), None);
+        assert_eq!(find_containing_loose(&map, 0x0f_0000, 0x12_0000), None);
+    }
+
 }

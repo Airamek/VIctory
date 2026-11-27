@@ -1,3 +1,9 @@
+> **See also:** README.md · docs/architecture.md · docs/asset-policy.md
+> · docs/ops-guidelines.md · docs/gpu-profiling-methodology.md
+> · docs/preexisting-flakes.md · docs/eval-survey-followups.md
+> · D:/dev/TRIAGE_PROGRESS.md · D:/dev/ROADMAP_30FPS.md · D:/dev/TASK_QUEUE.md
+> (index only; content below unchanged — doc-linker pass, eval/1828-rebase @ 19062fe)
+
 # Architecture
 
 ```
@@ -105,3 +111,4 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+On-disk layout, invalidation, and safe-clear: `docs/asset-policy.md`.

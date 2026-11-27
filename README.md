@@ -1,3 +1,9 @@
+> **See also:** README.md · docs/architecture.md · docs/asset-policy.md
+> · docs/ops-guidelines.md · docs/gpu-profiling-methodology.md
+> · docs/preexisting-flakes.md · docs/eval-survey-followups.md
+> · D:/dev/TRIAGE_PROGRESS.md · D:/dev/ROADMAP_30FPS.md · D:/dev/TASK_QUEUE.md
+> (index only; content below unchanged — doc-linker pass, eval/1828-rebase @ 19062fe)
+
 # VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
@@ -224,6 +230,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_NAME_SHADERS=<file>` | with `translate`: writes `<hash>	<source>` for every shader container, so a pipeline the runtime names by hash can be named by source |
 | `VICTORY_GPU_TIMING=1` | with the above, GPU timestamps bracket each noted command (16K stamps/list) plus a per-list busy pair; the cost report is per kind then pipeline over summed list busy with residual un-noted work, per-submission summed-busy/gap/utilisation and starvation counters; slow lists logged with their slowest commands; a device removal lists the in-flight commands, and with `VICTORY_GPU_TIMING_ALONE` names the list it happened in with all its commands |
 | `VICTORY_GPU_TIMING_ALONE=1` | with the above, each list of a submission run and waited for on its own (opt-in; default keeps the normal submission batching, timing-only) |
+| `VICTORY_COPY_QUEUE=1` | texture uploads run on the D3D12 copy engine (COPY queue + copy fence) instead of the direct queue; off by default. COPY-kind upload lists emit no GPU-timing timestamp queries (their GPU time is invisible to busy); when on, the per-frame fps line appends copy counters (textures/frame on COPY, copy submissions, fence signalled/completed, DIRECT waits/frame). Rollout default stays off until a gameplay run validates it |
 | `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |

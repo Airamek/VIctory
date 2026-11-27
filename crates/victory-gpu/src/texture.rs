@@ -59,6 +59,11 @@ pub(crate) struct Staging {
     /// copied.
     uploads: std::sync::atomic::AtomicU64,
     copied: std::sync::atomic::AtomicU64,
+    /// The invalidation generation this texture's memory was last settled
+    /// against ([`crate::watch::invalidation_generation_since`]): guard and
+    /// remap invalidations between the settle and the next refresh force
+    /// another read instead of trusting the tracker's clean bit.
+    refreshed: std::sync::atomic::AtomicU64,
 }
 
 /// What was last detiled: the hash of the memory (not tracked), or of each
@@ -67,6 +72,15 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     hashes: Vec<Option<blake3::Hash>>,
+}
+
+impl Last {
+    /// Forgets a half-read snapshot: a refresh torn by a concurrent guard
+    /// or remap invalidation must not validate stale subresource hashes.
+    fn discard_snapshot(&mut self) {
+        self.hash = None;
+        self.hashes.fill(None);
+    }
 }
 
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
@@ -124,7 +138,14 @@ const KEPT_BYTES: u64 = 64 << 20;
 /// offload, a submission is finished once both queues ran it: buffers are
 /// free once the direct value passed `completed` and the copy value passed
 /// `copy_completed` (with no copy work, the copy check always passes).
+///
+/// Also the per-submission sweep hook for [`crate::residency`]: samples host
+/// memory pressure (internally throttled to once a second) and, while
+/// pressured, lets idle staging go entirely instead of keeping
+/// `KEPT_BYTES`/`CHUNKS_KEPT` of it.
 pub(crate) fn recycle() {
+    crate::residency::refresh();
+    let pressured = crate::residency::pressured();
     let (reached, copy_reached) = crate::host::host()
         .map_or((u64::MAX, u64::MAX), |h| (h.completed(), h.copy_completed()));
     {
@@ -142,7 +163,13 @@ pub(crate) fn recycle() {
             // being prepared carves afresh after this). Needs both queues
             // done (both completeds past every mark, checked above).
             (c.current, c.used) = (0, 0);
-            c.all.truncate(CHUNKS_KEPT);
+            if pressured {
+                // Idle chunks are let go entirely under pressure; the next
+                // submission carves afresh once growth is allowed again.
+                c.all.clear();
+            } else {
+                c.all.truncate(CHUNKS_KEPT);
+            }
         }
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -157,10 +184,16 @@ pub(crate) fn recycle() {
         }
     }
     b.used = kept;
-    while b.free_bytes > KEPT_BYTES
-        && let Some((n, ..)) = b.free.pop_front()
-    {
-        b.free_bytes -= n;
+    if pressured {
+        // Under pressure no idle staging is kept: every free buffer drops.
+        b.free.clear();
+        b.free_bytes = 0;
+    } else {
+        while b.free_bytes > KEPT_BYTES
+            && let Some((n, ..)) = b.free.pop_front()
+        {
+            b.free_bytes -= n;
+        }
     }
 }
 
@@ -197,9 +230,15 @@ fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         i.and_then(|i| b.free.remove(i)).inspect(|_| b.free_bytes -= class)
     };
     // Made without the pool's lock (refreshes run on several threads).
+    // No new block while growth is held (refused allocation, or too little
+    // commit left): the free list above still serves. The upload stays due
+    // for a later submission.
     let e = match taken {
         Some(e) => e,
         None => {
+            if !crate::residency::allow_growth() {
+                return None;
+            }
             let (buffer, data) = host()?.upload_buffer(class)?;
             crate::host::name(&buffer, || "texture staging".into());
             (class, buffer, data as usize)
@@ -258,6 +297,12 @@ fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
             }
             (c.current, c.used) = (c.current + 1, 0);
             continue;
+        }
+        // A refused pool must not ask the driver again for each texture:
+        // existing chunks keep carving while new ones wait out the backoff
+        // (or for commit to recover). The upload stays due meanwhile.
+        if !crate::residency::allow_growth() {
+            return None;
         }
         let (buffer, data) = host()?.upload_buffer(CHUNK)?;
         crate::host::name(&buffer, || "texture staging chunk".into());
@@ -630,6 +675,15 @@ pub(crate) fn record_upload(
     list.move_texture(copy, SHADER_RESOURCE)
 }
 
+/// Serializes the tests that assert on the process-global [`ALIAS_COPIES`]
+/// counter (the established single-test-lock pattern): an alias copy one
+/// of them triggers would otherwise land in another's before/after window.
+/// Every test that can trigger an alias copy holds it for the window it
+/// measures (the holders below call `host_texture`/`readable` on aliasing
+/// textures; per-texture counters like [`uploads`] need no such lock).
+#[cfg(test)]
+pub(crate) static ALIAS_ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The uploads [`record_upload`] recorded into `resource`'s host texture
 /// (tests: counts of their own texture, whatever other tests upload
 /// meanwhile).
@@ -966,9 +1020,16 @@ impl Staging {
     }
 
     /// Whether its memory may have changed since it was last detiled (an
-    /// untracked texture always may).
+    /// untracked texture always may; a tracked one also may when a guard
+    /// or remap invalidation landed since its last settle).
     pub(crate) fn maybe_changed(&self) -> bool {
-        self.tracked.as_ref().is_none_or(|t| !t.clean())
+        use std::sync::atomic::Ordering::Relaxed;
+        let from = self.memory as usize;
+        let to = from.saturating_add(self.layout.size as usize);
+        if self.tracked.as_ref().is_none_or(|t| !t.clean()) {
+            return true;
+        }
+        crate::watch::invalidation_generation_since(from, to, self.refreshed.load(Relaxed)).is_some()
     }
 
     /// Whether the texture is a CPU-written movie plane: one R8 subresource
@@ -995,29 +1056,63 @@ impl Staging {
     pub(crate) fn refresh(&self) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, buffer) = self.refresh_now();
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
-        buffer
+        // A guard write or remap landing between the read and the snapshot
+        // comparison tears it: forget the half-read snapshot, re-arm the
+        // trackers and read again (bounded; then give the frame the old
+        // bytes rather than half-new ones). Knob-free: always synchronous.
+        let mut retries = 0;
+        loop {
+            let generation = crate::watch::snapshot_generation();
+            let (read, buffer) = self.refresh_now(generation);
+            if crate::watch::snapshot_generation() == generation {
+                let preparing = &crate::host::PREPARING;
+                preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+                preparing[3].fetch_add(read as u64, Relaxed);
+                return buffer;
+            }
+            self.last.lock().unwrap_or_else(|e| e.into_inner()).discard_snapshot();
+            if let Some(t) = &self.tracked {
+                t.remark(self.memory as usize, (self.memory as usize).saturating_add(self.layout.size as usize));
+            }
+            retries += 1;
+            if retries >= 8 {
+                return None;
+            }
+            std::thread::yield_now();
+        }
     }
 
     /// Returns the bytes of title memory read, and the buffer it detiled
-    /// into with the subresources detiled.
-    fn refresh_now(&self) -> (usize, Option<Upload>) {
+    /// into with the subresources detiled. Settles `refreshed` against the
+    /// invalidation generation seen (or `generation` when none), so the
+    /// next [`Staging::maybe_changed`] only fires on newer invalidations.
+    fn refresh_now(&self, generation: u64) -> (usize, Option<Upload>) {
+        use std::sync::atomic::Ordering::Relaxed;
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
+        let refreshed = self.refreshed.load(Relaxed);
+        let seen = crate::watch::invalidation_generation_since(start, start + size, refreshed);
+        let settle = |epoch: Option<u64>| {
+            let epoch = epoch.unwrap_or(generation).max(refreshed);
+            self.refreshed.store(epoch, Relaxed);
+        };
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
             // Most refreshes find nothing: the tracker's dense bit says so
             // without its lock (123,000 refreshes a frame, run evict3).
-            if t.clean() {
+            if t.clean() && seen.is_none() {
+                settle(seen);
                 return (0, None);
             }
-            let ranges = t.take(start, start + size);
+            let mut ranges = t.take(start, start + size);
+            if ranges.is_empty() && seen.is_some() {
+                t.remark(start, start + size);
+                ranges = t.take(start, start + size);
+            }
             if ranges.is_empty() {
+                settle(seen);
                 return (0, None);
             }
             // Only the subresources in the pages that changed (streamed
@@ -1071,6 +1166,7 @@ impl Staging {
                 .map(|i| i as u32)
                 .collect();
             if fresh.is_empty() {
+                settle(seen);
                 return (bytes, None);
             }
             let buffer = self.detile(read, &fresh);
@@ -1078,6 +1174,8 @@ impl Staging {
                 for &i in &fresh {
                     last.hashes[i as usize] = None;
                 }
+            } else {
+                settle(seen);
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
@@ -1373,6 +1471,7 @@ fn staging_for(
         last: Mutex::default(),
         uploads: Default::default(),
         copied: Default::default(),
+        refreshed: Default::default(),
     });
     *held = Some(s.clone());
     Some(s)
@@ -1457,6 +1556,7 @@ mod tests {
                 last: Mutex::default(),
                 uploads: Default::default(),
                 copied: Default::default(),
+                refreshed: Default::default(),
                 footprints,
             }
         }
@@ -1730,5 +1830,53 @@ mod tests {
         host.drain();
         recycle();
         let _again = take_plane_chunk(1 << 20).expect("a plane chunk after release");
+    }
+
+    /// A concurrent guard/remap invalidation between a texture's read and
+    /// its settle is not lost: `remark` re-arms the trackers and the
+    /// invalidation stays visible until the next present spends it
+    /// (upstream #3437-adjacent dirty-ranges half of #3427, knob-free).
+    #[test]
+    fn concurrent_snapshot_generation_bump_does_not_lose_texture_updates() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let p = crate::watch::tests::pool(1);
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 4,
+            height: 4,
+            depth: 1,
+            mips: 1,
+            block: 1,
+            swizzle: Swizzle::LINEAR,
+            element_bytes: 4,
+            samples: 1,
+        };
+        let layout = Layout::new(&desc).expect("layout");
+        let size = layout.size as usize;
+        let staging = Staging {
+            size: size as u64,
+            footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default()],
+            rows: vec![4],
+            layout: layout.clone(),
+            mips: 1,
+            memory: p as *const u8,
+            tracked: crate::watch::track(p, size, true),
+            spans: spans(&layout, 1, 1),
+            last: Mutex::default(),
+            uploads: Default::default(),
+            copied: Default::default(),
+            refreshed: Default::default(),
+        };
+        let _ = staging.refresh_now(crate::watch::snapshot_generation());
+        let t = staging.tracked.as_ref().expect("tracked");
+        assert!(t.clean());
+        // Mark dirty and force a generation bump as if a concurrent remap happened.
+        t.remark(p, p + size);
+        crate::watch::note_invalidated_for_test(p, size);
+        crate::watch::bump_snapshot_generation_for_test();
+        // Should not permanently lose the dirty state.
+        let _ = staging.refresh();
+        assert!(!t.clean() || crate::watch::invalidated(p, p + size));
+        crate::watch::tests::free(p);
     }
 }

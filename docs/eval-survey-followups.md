@@ -1,3 +1,9 @@
+> **See also:** README.md · docs/architecture.md · docs/asset-policy.md
+> · docs/ops-guidelines.md · docs/gpu-profiling-methodology.md
+> · docs/preexisting-flakes.md · docs/eval-survey-followups.md
+> · D:/dev/TRIAGE_PROGRESS.md · D:/dev/ROADMAP_30FPS.md · D:/dev/TASK_QUEUE.md
+> (index only; content below unchanged — doc-linker pass, eval/1828-rebase @ 19062fe)
+
 # eval/survey-followups — survey follow-ups (take / subsumed / skip)
 
 Base: `fork/eval/1828-rebase @ 5be261f` (fork `Airamek/VIctory`, origin `Marvisak/VIctory` READ-ONLY).
