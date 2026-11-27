@@ -181,7 +181,10 @@ impl Drop for Shadow {
     /// With a range not copied back (its list was reset meanwhile), with its
     /// shared-buffer run to hand back, and with mark bits to hand back.
     /// Pooled transient buffers go back to the pool (still charged: the
-    /// commit is still held); everything else is uncharged.
+    /// commit is still held); everything else is uncharged, except arena
+    /// runs (charged with their chunk, not the copy) and card shadows (the
+    /// card engine's VRAM accounting owns those: never in the bound, so the
+    /// bound only ever holds evictable bytes).
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         forget(&mut self.before.get_mut().unwrap_or_else(|e| e.into_inner()).0);
@@ -197,7 +200,7 @@ impl Drop for Shadow {
                 SHADOW_BYTES.fetch_sub(cap - self.len, Relaxed);
             }
             SHADOW_BYTES.fetch_sub(self.len, Relaxed);
-        } else {
+        } else if !self.is_card() {
             SHADOW_BYTES.fetch_sub(self.len, Relaxed);
         }
         SHADOW_STATS[SHADOW_STATS_FREED].fetch_add(1, Relaxed);
@@ -211,7 +214,9 @@ impl Drop for Shadow {
 
 /// Host bytes held by copies of title memory: [`BUFFERS`] and [`LOOSE`]
 /// copies' title bytes plus pooled transient buffers (see [`SHADOW_ARENA_BYTES`]
-/// for the arena chunks [`EXACT`] copies live in). Bounded by [`evict_unused`]
+/// for the arena chunks [`EXACT`] copies live in). Card-resident shadows are
+/// not charged here (the card engine's VRAM accounting owns those), so the
+/// bound only ever holds evictable bytes. Bounded by [`evict_unused`]
 /// and the transient fallback in [`find`]/[`loose`]/[`exact`]/[`Arena::take`].
 pub(crate) static SHADOW_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Of the host commit copies hold, in arena chunks: charged per chunk, with
@@ -238,7 +243,8 @@ fn shadow_budget() -> Option<u64> {
 }
 
 /// Host bytes copies hold now (buffers, loose windows, transients, pooled
-/// transient buffers, and arena chunks).
+/// transient buffers, and arena chunks; not card-resident shadows, which the
+/// card engine's VRAM accounting owns).
 fn shadow_total() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     SHADOW_BYTES.load(Relaxed).saturating_add(SHADOW_ARENA_BYTES.load(Relaxed))
@@ -485,11 +491,18 @@ impl Shadow {
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
-        if slice.is_none() {
+        if slice.is_none() && !shadow.is_card() {
             // An arena run's bytes are charged with its chunk
-            // ([`Arena::take`]), not with the copy.
+            // ([`Arena::take`]), not with the copy, and a card shadow's with
+            // the card engine's VRAM accounting: the bound only ever holds
+            // evictable bytes.
             use std::sync::atomic::Ordering::Relaxed;
             SHADOW_BYTES.fetch_add(len, Relaxed);
+        }
+        // Every copy counts as made (freed in [`Drop`]): even an arena run,
+        // whose bytes ride with its chunk.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
             SHADOW_STATS[SHADOW_STATS_MADE].fetch_add(1, Relaxed);
         }
         shadow
@@ -2034,9 +2047,11 @@ fn transient_dedicated(start: u64, len: u64) -> Option<Arc<Shadow>> {
     if let Some((buffer, data, gpu, cap)) = take_transient_buffer(len) {
         let shadow = Shadow::new_transient(buffer, data, gpu, start, len, Some(cap));
         shadow.touch();
-        // The pool held `cap` bytes charged; the copy holds `len`.
+        // The pool held `cap` bytes charged; the copy holds `len`: the
+        // constructor charged `len` on top of the pool's still-charged `cap`,
+        // so the pool's whole `cap` goes back here.
         use std::sync::atomic::Ordering::Relaxed;
-        SHADOW_BYTES.fetch_sub(cap.saturating_sub(len), Relaxed);
+        SHADOW_BYTES.fetch_sub(cap, Relaxed);
         return Some(shadow);
     }
     let h = host()?;
@@ -2058,7 +2073,10 @@ fn transient_dedicated(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// bakes' parameter blocks: refused, their slots read zeros, every meshlet
 /// culled). Such a view gets a copy of its own bytes, starting at its
 /// address (`true` with it), which lives while a heap slot made from the
-/// view or a list holds it.
+/// view or a list holds it. Over the host-copy bound the copy is
+/// pressure-served ([`transient_dedicated`], still `true`): heap slots keep
+/// its buffer but never the copy itself (each resolution mints a new one),
+/// so the slot's buffer and the refreshed copy cannot diverge behind a pin.
 pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
     let shadow = find(address, len)?;
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
@@ -2452,9 +2470,9 @@ pub(crate) mod tests {
             return; // no host GPU here
         }
         let mut arena = Arena::default();
-        let (_, _, _, a) = arena.take(100, 456).unwrap();
-        let (_, _, _, b) = arena.take(5000, 16).unwrap();
-        let (_, _, _, c) = arena.take(4, 4).unwrap();
+        let (_, _, _, a) = arena.take(100, 456).expect("not pressured in tests");
+        let (_, _, _, b) = arena.take(5000, 16).expect("not pressured in tests");
+        let (_, _, _, c) = arena.take(4, 4).expect("not pressured in tests");
         assert!(a.offset % 456 == 0 && a.offset % 256 == 0 && b.offset % 256 == 0);
         let mut runs = [a, b, c].map(|s| (s.offset, s.offset + s.len));
         runs.sort_unstable();
@@ -2465,7 +2483,7 @@ pub(crate) mod tests {
         assert_eq!(arena.chunks.len(), 1);
         assert_eq!(arena.chunks[0].3.len(), 1, "one free run again");
         // Larger than a buffer: one of its own.
-        let (_, _, _, d) = arena.take(CHUNK + 1, 4).unwrap();
+        let (_, _, _, d) = arena.take(CHUNK + 1, 4).expect("not pressured in tests");
         assert_eq!((arena.chunks.len(), d.chunk), (2, 1));
     }
 

@@ -161,6 +161,27 @@ impl Viewed {
     }
 }
 
+impl Drop for Viewed {
+    /// The heap is gone: its slots view nothing now. Each live range added
+    /// one to the census ([`Inner::count`]); take each back, or stale entries
+    /// would block eviction of later copies at the same addresses.
+    fn drop(&mut self) {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.ranges.is_empty() {
+            return;
+        }
+        let mut viewed = VIEWED_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        for &(ptr, _, _, _) in inner.ranges.keys() {
+            if let Some(n) = viewed.get_mut(&ptr) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    viewed.remove(&ptr);
+                }
+            }
+        }
+    }
+}
+
 /// What a made view reads that title memory feeds.
 fn seen(view: &View) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
