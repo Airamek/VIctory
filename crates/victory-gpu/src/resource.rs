@@ -2537,6 +2537,49 @@ mod tests {
         assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
     }
 
+    /// Cost of the CPU half of [`evict_unused`] ([`choose`]): idle partition
+    /// plus LRU sort over the host textures a frame's registry holds, apart
+    /// from the registry scan and the driver calls that give them up. Run with
+    /// `cargo test --release -p victory-gpu --lib -- --ignored --nocapture benchmark_evict_choose`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn benchmark_evict_choose() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let (frame, now) = (10_000u64, 600_000u64);
+        let (idle_frame, idle_ms) = (frame - IDLE_FRAMES - 1, now - IDLE_MS - 1);
+        for count in [1024usize, 4096, 16_384] {
+            let uses: Vec<(u64, u64, u64)> = (0..count)
+                .map(|i| {
+                    let bytes = 4096 + (i as u64 % 16) * 4096;
+                    if i % 4 == 0 {
+                        (idle_frame, idle_ms, bytes)
+                    } else {
+                        (frame - (i as u64 % 60), now - (i as u64 % 20_000), bytes)
+                    }
+                })
+                .collect();
+            let total: u64 = uses.iter().map(|u| u.2).sum();
+            let over = total / 10;
+            let batch = (64 * 1024 / count).max(1);
+            let mut samples = [0.0; 9];
+            for sample in &mut samples {
+                let start = Instant::now();
+                for _ in 0..batch {
+                    black_box(choose(black_box(&uses), frame, now, over));
+                }
+                *sample = start.elapsed().as_secs_f64() * 1e9 / batch as f64;
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "{count:6} candidates: {:8.1} ns/pass median ({} chosen)",
+                samples[4],
+                choose(&uses, frame, now, over).len()
+            );
+        }
+    }
+
     /// Title textures of one memory share a key in any format of the same
     /// element; another address, shape, element size or a depth texture is
     /// another memory. The library's own layout pick resolves as spelled.

@@ -144,6 +144,10 @@ pacing independent of our instrumentation waits.
   --nocapture`.
 - `texture_layout_bench` example (crates/victory-formats/examples/),
   XMA inverse-transform bench (crates/victory-formats/src/xma.rs:1371-1375).
+- Bound hot paths: `benchmark_evict_choose` (resource.rs),
+  `benchmark_evict_plan` / `benchmark_spare_transient_fit` (shadow.rs),
+  `benchmark_compile_permit` (pipeline/make.rs); design, rationale and first
+  numbers in `docs/microbench-hot-paths.md`.
 
 ### 1.9 WARP support and its limits
 
