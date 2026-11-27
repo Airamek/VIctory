@@ -193,6 +193,21 @@ cost by pipeline:` report; any device-removed/host-failure text fails it.
 Captured scene footprints (draws/commands/texture MB) feed the compare
 script. Explicit non-goal: no throughput comparison on WARP, ever.
 
+Beside the PASS verdict the harness parses the bounds-era footprint, so a
+bounded run shows whether the new bounds held rather than just whether the
+title path ran. From every `host copies of title memory: ...` report
+(`shadow::log_shadow`) it records held-MB first/last/max, evictions per frame
+and transients served; it counts driver-compile permit waits
+(`pipeline waited for a driver-compile slot`, `waited_ms`) and counts
+shared-buffer allocations the driver refused (`no shared buffer ... 0x8007000E`,
+where WARP's host-RAM budget turns a late bound into allocation pressure); it
+keeps the last `heap views:` left-null census plus draws/commands/frame and
+texture MB in `result.json`. `BoundsVerdict` is `OK` when shadow reports were parsed, `WARN`
+on a PASS with none (a build older than the bounds, or lost diagnostics), and
+`n/a` otherwise; it never changes `Verdict` and never ranks builds by speed.
+Bounded-run kills use `taskkill /T` so no child of the title path survives
+and keeps the redirected handles open.
+
 ## 3. Gate for perf claims without user gameplay
 
 A "win" is a GPU-busy or per-kind claim from `VICTORY_GPU_TIMING` reports,
