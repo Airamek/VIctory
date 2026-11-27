@@ -48,23 +48,25 @@ isolate CPU bookkeeping from driver/GPU work that needs a title and a device.
 - `pressured(ask)` (`shadow.rs:255`) = two atomic loads + `video_memory()`;
   `relieve(ask)` (`shadow.rs:260`) runs an evict pass first.
 - The pressure branch in `loose()` (`shadow.rs:1743`), `exact()`
-  (`shadow.rs:2135`), `find()`/`Arena::take` (`shadow.rs:2224`) either returns
-  a cached copy or `transient_dedicated(...)` (`shadow.rs:2045`): a copy that
+  (`shadow.rs:2155`), `find()` (`shadow.rs:1648`)/`Arena::take`
+  (`shadow.rs:2244`) either returns
+  a cached copy or `transient_dedicated(...)` (`shadow.rs:2065`): a copy that
   is never registered, pinned by its lists, remade whole per submission.
 - Pooling: `SPARE_TRANSIENT` (count/bytes-bounded), `take_transient_buffer`,
   `return_transient_buffer`; the best-fit selection is now `spare_fit()`
-  (`shadow.rs:2012`). The CPU side is a scan of at most `SPARE_TRANSIENT_MAX`
+  (`shadow.rs:2028`). The CPU side is a scan of at most `SPARE_TRANSIENT_MAX`
   (16) entries.
 - The dominant cost is the D3D12 buffer make/map and the title-memory copy —
   device work, not measurable in a CPU microbench. Its signal is already
   in-engine: `SHADOW_STATS[SHADOW_STATS_TRANSIENT]`, `made/freed/evicted`
-  per frame, pool size and held MB in `log_shadow()` (`shadow.rs:1985`).
+  per frame, pool size and held MB in `log_shadow()` (`shadow.rs:1986`).
 
 ### 1.4 Driver-compile permit (`crates/victory-gpu/src/pipeline/make.rs`)
 
 - `COMPILE_PERMITS = 3` (`make.rs:151`), `COMPILE_SLOTS` (`make.rs:154`),
   `CompileGuard::take()` / `Drop` (`make.rs:159`/`178`).
-- Taken in `Pending::make()` (`make.rs:108`) before `HostPipeline::new`, and
+- Taken in `Pending::make()` (`make.rs:104`, `CompileGuard::take()` at :108)
+  before `HostPipeline::new`, and
   in the pre-build (`pipeline.rs:696`), so both share the cap.
 - The permit is a `Mutex<usize>` + `Condvar`: per compile it costs one
   lock/unlock when uncontended and a wait when all three slots are held. Real
