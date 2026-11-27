@@ -69,6 +69,9 @@ struct Inner {
 /// A copy, and the counts of its ranges' starts and ends.
 type Ends = (Arc<Shadow>, BTreeMap<u64, u32>, BTreeMap<u64, u32>);
 
+/// Copies with live heap-slot ranges on them, by host copy: [`viewing`].
+static VIEWED_COUNTS: Mutex<BTreeMap<usize, u32>> = Mutex::new(BTreeMap::new());
+
 /// One more (`add`) or one fewer of `at` in `counts`.
 fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
     let n = counts.entry(at).or_insert(0);
@@ -93,6 +96,15 @@ impl Inner {
                 }
                 // A range came or went: its copy's hull may change.
                 if (was == 0) != (now == 0) {
+                    let mut viewed = VIEWED_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+                    if now > 0 {
+                        *viewed.entry(key.0).or_insert(0) += 1;
+                    } else if let Some(n) = viewed.get_mut(&key.0) {
+                        *n = n.saturating_sub(1);
+                        if *n == 0 {
+                            viewed.remove(&key.0);
+                        }
+                    }
                     let ends = self
                         .ends
                         .entry((key.0, key.3))
@@ -416,6 +428,13 @@ pub(crate) fn note_draw(writes: bool) {
     if writes {
         HEAP_DRAWS[1].fetch_add(1, Relaxed);
     }
+}
+
+/// Whether any heap slot views `shadow` (host copy at raw pointer `ptr`):
+/// a copy so viewed is never given up by [`crate::shadow::evict_unused`]
+/// (its hull feeds submissions, and slots embed its buffer).
+pub(crate) fn viewing(ptr: usize) -> bool {
+    VIEWED_COUNTS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ptr)
 }
 
 /// Every view heap's registry.

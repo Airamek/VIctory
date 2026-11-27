@@ -601,6 +601,7 @@ impl HostHeap {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             let old = std::mem::replace(slot, resource);
+            note_kept(&old, slot);
             #[cfg(feature = "diagnostics")]
             if let Some((old, _)) = &old
                 && !self.sampler
@@ -1360,6 +1361,53 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// own copy of title memory ([`crate::shadow::for_view`]): the slot holds
 /// it, so that draws reading the view find and refresh that copy.
 type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>)>;
+
+/// Heap slots' kept host copies of title memory: slots holding one, and the
+/// distinct copies, by host copy. [`keeping`] (eviction) and [`kept_census`]
+/// (diagnostics).
+static KEPT: Mutex<(u64, std::collections::BTreeMap<usize, u64>)> = Mutex::new((0, std::collections::BTreeMap::new()));
+
+/// Notes a slot's kept copy going from `old` to `new`.
+fn note_kept(old: &Kept, new: &Kept) {
+    use std::sync::Arc;
+    let (old, new) = (
+        old.as_ref().and_then(|(_, s)| s.as_ref()).map(|s| Arc::as_ptr(s) as usize),
+        new.as_ref().and_then(|(_, s)| s.as_ref()).map(|s| Arc::as_ptr(s) as usize),
+    );
+    if old == new {
+        return;
+    }
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ptr) = old {
+        kept.0 -= 1;
+        if let Some(n) = kept.1.get_mut(&ptr) {
+            *n -= 1;
+            if *n == 0 {
+                kept.1.remove(&ptr);
+            }
+        }
+    }
+    if let Some(ptr) = new {
+        kept.0 += 1;
+        *kept.1.entry(ptr).or_insert(0) += 1;
+    }
+}
+
+/// Whether any heap slot keeps `shadow` (host copy at raw pointer `ptr`) in
+/// its [`Kept`]: a copy so held is never given up by
+/// [`crate::shadow::evict_unused`] (draws find and refresh that copy through
+/// the slot).
+pub(crate) fn keeping(ptr: usize) -> bool {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner()).1.contains_key(&ptr)
+}
+
+/// Heap slots holding a host copy, and the distinct copies: beside
+/// [`crate::shadow::log_shadow`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn kept_census() -> (u64, usize) {
+    let kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    (kept.0, kept.1.len())
+}
 
 /// Buffer views refused so far (diagnostics: the first are logged).
 #[cfg(feature = "diagnostics")]
