@@ -668,6 +668,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// slots come and go; a copy no slot views any more has none.
     #[test]
     fn hulls_follow_the_ranges() {
+        let _gpu = crate::host::gpu_test_lock();
         let memory = vec![0u8; 0x1000];
         let at = memory.as_ptr() as u64;
         crate::shadow::register(at as usize, at, 0x1000);
@@ -710,6 +711,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// copy.
     #[test]
     fn heap_views_are_current() {
+        let _gpu = crate::host::gpu_test_lock();
         let (src, dst) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
         let tex = resource(3, 4, 1, 28, LINEAR);
         let write = |base: u32, texel: u8| {
@@ -733,6 +735,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// heaps through a pool view): every round must reach the shader.
     #[test]
     fn heap_views_follow_writes_through_another_mapping() {
+        let _gpu = crate::host::gpu_test_lock();
         let (a, b) = crate::watch::tests::twin_views(2);
         let src = resource_at(a, 1, 256, 1, 0, 1);
         let tex = resource_at(a + PAGE_BYTES, 3, 4, 1, 28, LINEAR);
@@ -759,6 +762,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// without crashing, and a 60-byte one (the world case) likewise.
     #[test]
     fn heap_views_structured_16_read_correct_elements() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };

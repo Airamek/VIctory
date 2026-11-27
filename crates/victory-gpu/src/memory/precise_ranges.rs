@@ -89,6 +89,7 @@ mod tests {
 
     #[test]
     fn adaptive_index_waits_for_work_and_keeps_small_inputs_linear() {
+        let _gpu = crate::host::gpu_test_lock();
         let ranges = vec![(0, 1); 64];
         let mut lookup = AdaptiveRanges::new(&ranges);
         assert!(lookup.index.is_none());
@@ -114,6 +115,7 @@ mod tests {
 
     #[test]
     fn adaptive_lookup_matches_reference_before_and_after_indexing() {
+        let _gpu = crate::host::gpu_test_lock();
         let ranges: Vec<_> = (0..128u64)
             .rev()
             .map(|i| (i * 65536 + 7, i % 3 * 65536))
@@ -135,6 +137,7 @@ mod tests {
 
     #[test]
     fn nested_ranges_keep_the_earlier_long_end() {
+        let _gpu = crate::host::gpu_test_lock();
         let index = PreciseRanges::new(&[(0, 200), (10, 1), (20, 1), (20, 2)]);
         assert!(index.overlaps(100, 101));
         assert!(!index.overlaps(200, 201));
@@ -142,6 +145,7 @@ mod tests {
 
     #[test]
     fn boundaries_and_zero_length_match_the_old_predicate() {
+        let _gpu = crate::host::gpu_test_lock();
         let ranges = [(64, 64), (200, 0), (300, 8)];
         let index = PreciseRanges::new(&ranges);
         for (from, to) in [
@@ -161,6 +165,7 @@ mod tests {
 
     #[test]
     fn empty_or_reversed_queries_never_overlap() {
+        let _gpu = crate::host::gpu_test_lock();
         let index = PreciseRanges::new(&[(0, 100), (50, 0)]);
         assert!(!index.overlaps(25, 25));
         assert!(!index.overlaps(60, 40));
@@ -169,6 +174,7 @@ mod tests {
 
     #[test]
     fn exhaustive_small_ranges_and_queries() {
+        let _gpu = crate::host::gpu_test_lock();
         let ranges: Vec<_> = (0..8u64)
             .flat_map(|a| (0..=8 - a).map(move |n| (a, n)))
             .collect();
@@ -187,6 +193,7 @@ mod tests {
 
     #[test]
     fn many_unsorted_declarations_across_page_boundaries() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut seed = 0x1234_abcd_u64;
         let mut next = || {
             seed ^= seed << 13;

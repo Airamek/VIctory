@@ -96,16 +96,44 @@ Notes:
 - No census test carries `#[ignore]`. Every `#[ignore]` in the tree is a
   benchmark/measurement (`snapshot_fill_throughput`, `bench_write`,
   `bench_bools`, `benchmark_private_data_release`, texture/XMA benches,
-  `snapshot_tests` throughput) or needs out-of-repo assets — see also
-  methodology §1.8. None of them is a gate test.
-- Established serial-only pattern (not skips — the tests still run, just
-  never overlapping): `host::submissions::GATE_LOCK`
-  (`crates/victory-gpu/src/host.rs:8857-8859`, "serializes tests that
-  temporarily gate the shared host queue"), and the snapshot single-test
-  lock (`crates/victory-gpu/src/shadow/snapshot_tests.rs`, "one test at a
-  time", §27). If an UNCONFIRMED guard/queue test above recurs
-  deterministically, this pattern — not a revert, not an ignore — is the
-  prescribed fix (§13).
+  `snapshot_tests` throughput, `library_file_memory`, device-enumeration)
+  or needs out-of-repo assets — see also methodology §1.8. None of them is
+  a gate test.
+- Global serialization (determinism item 3, not skips — the tests still
+  run, just never overlapping): every test in `crates/victory-gpu` holds
+  `crate::host::GPU_TEST_LOCK` (`gpu_test_lock()`, first line of the body)
+  for its whole run. It replaces the per-area locks it generalizes
+  (`host::submissions::GATE_LOCK` and the snapshot single-test `ONE`,
+  both removed): one lock means no lock ordering to get wrong, and the
+  compiler-DLL hammering behind abort #2 (§138) is serialized with the
+  rest. Poison-tolerant; production code never takes it; tests never call
+  other tests. If an UNCONFIRMED guard/queue test above recurs
+  deterministically, holding this lock — not a revert, not an ignore — is
+  the prescribed fix (§13).
+- The one deliberate exception is the freeze-class abort test
+  `resource::tests::a_null_view_has_no_alias_source` (Rule #0 below): it
+  carries no lock line and stays byte-identical while its crash is under
+  investigation.
+
+## GPU/CPU test split + WARP policy (determinism item 6)
+
+- Split: a test that needs a device says so with the early-return idiom
+  (`let Some(host) = ...host() else { return }; // no host GPU here`) and
+  holds `GPU_TEST_LOCK` while it runs; without a device it passes
+  vacuously. A test that needs no device still holds the lock (shared
+  registries, guard pages and the compiler DLL are process-global either
+  way) and must pass with no adapter present. No `#[ignore]`, no skips,
+  no thread-count games: the lock — plus `--jobs 1` serial adjudication —
+  is the whole mechanism.
+- WARP (`VICTORY_D3D12_WARP=1`, diagnostics builds) is a correctness and
+  footprint signal only: it proves the code paths run, never how fast
+  they run and never that they are correct on hardware. WARP-green never
+  transfers to a hardware claim; the RX 6600 XT run decides. Tests fail
+  red on WARP exactly as on hardware (TDR fail-fast refuses the hardware
+  device in tests at TdrLevel 0/1 instead of freezing the box).
+- Loaded-box GPU runs are suspect by default (§139): gates that matter
+  run on a quiet box, and any freeze-class abort is stop-the-line per
+  Rule #0 below, never census material.
 
 ## Explicitly NOT flakes (do not adjudicate as census)
 
@@ -133,3 +161,4 @@ abort's own mechanism is proven.
 - No code changes, so no test gate is claimed or needed (stated, not run).
 | 24 | `watch::tests::a_busy_alias_leaves_the_page_changed_and_keeps_saved_bytes` (`crates/victory-gpu/src/watch.rs`) | Busy alias leaves page changed and keeps saved bytes (watch tracker) | **Full-run shared-state**: solo-green on fix and base tips, module group 22/22 green on fix; fails intermittently ONLY in full workspace serial runs. Same family as #18 (serial-only flake). Revisit as interaction if it recurs deterministically or outside full runs | S138: fix-solo + base-solo + watch-group green, gate3 full-workspace fail 1x - census-listed, MERGE ACCEPTED |
 | 25 | `shadow::tests::partial_refresh_under_marked_range_updates_saved_bytes` (`crates/victory-gpu/src/shadow.rs`) | Partial refresh under marked range updates saved bytes (shadow write-back) | **Full-run shared-state**: solo-green on fix and base tips, group-green (3 group runs: partial_refresh passed each; one run each failed by big_snapshot sibling flake and one unknown, both unattributed); fails intermittently ONLY in full workspace serial runs. Same family as #20. Revisit as interaction if deterministic | S140: fix-solo + base-solo + 3x group green, ident-gate full-workspace fail 1x - census-listed, MERGE ACCEPTED |
+| 26 | `host::flush_copies_each_copy_once` (`crates/victory-gpu/src/host.rs`, host-level twin of #3's `host::batch::flush_copies_each_copy_once`) | Enough host copies flush their refreshes in one batch: disjoint copies copy what the title wrote, each once | **Full-run shared-state**: solo-green on fix and base tips, group-green with #18/#4 suspects; fails intermittently ONLY in full workspace serial runs. Same guard-lock convoy family as #3. Revisit as interaction if it recurs deterministically or outside full runs | eval/test-determinism gate: branch-solo + base-solo + 3-suspect group green, serial-workspace fail 1x - census-listed |

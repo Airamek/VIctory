@@ -441,6 +441,7 @@ mod tests {
 
     #[test]
     fn private_data_is_scoped_to_object_and_id() {
+        let _gpu = crate::host::gpu_test_lock();
         let first = new_test_object();
         let second = new_test_object();
         let set =
@@ -526,6 +527,7 @@ mod tests {
 
     #[test]
     fn final_release_clears_private_data_before_drop() {
+        let _gpu = crate::host::gpu_test_lock();
         #[repr(C)]
         struct OwnedObject(Object);
 
@@ -550,6 +552,7 @@ mod tests {
 
     #[test]
     fn unimplemented_calls_report_their_argument_registers() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(
             argument_text([0x1234_0000, 0x0, 0xdead_beef_cafe, 0xffff_ffff_ffff_fff6]),
             "0x12340000 0x0 0xdeadbeefcafe 0xfffffffffffffff6"
@@ -558,6 +561,7 @@ mod tests {
 
     #[test]
     fn guids_round_trip_through_text() {
+        let _gpu = crate::host::gpu_test_lock();
         let g = guid(
             0x189819f1,
             0x1db6,
@@ -572,6 +576,7 @@ mod tests {
     /// whichever of its interfaces is asked: the object's identity.
     #[test]
     fn every_object_answers_for_iunknown() {
+        let _gpu = crate::host::gpu_test_lock();
         type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
         let unknown = |object: This| {
             let mut found = std::ptr::null();

@@ -53,12 +53,14 @@ mod tests {
 
     #[test]
     fn aliases_are_sorted_and_deduplicated() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(eligible(&[8, 2, 1, 2, 3, 8, 7], &[]), [1, 2, 3, 7, 8]);
         assert!(eligible(&[], &[(0, usize::MAX)]).is_empty());
     }
 
     #[test]
     fn nested_duplicate_and_empty_writes_are_excluded() {
+        let _gpu = crate::host::gpu_test_lock();
         let pages: Vec<_> = (0..20).rev().collect();
         let busy = [
             (8, 9),
@@ -81,6 +83,7 @@ mod tests {
 
     #[test]
     fn dropping_one_duplicate_writer_does_not_enable_its_pages() {
+        let _gpu = crate::host::gpu_test_lock();
         let pages = [0, 1, 2, 3, 4, 5, 6];
         let mut busy = vec![(1, 5), (1, 5), (2, 6), (0, 0), (3, 3), (9, 10)];
         assert_eq!(eligible(&pages, &busy), [0, 6]);
@@ -92,6 +95,7 @@ mod tests {
 
     #[test]
     fn exhaustive_small_candidates_and_active_writes() {
+        let _gpu = crate::host::gpu_test_lock();
         let ranges: Vec<_> = (0..5).flat_map(|a| (0..5).map(move |b| (a, b))).collect();
         for code in 0..5usize.pow(4) {
             let pages = [code % 5, code / 5 % 5, code / 25 % 5, code / 125];
@@ -108,6 +112,7 @@ mod tests {
 
     #[test]
     fn seeded_large_batches_match_the_reference() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut seed = 0x7a21_3b49_u32;
         let mut next = || {
             seed ^= seed << 13;

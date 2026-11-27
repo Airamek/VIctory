@@ -100,6 +100,7 @@ mod tests {
 
     #[test]
     fn null_or_argument_free_descriptions_are_rejected() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let mut signature = null;
         // No description at all.
@@ -136,6 +137,7 @@ mod tests {
 
     #[test]
     fn signatures_without_arguments_stay_empty() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         // Zero arguments and no pointer is a valid, if useless, signature.
         let empty = Desc {
@@ -179,6 +181,7 @@ mod tests {
 
     #[test]
     fn arguments_are_copied_out_of_title_memory() {
+        let _gpu = crate::host::gpu_test_lock();
         // A title reuses the memory its description lived in, while
         // ExecuteIndirect reads the layout long after creation.
         assert!(
@@ -213,6 +216,7 @@ mod tests {
 
     #[test]
     fn signatures_answer_their_interfaces_and_count_references() {
+        let _gpu = crate::host::gpu_test_lock();
         let arguments = [[2u32, 4, 1, 1]]; // dispatch 4x1x1 groups
         let desc = Desc {
             stride: 12,
@@ -260,6 +264,7 @@ mod tests {
 
     #[test]
     fn creation_without_an_out_pointer_only_probes() {
+        let _gpu = crate::host::gpu_test_lock();
         let arguments = [[2u32, 4, 1, 1]]; // dispatch 4x1x1 groups
         let desc = Desc {
             stride: 12,

@@ -458,6 +458,7 @@ mod tests {
 
     #[test]
     fn creation_hands_out_the_device() {
+        let _gpu = crate::host::gpu_test_lock();
         let (hr, device) = create_as(&IID);
         assert_eq!(hr, S_OK);
         assert_eq!(device, super::device());
@@ -475,6 +476,7 @@ mod tests {
 
     #[test]
     fn newer_device_levels_are_the_same_device() {
+        let _gpu = crate::host::gpu_test_lock();
         // ID3D12Device11, as Grand Theft Auto VI asks for it.
         let (hr, device) = create_as(&LEVEL_IIDS[8]);
         assert_eq!((hr, device), (S_OK, super::device()));
@@ -490,6 +492,7 @@ mod tests {
     /// interface the device itself answers to.
     #[test]
     fn the_device_is_found_at_every_level_through_others() {
+        let _gpu = crate::host::gpu_test_lock();
         type Get = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
         let fence_iid = &crate::fence::FENCE_IIDS[0];
         let mut fence = std::ptr::null();
@@ -519,6 +522,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_hosts_children_hand_out_newer_device_levels() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_FENCE_FLAG_NONE, ID3D12Device5, ID3D12Fence,
         };
@@ -536,6 +540,7 @@ mod tests {
 
     #[test]
     fn virtual_memory_configuration_reports_user_space() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut config = VirtualMemory {
             flags: 0,
             page_table_pages: 7,
@@ -552,6 +557,7 @@ mod tests {
 
     #[test]
     fn feature_levels_pick_the_highest_supported() {
+        let _gpu = crate::host::gpu_test_lock();
         type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
         let device = device();
         let check = slot::<Check>(device, 0x68);
@@ -573,6 +579,7 @@ mod tests {
     /// The queries the AMD upscaler's capability check makes.
     #[test]
     fn shader_model_and_wave_options_are_the_consoles() {
+        let _gpu = crate::host::gpu_test_lock();
         type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
         let device = device();
         let check = slot::<Check>(device, 0x68);
@@ -596,6 +603,7 @@ mod tests {
 
     #[test]
     fn a_healthy_device_reports_no_removal() {
+        let _gpu = crate::host::gpu_test_lock();
         let device = device();
         let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
         assert_eq!(reason(device), S_OK);

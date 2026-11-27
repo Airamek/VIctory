@@ -200,6 +200,7 @@ mod tests {
     /// parallelogram at the top right.
     #[test]
     fn rectangles_get_their_fourth_corner() {
+        let _gpu = crate::host::gpu_test_lock();
         let vertex = |x: f32, y: f32, r: u8| {
             let mut v = Vec::new();
             v.extend(x.to_le_bytes());
@@ -230,6 +231,7 @@ mod tests {
     /// winding in both halves.
     #[test]
     fn rectangles_complete_opposite_their_right_angle() {
+        let _gpu = crate::host::gpu_test_lock();
         let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
         let src = [vertex(0.0, 0.0), vertex(0.0, 1.0), vertex(1.0, 0.0)].concat();
         let mut dst = vec![0u8; 6 * 8];
@@ -252,6 +254,7 @@ mod tests {
     /// (the carry used to be or-ed into an odd exponent, halving the value).
     #[test]
     fn halves_round_up_into_the_next_power_of_two() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(f32_to_half(2.0 - 2f32.powi(-12)), 0x4000);
         assert_eq!(f32_to_half(0.5 - 2f32.powi(-13)), 0x3800);
         assert_eq!(f32_to_half(65520.0), 0x7c00, "past the largest half");
@@ -272,6 +275,7 @@ mod tests {
     /// code indexed past the vertex and panicked.
     #[test]
     fn elements_past_the_stride_are_left_alone() {
+        let _gpu = crate::host::gpu_test_lock();
         let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
         let src = [vertex(0.0, 2.0), vertex(1.0, 3.0), vertex(5.0, 7.0)].concat();
         let mut dst = vec![0u8; 6 * 8];
@@ -282,6 +286,7 @@ mod tests {
 
     #[test]
     fn normalized_attributes_are_interpolated_in_their_own_range() {
+        let _gpu = crate::host::gpu_test_lock();
         let vertex = |rg: [u8; 2], u16_value: u16, u8_value: u8, snorm8: i8, snorm16: i16| {
             [
                 &rg[..],
@@ -311,6 +316,7 @@ mod tests {
     /// able to write them back instead of flushing every one to zero.
     #[test]
     fn half_subnormals_convert_in_both_directions() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(f32_to_half(2f32.powi(-24)), 0x0001);
         assert_eq!(f32_to_half(-2f32.powi(-24)), 0x8001);
         assert_eq!(f32_to_half(2f32.powi(-23)), 0x0002);
@@ -326,6 +332,7 @@ mod tests {
 
     #[test]
     fn f32_to_half_preserves_nan_and_rounds_normals_to_nearest_even() {
+        let _gpu = crate::host::gpu_test_lock();
         // Quiet and signalling NaNs (both signs) must produce quiet f16 NaNs,
         // never infinities (0x7c00 / 0xfc00).
         for (bits, want) in [
@@ -374,6 +381,7 @@ mod tests {
 
     #[test]
     fn zero_or_overflowing_stride_is_ignored_without_panicking() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut dst = [0xAAu8; 16];
         expand_rects(&[1, 2, 3], &mut dst, 0, &[(0, 16)]);
         assert_eq!(dst, [0xAAu8; 16]);
@@ -383,6 +391,7 @@ mod tests {
 
     #[test]
     fn unorm16_unorm8_clamping_and_unknown_formats_expand_correctly() {
+        let _gpu = crate::host::gpu_test_lock();
         // Vertex layout (12 bytes):
         //   0..4: R16G16_UNORM (format 35)
         //   4..8: R8G8B8A8_UNORM (format 28) — tests clamping below 0 and above 1
@@ -420,6 +429,7 @@ mod tests {
 
     #[test]
     fn multiple_rectangles_and_f32_f16_vector_formats_expand_in_sequence() {
+        let _gpu = crate::host::gpu_test_lock();
         // Two rectangles of R32G32B32_FLOAT (format 6, 12 bytes) + R16G16_FLOAT (format 34, 4 bytes) = 16 bytes
         let v = |p: [f32; 3], uv: [f32; 2]| {
             let mut b = Vec::with_capacity(16);

@@ -1384,6 +1384,7 @@ mod tests {
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
+        let _gpu = crate::host::gpu_test_lock();
         // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
         // Padded size (1024) must be clamped to 784 so from_raw_parts_mut stays in bounds.
         assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
@@ -1393,6 +1394,7 @@ mod tests {
 
     #[test]
     fn movie_plane_needs_a_single_r8_subresource() {
+        let _gpu = crate::host::gpu_test_lock();
         use victory_formats::texture::{Desc, Dimension, Swizzle};
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_SUBRESOURCE_FOOTPRINT,
@@ -1494,6 +1496,7 @@ mod tests {
 
     #[test]
     fn committed_rejects_overflow_and_noaccess_pages() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
             VirtualFree,
@@ -1519,6 +1522,7 @@ mod tests {
 
     #[test]
     fn merge_spans_coalesces_overlapping_and_adjacent_intervals() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut s = vec![
             (100, 200),
             (50, 50),
@@ -1539,6 +1543,7 @@ mod tests {
 
     #[test]
     fn parallel_pool_reuses_worker_scratch_and_handles_reentrancy_and_panics() {
+        let _gpu = crate::host::gpu_test_lock();
         use std::collections::HashSet;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1651,6 +1656,7 @@ mod tests {
 
     #[test]
     fn committed_cached_matches_committed_and_remembers_committed_pages() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -1695,6 +1701,7 @@ mod tests {
     /// passes by without one.
     #[test]
     fn plane_chunks_are_not_reused_while_held_or_covered() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::core::Interface;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here

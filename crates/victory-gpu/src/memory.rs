@@ -809,6 +809,7 @@ mod tests {
     /// miss through the next one, then go back again.
     #[test]
     fn a_miss_holds_back_its_frame_and_the_next() {
+        let _gpu = crate::host::gpu_test_lock();
         assert!(!withheld_in(0, MISS_NEVER));
         assert!(!withheld_in(u64::MAX, MISS_NEVER));
         assert!(withheld_in(7, 7));
@@ -830,6 +831,7 @@ mod tests {
 
     #[test]
     fn addresses_find_the_copy_holding_them() {
+        let _gpu = crate::host::gpu_test_lock();
         // A 4 MiB window, a buffer inside it from 0x40_0000+0x1_8000
         // (pages in part), and a buffer above 4 GiB.
         let copies = [
@@ -860,6 +862,7 @@ mod tests {
     /// named, the rest read as missing; the table fits its buffer.
     #[test]
     fn a_full_table_names_the_largest_copies() {
+        let _gpu = crate::host::gpu_test_lock();
         let copies: Vec<(u64, u64)> = (0..CAPACITY as u64 + 2).map(|k| (k << 28, 0x1_0000 + k)).collect();
         let pairs: Vec<u32> = (0..copies.len() as u32).map(|k| 10 + 2 * k).collect();
         let (dwords, blocks, _) = table(&copies, &pairs, 4);
@@ -871,6 +874,7 @@ mod tests {
 
     #[test]
     fn table_skips_overflowing_and_out_of_range_copies() {
+        let _gpu = crate::host::gpu_test_lock();
         let copies = [
             (u64::MAX - 0x100, 0x200),
             (1u64 << 40, 0x1_0000),
@@ -888,8 +892,8 @@ mod tests {
     /// GPU (a view heap and a shadow copy); passes by without one.
     #[test]
     fn a_heap_prepares_its_table_walk_once_per_generation() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
-        let _guard = gpu_test_lock();
         let (Some(host), Some(_heap)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
@@ -932,6 +936,7 @@ mod tests {
 
     #[test]
     fn has_missed_checks_block_zero_out_of_range_unowned_and_owned() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut owner = vec![NO_OWNER; 2 * BLOCK];
         owner[BLOCK + 5] = 0;
         let l = Layout {
@@ -965,14 +970,9 @@ mod tests {
         assert!(has_missed(&marks, &l));
     }
 
-    fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     #[test]
     fn bitmap_pool_reuses_and_zeroes_across_resets() {
-        let _guard = gpu_test_lock();
+        let _gpu = crate::host::gpu_test_lock();
         let (Some(host), Some(_views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
@@ -1097,7 +1097,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// dynamic slot.
     #[test]
     fn lists_share_a_table_and_copies_keep_their_views() {
-        let _guard = gpu_test_lock();
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
@@ -1225,7 +1225,7 @@ void main() {
     /// writes in the copies.
     #[test]
     fn a_submission_that_missed_leaves_the_copies_at_once() {
-        let _guard = gpu_test_lock();
+        let _gpu = crate::host::gpu_test_lock();
         use crate::watch::PAGE;
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {

@@ -2092,6 +2092,7 @@ mod tests {
 
     #[test]
     fn lists_bind_the_initial_pipeline_on_creation() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::pipeline::{ComputeHead, create_compute};
 
         // A synthetic compute description matching the public ABI.
@@ -2159,6 +2160,7 @@ mod tests {
     /// the methods newer lists insert: the AMD upscaler calls them there.
     #[test]
     fn unordered_access_clears_have_the_same_slots_in_both_layouts() {
+        let _gpu = crate::host::gpu_test_lock();
         for table in [&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS] {
             assert_eq!(table.0[0x1a8 / 8], state::clear_unordered_uint as *const ());
             assert_eq!(
@@ -2171,6 +2173,7 @@ mod tests {
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let mut allocator = null;
         assert_eq!(
@@ -2218,6 +2221,7 @@ mod tests {
     /// query destination buffer.
     #[test]
     fn resolve_queries_rejects_overflowing_offset() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let mut allocator = null;
         assert_eq!(

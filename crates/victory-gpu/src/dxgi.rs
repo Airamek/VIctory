@@ -287,6 +287,7 @@ mod tests {
     /// description, factory, first output.
     #[test]
     fn startup_walks_from_device_to_output() {
+        let _gpu = crate::host::gpu_test_lock();
         let d3d = crate::device::device();
         let newest_pc = guid(
             0x6007896c,
@@ -327,6 +328,7 @@ mod tests {
 
     #[test]
     fn out_of_range_enumeration_clears_output() {
+        let _gpu = crate::host::gpu_test_lock();
         for (object, offset, method) in [
             (&FACTORY_OBJECT, 0x38, "EnumAdapters"),
             (&FACTORY_OBJECT, 0x60, "EnumAdapters1"),

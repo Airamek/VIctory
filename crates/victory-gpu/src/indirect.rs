@@ -455,6 +455,7 @@ mod tests {
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
+        let _gpu = crate::host::gpu_test_lock();
         if super::host().is_none() {
             return; // no host GPU here
         }
@@ -510,6 +511,7 @@ mod tests {
     /// let four; of 600 garbage mesh dispatches 16, not 31.
     #[test]
     fn rejected_records_do_not_wrap_the_budget() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
             return; // no host GPU here
         };
@@ -523,6 +525,7 @@ mod tests {
     /// small records that all fit all run.
     #[test]
     fn the_budget_goes_to_the_first_records() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(draws) = clamped(0, &[3 << 18, 1, 0, 0], 200, 1) else {
             return; // no host GPU here
         };
@@ -537,6 +540,7 @@ mod tests {
     /// and the small ones after it run.
     #[test]
     fn a_record_that_does_not_fit_takes_nothing() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut words = [1 << 24, 3, 0, 0].repeat(3);
         words.extend([3, 1, 0, 0].repeat(6));
         let Some(draws) = clamped(0, &words, 8, 1) else {
@@ -553,6 +557,7 @@ mod tests {
     /// title's copy is never transitioned, and all end common.
     #[test]
     fn argument_buffers_move_from_their_current_states() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::host::tests::{issued, replay};
         use windows::core::Interface;
         let Some(host) = super::host() else {
@@ -605,6 +610,7 @@ mod tests {
     /// finds it spent, and they all run empty.
     #[test]
     fn a_spent_budget_stays_spent() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(twice) = clamped(1, &[u32::MAX], 64, 2) else {
             return; // no host GPU here
         };
@@ -620,6 +626,7 @@ mod tests {
     /// promotes (zeroes) and reverts it.
     #[test]
     fn chunk_scopes_uav_barriers_and_skips_zero_records() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::host::tests::{issued, replay};
         use windows::core::Interface;
         let Some(host) = super::host() else {

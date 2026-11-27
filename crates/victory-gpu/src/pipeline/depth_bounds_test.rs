@@ -17,6 +17,7 @@ struct Depth1(u32, D3D12_DEPTH_STENCIL_DESC1);
 
 #[test]
 fn depth_bounds_flag_changes_the_stream_state() {
+    let _gpu = crate::host::gpu_test_lock();
     let mut g = host::GraphicsState::default();
     let mut depth = Depth1(21, D3D12_DEPTH_STENCIL_DESC1::default());
     let read = |g: &mut host::GraphicsState, d: &Depth1| {
@@ -95,6 +96,7 @@ fn made(pso: This) -> &'static host::HostPipeline {
 
 #[test]
 fn depth_bounds_control_a_title_draw() {
+    let _gpu = crate::host::gpu_test_lock();
     let Some(host) = crate::host::host() else {
         eprintln!("skipped depth bounds render: no host D3D12 device");
         return;

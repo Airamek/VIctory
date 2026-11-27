@@ -652,6 +652,7 @@ mod tests {
 
     #[test]
     fn empty_draws_do_not_request_graphics_pipelines() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::object::{S_OK, This, guid, slot};
 
         if crate::host::host().is_none() {
@@ -717,6 +718,7 @@ mod tests {
     /// once, unless a worker has taken it.
     #[test]
     fn draws_go_ahead_of_early_starts() {
+        let _gpu = crate::host::gpu_test_lock();
         let p = Pending::new(
             Vec::new(),
             None,
@@ -753,6 +755,7 @@ mod tests {
     /// share it, and the next frame has it whole again.
     #[test]
     fn waits_of_a_frame_share_its_budget() {
+        let _gpu = crate::host::gpu_test_lock();
         let waits = Waits::new();
         let budget = Duration::from_millis(500);
         let ms = Duration::from_millis;
@@ -806,6 +809,7 @@ mod tests {
     /// from its own start: the frame waited for nearly two).
     #[test]
     fn a_thread_that_waits_while_another_does_gets_no_budget_of_its_own() {
+        let _gpu = crate::host::gpu_test_lock();
         static WAITS: Waits = Waits::new();
         let budget = Duration::from_millis(800);
         let started = Instant::now();
@@ -842,6 +846,7 @@ mod tests {
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
+        let _gpu = crate::host::gpu_test_lock();
         let p = Arc::new(Pending::new(
             Vec::new(),
             None,
@@ -859,6 +864,7 @@ mod tests {
 
     #[test]
     fn zero_group_dispatches_do_not_request_a_pipeline() {
+        let _gpu = crate::host::gpu_test_lock();
         use crate::object::{S_OK, This, slot};
 
         let Some(host) = crate::host::host() else {
@@ -895,6 +901,7 @@ mod tests {
     /// Huge driver compiles wait for the slot; ordinary ones never do.
     #[test]
     fn huge_compiles_wait_for_the_slot() {
+        let _gpu = crate::host::gpu_test_lock();
         assert!(!huge(0));
         assert!(!huge(HUGE_BYTES - 1));
         assert!(huge(HUGE_BYTES));
@@ -921,6 +928,7 @@ mod tests {
     #[cfg(feature = "diagnostics")]
     #[test]
     fn skipped_pipeline_stays_off_the_queue() {
+        let _gpu = crate::host::gpu_test_lock();
         let hashes = crate::pipeline::parse_skip_hashes(" 0123456789ABCDEF ");
         let shader = Arc::new(Shader {
             stage: "compute",

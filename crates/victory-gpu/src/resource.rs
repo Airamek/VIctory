@@ -2633,6 +2633,7 @@ mod tests {
 
     #[test]
     fn a_regions_rows_in_a_footprint() {
+        let _gpu = crate::host::gpu_test_lock();
         // R32_FLOAT (41) 100x8x1, pitch 512.
         let f = PlacedFootprint { offset: 4096, format: 41, width: 100, height: 8, depth: 1, row_pitch: 512 };
         assert_eq!(f.rows([2, 3, 0], [10, 2, 1]), Some(vec![(3 * 512 + 8, 40), (4 * 512 + 8, 40)]));
@@ -2645,6 +2646,7 @@ mod tests {
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
+        let _gpu = crate::host::gpu_test_lock();
         // DXGI_FORMAT values: 60 R8_TYPELESS, 61 R8_UNORM, 62 R8_UINT,
         // 63 R8_SNORM, 64 R8_SINT, 65 A8_UNORM. The R8 typeless family is
         // 60..=64; A8_UNORM has no typeless family and cannot be cast to R8,
@@ -2721,6 +2723,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn host_textures_are_made_on_first_use_with_every_use_of_their_memory() {
+        let _gpu = crate::host::gpu_test_lock();
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
@@ -2751,6 +2754,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn only_textures_fed_from_title_memory_are_given_up() {
+        let _gpu = crate::host::gpu_test_lock();
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
@@ -2787,6 +2791,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn placed_textures_made_side_by_side_are_one_each() {
+        let _gpu = crate::host::gpu_test_lock();
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
@@ -2810,6 +2815,7 @@ mod tests {
     /// gone.
     #[test]
     fn idle_textures_go_and_past_the_budget_the_least_recently_used() {
+        let _gpu = crate::host::gpu_test_lock();
         let (frame, now) = (1_000, 1_000_000);
         let recent = (frame, now - 1_000, 10);
         let idle = (frame - IDLE_FRAMES, now - IDLE_MS, 10);
@@ -2828,6 +2834,7 @@ mod tests {
     /// marks.
     #[test]
     fn placed_pressure_is_hysteresis_to_the_low_marks() {
+        let _gpu = crate::host::gpu_test_lock();
         assert_eq!(placed_excess(0, 0, 0, 0), (0, 0));
         assert_eq!(placed_excess(PLACED_HIGH_BYTES - 1, PLACED_HIGH_COUNT - 1, 0, 0), (0, 0));
         assert_eq!(
@@ -2845,6 +2852,7 @@ mod tests {
     /// another memory. The library's own layout pick resolves as spelled.
     #[test]
     fn one_memory_one_key_in_any_format_of_its_element() {
+        let _gpu = crate::host::gpu_test_lock();
         let a = ResourceDesc { flags: 4, ..texture(192, 108, 42, 1) };
         let b = ResourceDesc { format: 67, flags: 0, ..a };
         let key = memory_key(0x1_0000, &a);
@@ -2863,6 +2871,7 @@ mod tests {
     /// depth ones; block formats among block formats of their block size.
     #[test]
     fn castable_formats_share_the_element() {
+        let _gpu = crate::host::gpu_test_lock();
         let c = castable(42);
         for f in [67, 28, 29, 41, 24, 26, 87, 35] {
             assert!(c.contains(&f), "{f}");
@@ -2879,6 +2888,7 @@ mod tests {
 
     #[test]
     fn heaps_are_zeroed_aligned_memory() {
+        let _gpu = crate::host::gpu_test_lock();
         let heap = heap(1 << 20);
         // SAFETY: a heap we just made.
         let memory = unsafe { &(*heap.cast::<Heap>()).memory };
@@ -2904,6 +2914,7 @@ mod tests {
 
     #[test]
     fn device_setup_heap_properties_and_resources_at_addresses() {
+        let _gpu = crate::host::gpu_test_lock();
         let device = crate::device::device();
         // GetCustomHeapProperties (0xd0): the struct comes back through the
         // hidden first argument, which is also returned.
@@ -2966,6 +2977,7 @@ mod tests {
 
     #[test]
     fn sizes_cover_every_mip() {
+        let _gpu = crate::host::gpu_test_lock();
         let size = |d: &ResourceDesc| footprint(d).map(|i| i.size);
         assert_eq!(size(&buffer(256)), Some(KIB_64));
         // Textures take their console layout and its alignment (4 KiB
@@ -3030,6 +3042,7 @@ mod tests {
 
     #[test]
     fn upload_footprints_follow_the_pc_rules() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let mut layouts = [NO_FOOTPRINT; 2];
         let (mut rows, mut sizes, mut total) = ([0; 2], [0; 2], 0);
@@ -3055,6 +3068,7 @@ mod tests {
 
     #[test]
     fn depth_stencil_footprints_follow_the_pc_plane_order() {
+        let _gpu = crate::host::gpu_test_lock();
         // Native D3D12 reports the same layout for both depth/stencil families
         // and their view formats. Mips vary fastest, then array slices, then planes.
         let expected = [
@@ -3107,6 +3121,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -3307,6 +3322,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_texture_read_back_reaches_the_title_buffer() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3380,6 +3396,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_list_waiting_for_another_queues_write_reads_what_it_wrote() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3481,6 +3498,7 @@ mod tests {
 
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let mut committed = null;
         let hr = create_committed(
@@ -3546,6 +3564,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_occlusion_query_reports_what_the_draws_passed() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(_host) = crate::host::host() else {
             return; // no host GPU here
         };

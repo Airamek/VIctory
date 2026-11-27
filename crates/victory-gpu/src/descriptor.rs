@@ -1061,6 +1061,7 @@ pub(crate) mod tests {
     /// 16.8 MiB mapping and the copies it names live on).
     #[test]
     fn a_released_view_heap_drops_its_page_table() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -1087,6 +1088,7 @@ pub(crate) mod tests {
 
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let desc = HeapDesc {
             kind: 0,
@@ -1113,6 +1115,7 @@ pub(crate) mod tests {
 
     #[test]
     fn views_survive_copies() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let mut heap = vec![0u64; 4 * 8]; // four 32-byte slots
         let at = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
@@ -1150,6 +1153,7 @@ pub(crate) mod tests {
     /// up to 4 MiB; what does not fit says so.
     #[test]
     fn constant_views_fit_their_records() {
+        let _gpu = crate::host::gpu_test_lock();
         let top = (1u64 << CONSTANT_ADDRESS_BITS) - 1;
         for address in [
             0u64,
@@ -1201,6 +1205,7 @@ pub(crate) mod tests {
     /// for all the placed views alike.
     #[test]
     fn views_at_new_addresses_add_no_entries() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
@@ -1267,6 +1272,7 @@ pub(crate) mod tests {
     /// reads as a constant or placed view, nor as the entry's next view.
     #[test]
     fn released_entries_keep_their_generations_below_the_kind_bits() {
+        let _gpu = crate::host::gpu_test_lock();
         let resource = 0x7_7e00_0000_usize;
         let slot = [0u64; 4];
         let at = slot.as_ptr() as u64;
@@ -1294,6 +1300,7 @@ pub(crate) mod tests {
     /// nor records without the tag.
     #[test]
     fn views_held_whole_are_current_for_heap_syncs() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let slots = [0u64; 4 * 4];
         let at = |k: usize| slots.as_ptr() as u64 + k as u64 * 32;
@@ -1330,6 +1337,7 @@ pub(crate) mod tests {
     /// later read does not see the previous view.
     #[test]
     fn null_cbv_clears_a_stale_view() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let slots = [0u64; 2 * 4];
         let a = slots.as_ptr() as u64;
@@ -1347,6 +1355,7 @@ pub(crate) mod tests {
     /// resource at the same address is a new record.
     #[test]
     fn views_die_with_their_resource() {
+        let _gpu = crate::host::gpu_test_lock();
         let null = std::ptr::null();
         let slots = [0u64; 2 * 4];
         let (a, b) = (slots.as_ptr() as u64, slots.as_ptr() as u64 + 32);
@@ -1367,6 +1376,7 @@ pub(crate) mod tests {
     #[cfg(windows)]
     #[test]
     fn records_copied_as_bytes_are_made_at_the_next_sync() {
+        let _gpu = crate::host::gpu_test_lock();
         let memory = crate::watch::tests::pool(1);
         let desc = HeapDesc {
             kind: SAMPLERS,
@@ -1401,6 +1411,7 @@ pub(crate) mod tests {
     /// and checks that the heap starts there.
     #[test]
     fn placed_heaps_start_at_the_title_memory() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut memory = vec![0u8; 64 * 32];
         let address = memory.as_mut_ptr() as u64;
         let desc = HeapDesc {

@@ -277,6 +277,7 @@ mod tests {
 
     #[test]
     fn submissions_finish_in_order_and_signals_follow_their_work() {
+        let _gpu = crate::host::gpu_test_lock();
         let log: Log = Arc::default();
         let t: Timeline<&str> = Timeline::new();
         // Nothing in flight: a signal is at once.
@@ -306,6 +307,7 @@ mod tests {
 
     #[test]
     fn steps_conflict_with_the_newest_submission_touching_their_memory() {
+        let _gpu = crate::host::gpu_test_lock();
         let t: Timeline<()> = Timeline::new();
         // Writes 0x1000..0x2000 and a 4-byte word at 0x9000; reads 0x5000..0x6000.
         let touches = |shaders: Vec<(usize, usize, usize)>, labels, reads| Touches {

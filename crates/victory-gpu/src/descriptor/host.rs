@@ -2231,6 +2231,7 @@ mod tests {
     /// view-stride table; float, normalized, raw and structured ones none.
     #[test]
     fn integer_typed_buffer_views_are_marked_in_the_stride_table() {
+        let _gpu = crate::host::gpu_test_lock();
         use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
         // Format, dimension (buffer), first element, count, stride, counter, flags.
         let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
@@ -2253,6 +2254,7 @@ mod tests {
     /// reading it through a table makes it.
     #[test]
     fn a_placed_texture_slot_left_null_is_made_once_a_draw_reads_it() {
+        let _gpu = crate::host::gpu_test_lock();
         if host().is_none() {
             return; // no host GPU here
         }
@@ -2285,6 +2287,7 @@ mod tests {
     /// makes it again.
     #[test]
     fn a_slot_viewing_a_texture_given_up_is_made_again_when_read() {
+        let _gpu = crate::host::gpu_test_lock();
         if host().is_none() {
             return; // no host GPU here
         }
@@ -2330,6 +2333,7 @@ mod tests {
     /// the slot's old record is the one the slot ends up viewing.
     #[test]
     fn a_slot_rewritten_while_its_view_is_prepared_views_the_new_record() {
+        let _gpu = crate::host::gpu_test_lock();
         if host().is_none() {
             return; // no host GPU here
         }
@@ -2373,6 +2377,7 @@ mod tests {
     /// binding a view of the same heap meanwhile is not held up.
     #[test]
     fn views_bound_while_another_slot_gets_its_texture_do_not_wait() {
+        let _gpu = crate::host::gpu_test_lock();
         if host().is_none() {
             return; // no host GPU here
         }
@@ -2417,6 +2422,7 @@ mod tests {
     /// a title thread writing a view meanwhile is not held up by the make.
     #[test]
     fn views_written_while_read_slots_get_their_textures_do_not_wait() {
+        let _gpu = crate::host::gpu_test_lock();
         if host().is_none() {
             return; // no host GPU here
         }
@@ -2463,6 +2469,7 @@ mod tests {
     /// others by.
     #[test]
     fn heap_syncs_make_the_slots_whose_records_changed() {
+        let _gpu = crate::host::gpu_test_lock();
         if host().is_none() {
             return; // no host GPU here
         }
@@ -2494,6 +2501,7 @@ mod tests {
     /// does those naming table entries, and passes the others by.
     #[test]
     fn heap_syncs_make_the_slots_whose_records_hold_their_views_whole() {
+        let _gpu = crate::host::gpu_test_lock();
         if host().is_none() {
             return; // no host GPU here
         }
@@ -2541,6 +2549,7 @@ mod tests {
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
     fn empty_and_overlong_buffer_views_are_refused() {
+        let _gpu = crate::host::gpu_test_lock();
         assert!(within(64, 0, 4, 16));
         assert!(within(64, 3, 1, 16));
         assert!(!within(64, 0, 0, 16));
@@ -2552,6 +2561,7 @@ mod tests {
     /// wind field), and is 2D when the title names none.
     #[test]
     fn null_uavs_keep_the_titles_dimension() {
+        let _gpu = crate::host::gpu_test_lock();
         let d = null_uav_desc(Some(8));
         assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE3D);
         // SAFETY: the member the dimension names.
@@ -2571,6 +2581,7 @@ mod tests {
     /// A null 3D UAV made on the real device leaves it alive.
     #[test]
     fn null_3d_uav_is_accepted_by_the_device() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else {
             return; // no host GPU
         };
@@ -2595,6 +2606,7 @@ mod tests {
     /// dynamic slots past it either way ([`DYNAMIC`] or [`MIN_DYNAMIC`]).
     #[test]
     fn view_addresses_cover_tables_made_afresh() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
@@ -2667,6 +2679,7 @@ mod tests {
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
@@ -2735,6 +2748,7 @@ mod tests {
 
     #[test]
     fn dynamic_search_can_find_a_run_across_the_cursor() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(heap) = HostHeap::new(false, 4) else {
             eprintln!("no host descriptor heap; skipped");
             return;
@@ -2765,6 +2779,7 @@ mod tests {
     /// structured buffer.
     #[test]
     fn sixteen_byte_multiples_are_raw() {
+        let _gpu = crate::host::gpu_test_lock();
         for stride in [0, 1, 4, 8, 12, 20, 24, 28, 60] {
             assert!(!raw_stride(stride), "stride {stride}");
         }
@@ -2815,6 +2830,7 @@ mod tests {
     /// AMD compiler on structured buffers from the heap.
     #[test]
     fn stride_and_count_tables_hold_title_values() {
+        let _gpu = crate::host::gpu_test_lock();
         let buffer = |words: [u32; 10]| View::Shader(0, Some(words));
         let ubuffer = |words: [u32; 10]| View::Unordered(0, 0, Some(words));
         // Structured strides, including 16-byte multiples (raw on host but
@@ -2862,6 +2878,7 @@ mod tests {
     /// fields: level 0's size of the resource, the view's levels, its type.
     #[test]
     fn a_texture_view_gives_its_image_descriptor_size_fields() {
+        let _gpu = crate::host::gpu_test_lock();
         // A 1000x600 2D texture of 10 levels, then an array of 6 with the
         // whole chain (mip count 0, 1024 wide: 11 levels).
         let mut texture = [0u32; 14];
@@ -2931,6 +2948,7 @@ mod tests {
 
     #[test]
     fn placed_uav_textures_create_real_host_uavs() {
+        let _gpu = crate::host::gpu_test_lock();
         let Some(host) = host() else {
             return;
         };

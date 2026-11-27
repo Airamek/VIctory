@@ -239,6 +239,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn signals_set_waiting_events() {
+        let _gpu = crate::host::gpu_test_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
         use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
@@ -280,6 +281,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn blocking_waits_end_on_signal() {
+        let _gpu = crate::host::gpu_test_lock();
         let mut f = std::ptr::null();
         assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
         assert!(!f.is_null());
@@ -303,6 +305,7 @@ mod tests {
 
     #[test]
     fn fence1_interface_is_created_and_queried() {
+        let _gpu = crate::host::gpu_test_lock();
         const FENCE1_IID: Iid = guid(
             0x433685fe,
             0xe22b,
