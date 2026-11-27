@@ -2063,6 +2063,11 @@ pub(crate) extern "system" fn create_at_address(
     )
 }
 
+/// A placed texture shell: the title address and resource description
+/// words ([`texture_at`]) it was made for.
+#[cfg(windows)]
+type PlacedKey = (u64, [u32; 14]);
+
 /// Textures the title placed in its own memory and views without a
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
 /// interface textures), by address and description: a resource at that
@@ -2075,7 +2080,7 @@ pub(crate) extern "system" fn create_at_address(
 /// through (a warning once). A shell let go of is made again from title
 /// memory on its next read, which is exact.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), (usize, u64)>> =
+static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<PlacedKey, (usize, u64)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Console bytes of the placed textures [`texture_at`] made, minus those
@@ -2113,7 +2118,7 @@ static PLACED_FREED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::ato
 /// Shells let go of, with the frame it was: a shell made again for one
 /// counts as remade ([`PLACED_EVICTIONS`]).
 #[cfg(windows)]
-static PLACED_GIVEN_UP: std::sync::Mutex<Option<std::collections::HashMap<(u64, [u32; 14]), u64>>> =
+static PLACED_GIVEN_UP: std::sync::Mutex<Option<std::collections::HashMap<PlacedKey, u64>>> =
     std::sync::Mutex::new(None);
 
 /// Console bytes of a texture of resource description `desc` (as words).
@@ -2256,7 +2261,7 @@ fn placed_admit(size: u64) {
 
 /// A placed shell is made for `key`: counted if one was let go of.
 #[cfg(windows)]
-fn placed_remade(key: &(u64, [u32; 14])) {
+fn placed_remade(key: &PlacedKey) {
     use std::sync::atomic::Ordering::Relaxed;
     let mut given = PLACED_GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(at) = given.as_mut().and_then(|g| g.remove(key)) {
@@ -2319,7 +2324,7 @@ fn evict_placed(frame: u64, now: u64, over_bytes: u64, over_count: u64) -> (u64,
     // slots are nulled below (which takes the heap locks, as `give_up` does
     // before the texture maps; `make_read` takes the heap locks around
     // making these shells).
-    let shells: Vec<((u64, [u32; 14]), usize, u64, Option<std::sync::Arc<HostTexture>>)> = {
+    let shells: Vec<(PlacedKey, usize, u64, Option<std::sync::Arc<HostTexture>>)> = {
         let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         map.iter().map(|(k, &(r, bytes))| (*k, r, bytes, made(resource(r as This)))).collect()
     };
@@ -2360,7 +2365,7 @@ fn evict_placed(frame: u64, now: u64, over_bytes: u64, over_count: u64) -> (u64,
     }
     // Entries still mapping a shell to what was snapshotted go; one mapped
     // again meanwhile (made side by side) is left to its maker.
-    let mut victims: Vec<((u64, [u32; 14]), usize, u64)> = Vec::new();
+    let mut victims: Vec<(PlacedKey, usize, u64)> = Vec::new();
     {
         let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         for &i in &gone {
