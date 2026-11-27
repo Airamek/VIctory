@@ -14,6 +14,15 @@
 - **Every delegation carries:** the branch + tip it runs on, read-only vs
   read-write scope, the exact gates or evidence that define done, and what
   the next step is when it reports back. No bare "look into X" briefs.
+- **Delegate to machine capacity.** Keep the box saturated: as many
+  parallel tracks as the hardware allows (GPU work is exclusive — one
+  GPU-heavy task at a time; CPU/IO tracks parallelize freely; C: floor 30 GB
+  always). An idle machine with queued work is a lead failure.
+- **Check every completion.** Every finished task gets verified the moment
+  it lands (gate excerpts real? report contains what was asked? evidence
+  attached?) and is immediately converted into its next step (merge, review,
+  re-brief, follow-up). Completed work never sits. Progress notes get a
+  one-line ack; completions get action.
 - **Verify, don't redo.** Re-read the anchors a teammate cites before
   merging (file:line spot-checks are lead work; re-deriving is waste).
   Review-before-merge holds for every feature branch, even lead-written ones
