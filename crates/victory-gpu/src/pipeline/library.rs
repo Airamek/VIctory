@@ -639,6 +639,21 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    stored(library, name, &wide, load, create)
+}
+
+/// Loads `name` from `library`, else makes and stores it: a store the
+/// library refuses (a name stored with another description) still yields
+/// the made pipeline. A failed cache write is a miss, not a refused
+/// pipeline (xcl's two-pass tolerate, concept port: no `crates/xcl`
+/// import, the concept reimplemented on our pipeline library).
+fn stored(
+    library: &Shared,
+    name: &str,
+    wide: &HSTRING,
+    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
     let _held = NAMES.hold(name);
     // Outside the lock: loads take up to seconds, and a save holds the lock
     // for as long as it serialises. The library's blob lives as long as it
@@ -1287,6 +1302,102 @@ mod tests {
             drop(saving);
             assert_eq!(loaded, Ok(true), "the load waited for the save");
         });
+    }
+
+    /// A pipeline the library refuses to store (its name stored with
+    /// another description) is still returned: a failed cache write is a
+    /// miss, not a refused pipeline (xcl two-pass tolerate, concept port).
+    #[test]
+    fn a_store_refused_pipeline_is_still_returned() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
+            return; // no host GPU here
+        };
+        let shader = |i: usize| {
+            let source = format!(
+                "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n\
+                 [RootSignature(RS)] [numthreads(1, 1, 1)] void main() {{ b.Store(0, b.Load(4) * {i} + {i}); }}"
+            );
+            let mut blob = None;
+            // SAFETY: the source outlives the call; the blob is read within it.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    None,
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )
+                .ok()?;
+                let blob = blob?;
+                Some(
+                    std::slice::from_raw_parts(
+                        blob.GetBufferPointer().cast::<u8>(),
+                        blob.GetBufferSize(),
+                    )
+                    .to_vec(),
+                )
+            }
+        };
+        let Some((a, b)) = shader(1).zip(shader(2)) else {
+            return; // no shader compiler here
+        };
+        // SAFETY: the code holds its root signature.
+        let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, &a).unwrap() };
+        let desc = |code: &[u8]| D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
+            },
+            ..Default::default()
+        };
+        let (desc_a, desc_b) = (desc(&a), desc(&b));
+        let library = open(&device, Blob::None).expect("an empty library");
+        let shared = Shared {
+            loads: library.library.clone(),
+            state: Mutex::new(library),
+        };
+        let name = "tolerate: a refused store keeps the made pipeline";
+        let wide = HSTRING::from(name);
+        let make = |desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC| {
+            stored(
+                &shared,
+                name,
+                &wide,
+                // SAFETY: the description points at live data.
+                |library, name| unsafe { library.LoadComputePipeline(name, desc) },
+                // SAFETY: as above.
+                || unsafe { device.CreateComputePipelineState(desc) },
+            )
+        };
+        make(&desc_a).expect("stored");
+        let pso = make(&desc_b).expect("returned despite the refused store");
+        // Usable: it sets on a list. The library still holds the first.
+        // SAFETY: plain creation calls on the live device.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .unwrap();
+            list.SetPipelineState(&pso);
+            list.Close().unwrap();
+            let _: ID3D12PipelineState = shared
+                .loads
+                .LoadComputePipeline(PCWSTR(wide.as_ptr()), &desc_a)
+                .expect("the library still holds the first pipeline");
+        }
     }
 
     #[test]

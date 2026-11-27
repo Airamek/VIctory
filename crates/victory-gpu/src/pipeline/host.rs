@@ -188,7 +188,12 @@ impl GraphicsState {
                 }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
-                    if layout.pInputElementDescs.is_null() {
+                    if layout.pInputElementDescs.is_null() || layout.NumElements == 0 {
+                        // Omitted: a zero-count layout carries only inert
+                        // pointers and padding (xcl d61ff), and must not wipe
+                        // a layout read before it. A null pointer with a
+                        // nonzero count is unsupported active state, also
+                        // omitted.
                         return;
                     }
                     let elements = std::slice::from_raw_parts(
@@ -1168,6 +1173,62 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    /// A zero-count input layout (inert pointers, garbage padding) is
+    /// omitted, as xcl canonicalizes inactive two-pass stream
+    /// descriptors: it neither wipes a layout read before it nor changes
+    /// the key, and alone it reads as no vertex input.
+    #[test]
+    fn empty_input_layouts_are_omitted() {
+        let name = c"TEXCOORD";
+        let one = D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(name.as_ptr().cast()),
+            SemanticIndex: 2,
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            InputSlot: 1,
+            AlignedByteOffset: 8,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        };
+        // A layout subobject's 24 bytes: kind, then the description at +8.
+        fn subobject(layout: &D3D12_INPUT_LAYOUT_DESC) -> Vec<u8> {
+            let mut bytes = vec![0xAAu8; 24];
+            bytes[..4].copy_from_slice(&12u32.to_le_bytes());
+            // SAFETY: plain-old-data description, read within this call.
+            let desc = unsafe {
+                std::slice::from_raw_parts(
+                    (layout as *const D3D12_INPUT_LAYOUT_DESC).cast::<u8>(),
+                    size_of::<D3D12_INPUT_LAYOUT_DESC>(),
+                )
+            };
+            bytes[8..8 + size_of::<D3D12_INPUT_LAYOUT_DESC>()].copy_from_slice(desc);
+            bytes
+        }
+        let full = D3D12_INPUT_LAYOUT_DESC {
+            pInputElementDescs: &one,
+            NumElements: 1,
+        };
+        let empty = D3D12_INPUT_LAYOUT_DESC {
+            pInputElementDescs: 0x5000 as *const D3D12_INPUT_ELEMENT_DESC,
+            NumElements: 0,
+        };
+        let (full, empty) = (subobject(&full), subobject(&empty));
+        // SAFETY: whole layout subobjects of kind 12.
+        unsafe {
+            let mut state = GraphicsState::default();
+            state.read(12, full.as_ptr());
+            assert_eq!(state.inputs.len(), 1);
+            let keyed = state.describe();
+            state.read(12, empty.as_ptr());
+            assert_eq!(state.inputs.len(), 1);
+            assert_eq!(state.describe(), keyed);
+            // Alone, an empty layout reads as no vertex input.
+            let mut bare = GraphicsState::default();
+            bare.read(12, empty.as_ptr());
+            assert!(bare.inputs.is_empty());
+            assert_eq!(bare.describe(), GraphicsState::default().describe());
+        }
     }
 
     /// Blending is off on integer render targets (D3D12 forbids it; the
