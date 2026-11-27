@@ -17,7 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -101,6 +101,17 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// The last presented frame and milliseconds the title used it (a list
+    /// named it, or a submission refreshed it): [`evict_unused`] gives up
+    /// idle copies first.
+    last: [AtomicU64; 2],
+    /// A pressure-served copy, never in [`BUFFERS`], [`LOOSE`] or [`EXACT`]:
+    /// made whole from title memory at every submission ([`Shadow::update`]
+    /// with no tracker), pinned by its lists until they reset.
+    transient: bool,
+    /// A pooled buffer's bytes, when its buffer came from the transient
+    /// pool: given back there (still charged) when it goes.
+    pool_cap: Option<u64>,
 }
 
 /// `[from, to)` of a copy, kept from `at` of [`SNAPSHOTS`]' bytes on.
@@ -169,16 +180,89 @@ fn forget(parts: &mut Vec<Part>) {
 impl Drop for Shadow {
     /// With a range not copied back (its list was reset meanwhile), with its
     /// shared-buffer run to hand back, and with mark bits to hand back.
+    /// Pooled transient buffers go back to the pool (still charged: the
+    /// commit is still held); everything else is uncharged, except arena
+    /// runs (charged with their chunk, not the copy) and card shadows (the
+    /// card engine's VRAM accounting owns those: never in the bound, so the
+    /// bound only ever holds evictable bytes).
     fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
         forget(&mut self.before.get_mut().unwrap_or_else(|e| e.into_inner()).0);
         if let Some(slice) = self.slice {
             arena().give_back(slice);
+        } else if self.transient {
+            if let Some(cap) = self.pool_cap.filter(|&c| c >= self.len) {
+                SHADOW_BYTES.fetch_add(cap - self.len, Relaxed);
+                if return_transient_buffer(self.buffer.clone(), self.data as usize, self.gpu, cap) {
+                    SHADOW_STATS[SHADOW_STATS_FREED].fetch_add(1, Relaxed);
+                    return;
+                }
+                SHADOW_BYTES.fetch_sub(cap - self.len, Relaxed);
+            }
+            SHADOW_BYTES.fetch_sub(self.len, Relaxed);
+        } else if !self.is_card() {
+            SHADOW_BYTES.fetch_sub(self.len, Relaxed);
         }
+        SHADOW_STATS[SHADOW_STATS_FREED].fetch_add(1, Relaxed);
         if let Some(base) = self.marks {
             let mut m = marks();
             m.owners.remove(&base);
             m.give_back(base, pages(self.start, self.len));
         }
+    }
+}
+
+/// Host bytes held by copies of title memory: [`BUFFERS`] and [`LOOSE`]
+/// copies' title bytes plus pooled transient buffers (see [`SHADOW_ARENA_BYTES`]
+/// for the arena chunks [`EXACT`] copies live in). Card-resident shadows are
+/// not charged here (the card engine's VRAM accounting owns those), so the
+/// bound only ever holds evictable bytes. Bounded by [`evict_unused`]
+/// and the transient fallback in [`find`]/[`loose`]/[`exact`]/[`Arena::take`].
+pub(crate) static SHADOW_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Of the host commit copies hold, in arena chunks: charged per chunk, with
+/// the per-chunk breakdown in [`log_shadow`].
+static SHADOW_ARENA_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Copies made, freed, given up by [`evict_unused`], and pressure-served
+/// transients ([`SHADOW_STATS_TRANSIENT`]).
+pub(crate) static SHADOW_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+const SHADOW_STATS_MADE: usize = 0;
+const SHADOW_STATS_FREED: usize = 1;
+const SHADOW_STATS_EVICTED: usize = 2;
+const SHADOW_STATS_TRANSIENT: usize = 3;
+
+/// Past this share of the system (non-local) video-memory budget, host
+/// copies of title memory are given up least recently used first, until use
+/// is back under [`SHADOW_LOW`]: mirrors `crate::resource` (`BUDGET_HIGH` /
+/// `BUDGET_LOW`), but against the budget host copies actually commit.
+const SHADOW_HIGH: f64 = 0.90;
+const SHADOW_LOW: f64 = 0.85;
+
+/// The system-memory budget's bytes, when the host tells it.
+fn shadow_budget() -> Option<u64> {
+    crate::host::video_memory().map(|[_, (_, budget)]| (budget * 1e6) as u64)
+}
+
+/// Host bytes copies hold now (buffers, loose windows, transients, pooled
+/// transient buffers, and arena chunks; not card-resident shadows, which the
+/// card engine's VRAM accounting owns).
+fn shadow_total() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    SHADOW_BYTES.load(Relaxed).saturating_add(SHADOW_ARENA_BYTES.load(Relaxed))
+}
+
+/// Whether `ask` more bytes would put copies past [`SHADOW_HIGH`] of the
+/// budget: the caller gives up idle copies first, else serves a transient.
+fn pressured(ask: u64) -> bool {
+    shadow_budget().is_some_and(|budget| shadow_total().saturating_add(ask) > (SHADOW_HIGH * budget as f64) as u64)
+}
+
+/// Gives up idle copies until `ask` more bytes fit under [`SHADOW_LOW`].
+fn relieve(ask: u64) {
+    let Some(budget) = shadow_budget() else { return };
+    let low = (SHADOW_LOW * budget as f64) as u64;
+    let over = shadow_total().saturating_add(ask).saturating_sub(low);
+    if over > 0 {
+        evict(crate::queue::presented(), crate::resource::now_ms(), over);
     }
 }
 
@@ -347,7 +431,11 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
+        self.touch();
         list.defer_refresh(self, address as usize, len as usize);
+        if self.transient {
+            list.keep_transient(self);
+        }
     }
 
     fn new(
@@ -381,6 +469,7 @@ impl Shadow {
         } else {
             tracked.as_ref().and_then(|_| marks().take(pages(start, len)))
         };
+        let (frame, now) = (crate::queue::presented(), crate::resource::now_ms());
         let shadow = Arc::new(Shadow {
             buffer,
             state: AtomicU32::new(0),
@@ -395,11 +484,79 @@ impl Shadow {
             base: slice.map_or(0, |s| s.offset),
             slice,
             card,
+            last: [AtomicU64::new(frame), AtomicU64::new(now)],
+            transient: false,
+            pool_cap: None,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
+        if slice.is_none() && !shadow.is_card() {
+            // An arena run's bytes are charged with its chunk
+            // ([`Arena::take`]), not with the copy, and a card shadow's with
+            // the card engine's VRAM accounting: the bound only ever holds
+            // evictable bytes.
+            use std::sync::atomic::Ordering::Relaxed;
+            SHADOW_BYTES.fetch_add(len, Relaxed);
+        }
+        // Every copy counts as made (freed in [`Drop`]): even an arena run,
+        // whose bytes ride with its chunk.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            SHADOW_STATS[SHADOW_STATS_MADE].fetch_add(1, Relaxed);
+        }
         shadow
+    }
+
+    /// A pressure-served copy of `[start, start + len)` over `buffer` (a
+    /// pooled or fresh upload buffer, never an arena run): untracked, so
+    /// every submission copies it whole from title memory; never inserted
+    /// into [`BUFFERS`], [`LOOSE`] or [`EXACT`], never hull-cached.
+    fn new_transient(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        pool_cap: Option<u64>,
+    ) -> Arc<Shadow> {
+        use std::sync::atomic::Ordering::Relaxed;
+        SHADOW_BYTES.fetch_add(len, Relaxed);
+        SHADOW_STATS[SHADOW_STATS_MADE].fetch_add(1, Relaxed);
+        SHADOW_STATS[SHADOW_STATS_TRANSIENT].fetch_add(1, Relaxed);
+        Arc::new(Shadow {
+            buffer,
+            state: AtomicU32::new(0),
+            data,
+            gpu,
+            start,
+            len,
+            tracked: None,
+            pending: Mutex::default(),
+            before: Mutex::default(),
+            marks: None,
+            base: 0,
+            slice: None,
+            card: None,
+            last: [
+                AtomicU64::new(crate::queue::presented()),
+                AtomicU64::new(crate::resource::now_ms()),
+            ],
+            transient: true,
+            pool_cap,
+        })
+    }
+
+    /// Whether it is pressure-served ([`Shadow::new_transient`]).
+    pub(crate) fn is_transient(&self) -> bool {
+        self.transient
+    }
+
+    /// The title used it now: a list named it, or a submission refreshed it.
+    pub(crate) fn touch(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.last[0].store(crate::queue::presented(), Relaxed);
+        self.last[1].store(crate::resource::now_ms(), Relaxed);
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -450,7 +607,11 @@ impl Shadow {
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         let len = len.min(self.left(address));
+        self.touch();
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
+        if self.transient {
+            list.keep_transient(self);
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -823,6 +984,7 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.touch();
         if self.clean() {
             return 0;
         }
@@ -1485,19 +1647,44 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
+    let key = buffers()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
         .find(|(_, e)| e.end >= end)
         .map(|(k, _)| *k);
     let Some(key) = key else {
-        drop(map);
         return loose(address, end);
     };
+    if let Some(shadow) = buffers().get(&key).and_then(|e| e.shadow.clone()) {
+        shadow.touch();
+        return Some(shadow);
+    }
+    if buffers().get(&key).is_some() {
+        let len = buffers().get(&key).map(|e| e.end - key.0).unwrap_or(0);
+        let size = len.next_multiple_of(1 << 16);
+        if pressured(size) {
+            // The evict pass takes the registries itself: never under one.
+            relieve(size);
+        }
+        if pressured(size) {
+            // Bound, not refused: a copy that is never cached, made whole
+            // from title memory at every submission, until its lists reset.
+            tracing::debug!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "buffer over the host-copy bound: pressure-served copy"
+            );
+            return transient_dedicated(key.0, len);
+        }
+    }
+    let mut map = buffers();
     let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
+    if let Some(shadow) = entry.shadow.clone() {
+        shadow.touch();
+        return Some(shadow);
+    }
+    {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
@@ -1538,14 +1725,16 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len, card));
         changed();
     }
-    entry.shadow.clone()
+    let shadow = entry.shadow.clone()?;
+    shadow.touch();
+    Some(shadow)
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
+/// gets copies of the aligned windows it touches: idle ones are given up by
+/// [`evict_unused`] and remade whole on next use (this supersedes the old
+/// never-free shortcut).
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
@@ -1554,11 +1743,30 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    if let Some(shadow) = LOOSE.lock().unwrap_or_else(|e| e.into_inner()).get(&(start, len)) {
+        shadow.touch();
         return Some(shadow.clone());
     }
+    if pressured(len) {
+        // The evict pass takes the registries itself: never under one.
+        relieve(len);
+    }
     let h = host()?;
+    if pressured(len) {
+        // Bound, not refused: a copy that is never cached, made whole from
+        // title memory at every submission, until its lists reset.
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory over the host-copy bound: pressure-served copy"
+        );
+        return transient_dedicated(start, len);
+    }
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(shadow) = map.get(&(start, len)) {
+        shadow.touch();
+        return Some(shadow.clone());
+    }
     let (staging, data) = h.shared_buffer(len)?;
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
     let (buffer, card) = match crate::card::CardState::try_new(h, &staging, len) {
@@ -1587,6 +1795,275 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// Once per presented frame, before a submission (beside
+/// [`crate::resource::evict_unused`], same site in `Host::execute`): gives up
+/// host copies of title memory the title has not used for
+/// [`crate::resource::IDLE_MS`] and [`crate::resource::IDLE_FRAMES`], and past
+/// [`SHADOW_HIGH`] of the system budget the least recently used ones until
+/// under [`SHADOW_LOW`].
+pub(crate) fn evict_unused() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    let frame = crate::queue::presented();
+    if LAST.swap(frame, Relaxed) == frame {
+        return;
+    }
+    let total = shadow_total();
+    let over = match shadow_budget() {
+        Some(budget) if total > (SHADOW_HIGH * budget as f64) as u64 => {
+            total.saturating_sub((SHADOW_LOW * budget as f64) as u64)
+        }
+        _ => 0,
+    };
+    evict(frame, crate::resource::now_ms(), over);
+}
+
+/// A candidate copy: where the registry holds it (never for transients:
+/// they are never inserted, never evicted, only freed with their lists).
+enum Victim {
+    Buffer((u64, usize)),
+    Loose((u64, u64)),
+    Exact((u64, u64, u64)),
+}
+
+/// The copies that may be given up ([`evictable`]): buffers' and loose
+/// windows' registry holds, and live exact copies (weak entries upgraded).
+fn candidates() -> Vec<(Arc<Shadow>, Victim)> {
+    let mut out = Vec::new();
+    for ((start, resource), entry) in buffers().iter() {
+        if let Some(shadow) = entry.shadow.clone() {
+            out.push((shadow, Victim::Buffer((*start, *resource))));
+        }
+    }
+    for (key, shadow) in LOOSE.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        out.push((shadow.clone(), Victim::Loose(*key)));
+    }
+    for (key, weak) in EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.iter() {
+        if let Some(shadow) = weak.upgrade() {
+            out.push((shadow, Victim::Exact(*key)));
+        }
+    }
+    out
+}
+
+/// Whether `shadow` may be given up: no heap slot views it (bindless ranges
+/// or a heap slot's kept copy), no recorded or in-flight submission names it
+/// (only the registry and this pass hold it, nothing declared unwritten, no
+/// snapshot parts), and it is not card-resident (the card engine's plans, and
+/// VRAM accounting, own those).
+///
+/// A use racing this (a title thread recording) remakes the copy whole from
+/// title memory on next use: eviction only drops bytes title memory already
+/// holds. Nothing outstanding needs writing back: every declared shader
+/// write goes back through `pending`/`before` before its submission
+/// finishes, and no submission naming this copy is recorded or in flight
+/// (its steps would hold it). `marks` disarm with `pending`: arming only
+/// happens in [`Shadow::writing`], which also declares the range.
+fn evictable(shadow: &Arc<Shadow>, victim: &Victim) -> bool {
+    if shadow.is_card() {
+        return false;
+    }
+    // The registry's holds, plus this pass's own clone: Buffer/Loose hold
+    // one `Arc` each in their maps, Exact holds only a `Weak`.
+    let registry = match victim {
+        Victim::Buffer(_) | Victim::Loose(_) => 1,
+        Victim::Exact(_) => 0,
+    };
+    if Arc::strong_count(shadow) != registry + 1 {
+        return false;
+    }
+    if !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return false;
+    }
+    if !shadow.before.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty() {
+        return false;
+    }
+    let ptr = Arc::as_ptr(shadow) as usize;
+    if crate::bindless::viewing(ptr) {
+        return false;
+    }
+    if crate::descriptor::host::keeping(ptr) {
+        return false;
+    }
+    true
+}
+
+/// Gives up the copies the title has not used for [`crate::resource::IDLE_MS`]
+/// and [`crate::resource::IDLE_FRAMES`] at (`frame`, `now` ms), then the least
+/// recently used ones until `over` bytes are gone. Returns how many and their
+/// bytes.
+fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use crate::resource::{IDLE_FRAMES, IDLE_MS};
+    // Trailing fully free chunks go first (no title bytes in them), so the
+    // pass below only gives up copies holding title bytes.
+    arena().release_empty();
+    let idle = |s: &Arc<Shadow>| {
+        frame.saturating_sub(s.last[0].load(Relaxed)) >= IDLE_FRAMES
+            && now.saturating_sub(s.last[1].load(Relaxed)) >= IDLE_MS
+    };
+    let found = candidates();
+    let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..found.len()).partition(|&i| idle(&found[i].0));
+    let bytes = |i: &usize| found[*i].0.len;
+    let mut over = over.saturating_sub(gone.iter().map(bytes).sum());
+    rest.sort_by_key(|&i| found[i].0.last[1].load(Relaxed));
+    for i in rest {
+        if over == 0 {
+            break;
+        }
+        over = over.saturating_sub(bytes(&i));
+        gone.push(i);
+    }
+    let mut count = 0u64;
+    let mut freed = 0u64;
+    for i in gone {
+        let (shadow, victim) = &found[i];
+        // Re-checked: a title thread may have named it meanwhile.
+        if !evictable(shadow, victim) {
+            continue;
+        }
+        let removed = match victim {
+            Victim::Buffer(key) => buffers()
+                .get_mut(key)
+                .filter(|e| e.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, shadow)))
+                .map(|e| {
+                    e.shadow = None;
+                    changed();
+                })
+                .is_some(),
+            Victim::Loose(key) => LOOSE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(key)
+                .is_some_and(|s| Arc::ptr_eq(&s, shadow)),
+            Victim::Exact(key) => {
+                let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+                let live = guard.1.get(key).and_then(|w| w.upgrade()).is_some_and(|s| Arc::ptr_eq(&s, shadow));
+                if live {
+                    guard.1.remove(key);
+                }
+                live
+            }
+        };
+        if !removed {
+            continue;
+        }
+        // No declared write is outstanding (checked above): title memory
+        // already holds every byte. Close the snapshot bookkeeping all the
+        // same; the next use remakes the copy whole from title memory.
+        shadow.submission_done();
+        freed += shadow.len;
+        count += 1;
+        // The registry's hold is gone (`found`'s clones drop at the end of
+        // the pass): the copy is freed, and uncharged, then — unless a
+        // racing title thread named it after the check, which only remakes
+        // whole what it reads.
+    }
+    if count > 0 {
+        SHADOW_STATS[SHADOW_STATS_EVICTED].fetch_add(count, Relaxed);
+    }
+    (count, freed)
+}
+
+/// Logs [`SHADOW_STATS`] and [`SHADOW_BYTES`] per frame over `frames`, with
+/// the arena chunks' breakdown and what still lives: beside
+/// [`bindless::log`]/[`log_views`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_shadow(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [made, freed, evicted, transient] = [0, 1, 2, 3].map(|i| SHADOW_STATS[i].swap(0, Relaxed));
+    let arena_bytes = SHADOW_ARENA_BYTES.load(Relaxed);
+    let (chunks, free_bytes) = {
+        let a = arena();
+        let free_bytes: u64 = a.chunks.iter().map(|c| c.3.values().sum::<u64>()).sum();
+        (a.chunks.len(), free_bytes)
+    };
+    let live_buffers = buffers().values().filter(|e| e.shadow.is_some()).count();
+    let live_loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let (live_exact, dead_exact) = {
+        let guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let live = guard.1.values().filter(|w| w.strong_count() > 0).count();
+        (live, guard.1.len() - live)
+    };
+    let (kept_slots, kept_copies) = crate::descriptor::host::kept_census();
+    tracing::info!(
+        "host copies of title memory: {:.0} made/frame, {:.0} freed/frame, {:.0} evicted/frame ({} transient served); {:.1} MB held ({:.1} MB arena in {} chunks, {:.1} MB free) in {live_buffers} buffers, {live_loose} loose windows, {live_exact} live exact copies ({dead_exact} dead); heap slots keep {kept_slots} copies in {kept_copies} slots",
+        made as f64 / frames,
+        freed as f64 / frames,
+        evicted as f64 / frames,
+        transient,
+        shadow_total() as f64 / 1e6,
+        arena_bytes as f64 / 1e6,
+        chunks,
+        free_bytes as f64 / 1e6
+    );
+}
+
+/// Finished transient buffers for reuse ([`transient_dedicated`]): buffer,
+/// mapped pointer, host address, bytes. Bounded like `SPARE_UPLOADS` (count
+/// and bytes); over cap the buffer drops, and the next pressure ask
+/// allocates afresh.
+static SPARE_TRANSIENT: Mutex<Vec<(ID3D12Resource, usize, u64, u64)>> = Mutex::new(Vec::new());
+const SPARE_TRANSIENT_MAX: usize = 16;
+const SPARE_TRANSIENT_BYTES: u64 = 64 << 20;
+
+/// A pooled transient buffer of at least `size` bytes (capacity within
+/// twice that, best fit): still charged to [`SHADOW_BYTES`] while pooled.
+fn take_transient_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8, u64, u64)> {
+    let size = size.max(1);
+    let max_fit = size.saturating_mul(2);
+    let mut pool = SPARE_TRANSIENT.lock().unwrap_or_else(|e| e.into_inner());
+    let idx = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, _, cap))| *cap >= size && *cap <= max_fit)
+        .min_by_key(|(_, (_, _, _, cap))| *cap)
+        .map(|(i, _)| i)?;
+    let (buffer, data, gpu, cap) = pool.swap_remove(idx);
+    Some((buffer, data as *mut u8, gpu, cap))
+}
+
+/// Keeps a finished transient buffer for reuse, bounded in count and bytes;
+/// false when over cap (it drops instead).
+fn return_transient_buffer(buffer: ID3D12Resource, data: usize, gpu: u64, cap: u64) -> bool {
+    let mut pool = SPARE_TRANSIENT.lock().unwrap_or_else(|e| e.into_inner());
+    let total: u64 = pool.iter().map(|(_, _, _, c)| *c).sum();
+    if pool.len() >= SPARE_TRANSIENT_MAX || total.saturating_add(cap) > SPARE_TRANSIENT_BYTES {
+        return false;
+    }
+    pool.push((buffer, data, gpu, cap));
+    true
+}
+
+/// A pressure-served copy of `[start, start + len)`: never inserted into
+/// [`BUFFERS`], [`LOOSE`] or [`EXACT`], never hull-cached (queued per
+/// submission), pinned by its lists until they reset. Untracked, so every
+/// submission copies it whole from title memory: accuracy-neutral, only
+/// busier. `view_copy`/`buffer_srv`/`buffer_uav` keep returning `Some`; only
+/// the backing and lifetime change. `None` only with no host at all (the
+/// old bug path, never the pressure path).
+fn transient_dedicated(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    let len = len.max(1);
+    if let Some((buffer, data, gpu, cap)) = take_transient_buffer(len) {
+        let shadow = Shadow::new_transient(buffer, data, gpu, start, len, Some(cap));
+        shadow.touch();
+        // The pool held `cap` bytes charged; the copy holds `len`: the
+        // constructor charged `len` on top of the pool's still-charged `cap`,
+        // so the pool's whole `cap` goes back here.
+        use std::sync::atomic::Ordering::Relaxed;
+        SHADOW_BYTES.fetch_sub(cap, Relaxed);
+        return Some(shadow);
+    }
+    let h = host()?;
+    let (buffer, data) = h.shared_buffer(len)?;
+    crate::host::name(&buffer, || format!("pressure copy {start:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Shadow::new_transient(buffer, data, gpu, start, len, None);
+    shadow.touch();
+    Some(shadow)
+}
+
 /// The copy a buffer view of `len` bytes at `address`, whose elements are
 /// `element` bytes, reads: the innermost title buffer's ([`find`]), unless
 /// the view does not start on an element of that copy. A host view counts
@@ -1596,10 +2073,14 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// bakes' parameter blocks: refused, their slots read zeros, every meshlet
 /// culled). Such a view gets a copy of its own bytes, starting at its
 /// address (`true` with it), which lives while a heap slot made from the
-/// view or a list holds it.
+/// view or a list holds it. Over the host-copy bound the copy is
+/// pressure-served ([`transient_dedicated`], still `true`): heap slots keep
+/// its buffer but never the copy itself (each resolution mints a new one),
+/// so the slot's buffer and the refreshed copy cannot diverge behind a pin.
 pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
     let shadow = find(address, len)?;
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
+        shadow.touch();
         return Some((shadow, false));
     }
     #[cfg(feature = "diagnostics")]
@@ -1652,9 +2133,26 @@ pub(crate) fn log_views(frames: f64) {
 static EXACT: Mutex<(usize, BTreeMap<(u64, u64, u64), std::sync::Weak<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
 
 fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
+    if let Some(shadow) = EXACT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .1
+        .get(&(address, len, element))
+        .and_then(std::sync::Weak::upgrade)
+    {
+        shadow.touch();
+        return Some(shadow);
+    }
+    // The arena grows no new chunk past the bound: idle copies go first
+    // (the evict pass takes the registries itself: never under one), then
+    // the view gets a dedicated copy instead of an arena run.
+    if pressured(CHUNK) {
+        relieve(CHUNK);
+    }
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let (prune_at, map) = &mut *guard;
     if let Some(shadow) = map.get(&(address, len, element)).and_then(std::sync::Weak::upgrade) {
+        shadow.touch();
         return Some(shadow);
     }
     // Ring positions change every frame: entries die by the hundred.
@@ -1663,7 +2161,21 @@ fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
         *prune_at = (2 * map.len()).max(1024);
     }
     // A run of a shared buffer, its start a whole number of elements in.
-    let (buffer, data, gpu, slice) = arena().take(len, element)?;
+    // Over the host-copy bound the arena grows no new chunk: the view gets
+    // a copy of its own bytes over a dedicated buffer instead (never
+    // inserted here, never hull-cached).
+    let (buffer, data, gpu, slice) = match arena().take(len, element) {
+        Some(run) => run,
+        None => {
+            drop(guard);
+            tracing::debug!(
+                address = format_args!("{address:#x}"),
+                len,
+                "view over the host-copy bound: pressure-served copy"
+            );
+            return transient_dedicated(address, len);
+        }
+    };
     let shadow = Shadow::new_at(buffer, data, gpu, address, len, Some(slice), None);
     map.insert((address, len, element), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
@@ -1729,10 +2241,22 @@ impl Arena {
             Some(found) => found,
             None => {
                 let size = CHUNK.max((len + align).next_multiple_of(1 << 16));
+                if pressured(size) {
+                    // Fully free chunks go before growing past the bound
+                    // (no other lock is held under the arena's own: the
+                    // evict pass runs before, in `exact`, never here).
+                    self.release_empty();
+                }
+                if pressured(size) {
+                    // The caller serves a dedicated copy instead.
+                    return None;
+                }
                 let (buffer, data) = host()?.shared_buffer(size)?;
                 crate::host::name(&buffer, || format!("title views {size:#x}"));
                 // SAFETY: a live buffer.
                 let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                use std::sync::atomic::Ordering::Relaxed;
+                SHADOW_ARENA_BYTES.fetch_add(size, Relaxed);
                 let free = BTreeMap::from([(0, size)]);
                 self.chunks.push((buffer, data as usize, gpu, free));
                 let c = self.chunks.len() - 1;
@@ -1765,6 +2289,24 @@ impl Arena {
             n += m;
         }
         free.insert(at, n);
+    }
+
+    /// Drops trailing fully free chunks (their bytes uncharged): the last
+    /// resort before growing past the bound. Only trailing chunks go: live
+    /// slices name their chunk by index, so only popping the end keeps every
+    /// live index valid. A fully free chunk holds no live run by
+    /// construction (every live run is out of the free map).
+    fn release_empty(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        while let Some((buffer, _, _, free)) = self.chunks.last() {
+            // SAFETY: a live buffer.
+            let size = unsafe { buffer.GetDesc() }.Width;
+            if free.len() != 1 || free.get(&0) != Some(&size) {
+                break;
+            }
+            self.chunks.pop();
+            SHADOW_ARENA_BYTES.fetch_sub(size, Relaxed);
+        }
     }
 }
 
@@ -1928,9 +2470,9 @@ pub(crate) mod tests {
             return; // no host GPU here
         }
         let mut arena = Arena::default();
-        let (_, _, _, a) = arena.take(100, 456).unwrap();
-        let (_, _, _, b) = arena.take(5000, 16).unwrap();
-        let (_, _, _, c) = arena.take(4, 4).unwrap();
+        let (_, _, _, a) = arena.take(100, 456).expect("not pressured in tests");
+        let (_, _, _, b) = arena.take(5000, 16).expect("not pressured in tests");
+        let (_, _, _, c) = arena.take(4, 4).expect("not pressured in tests");
         assert!(a.offset % 456 == 0 && a.offset % 256 == 0 && b.offset % 256 == 0);
         let mut runs = [a, b, c].map(|s| (s.offset, s.offset + s.len));
         runs.sort_unstable();
@@ -1941,7 +2483,7 @@ pub(crate) mod tests {
         assert_eq!(arena.chunks.len(), 1);
         assert_eq!(arena.chunks[0].3.len(), 1, "one free run again");
         // Larger than a buffer: one of its own.
-        let (_, _, _, d) = arena.take(CHUNK + 1, 4).unwrap();
+        let (_, _, _, d) = arena.take(CHUNK + 1, 4).expect("not pressured in tests");
         assert_eq!((arena.chunks.len(), d.chunk), (2, 1));
     }
 

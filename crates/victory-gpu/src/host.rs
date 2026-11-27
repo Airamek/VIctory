@@ -2089,6 +2089,10 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: crate::fx::Set<(usize, usize, usize)>,
+    /// Pressure-served host copies handed out through this list
+    /// ([`crate::shadow::Shadow::refresh`]/[`crate::shadow::Shadow::gpu_writes`]
+    /// of a transient): pinned until the list resets, past any submission.
+    transients: Vec<std::sync::Arc<crate::shadow::Shadow>>,
     /// Textures whose contents the list brings up to date.
     textures: crate::fx::Set<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2641,6 +2645,8 @@ impl Host {
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
         crate::resource::evict_unused();
+        // Host copies of title memory past the bound go the same way.
+        crate::shadow::evict_unused();
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -4802,6 +4808,13 @@ impl HostList {
         }
     }
 
+    /// Pins a pressure-served host copy until the list resets (past any
+    /// submission): transients are never cached, so only the lists using
+    /// them hold them.
+    pub(crate) fn keep_transient(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        self.deferred().transients.push(shadow.clone());
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run
     /// (`marked`: the pages they mark).
@@ -5943,6 +5956,13 @@ impl Batch<'_> {
     ) {
         // Nothing to copy (matches `add`, which also passes clean copies by).
         if shadow.clean() {
+            return;
+        }
+        // Transients are never hull-cached: queued per submission, and made
+        // whole from title memory each time (their tracker is `None`).
+        if shadow.is_transient() {
+            shadow.touch();
+            self.add(shadow, address, len);
             return;
         }
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -7361,6 +7381,7 @@ impl Meter {
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);
+                crate::shadow::log_shadow(report_frames);
                 costs::log(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {

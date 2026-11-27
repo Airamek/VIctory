@@ -30,7 +30,9 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    /// With it the view's own copy of title memory, if it has one.
+    /// With it the view's own copy of title memory, if it has one. Tests read
+    /// this directly; every write goes through [`keep`] so [`note_kept`]
+    /// stays in sync.
     kept: Mutex<Vec<Kept>>,
     /// Where the next search starts, the slots taken, and the smallest run
     /// known not to be free since the last release (`usize::MAX`: none).
@@ -601,6 +603,7 @@ impl HostHeap {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             let old = std::mem::replace(slot, resource);
+            note_kept(&old, slot);
             #[cfg(feature = "diagnostics")]
             if let Some((old, _)) = &old
                 && !self.sampler
@@ -1358,8 +1361,72 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 
 /// The host resource a slot made by [`make`] views, if any, and the view's
 /// own copy of title memory ([`crate::shadow::for_view`]): the slot holds
-/// it, so that draws reading the view find and refresh that copy.
+/// it, so that draws reading the view find and refresh that copy. Never a
+/// pressure-served transient copy: each resolution mints a new one (never
+/// cached), so keeping one would pin a stale copy the draws never refresh
+/// (and poison the census below); the slot keeps the buffer with no copy.
+/// [`buffer_srv`]/[`buffer_uav`] filter transients out at every store.
 type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>)>;
+
+/// Heap slots' kept host copies of title memory: slots holding one, and the
+/// distinct copies, by host copy. [`keeping`] (eviction) and [`kept_census`]
+/// (diagnostics).
+static KEPT: Mutex<(u64, std::collections::BTreeMap<usize, u64>)> = Mutex::new((0, std::collections::BTreeMap::new()));
+
+/// Notes a slot's kept copy going from `old` to `new`.
+fn note_kept(old: &Kept, new: &Kept) {
+    use std::sync::Arc;
+    let (old, new) = (
+        old.as_ref().and_then(|(_, s)| s.as_ref()).map(|s| Arc::as_ptr(s) as usize),
+        new.as_ref().and_then(|(_, s)| s.as_ref()).map(|s| Arc::as_ptr(s) as usize),
+    );
+    if old == new {
+        return;
+    }
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ptr) = old {
+        kept.0 -= 1;
+        if let Some(n) = kept.1.get_mut(&ptr) {
+            *n -= 1;
+            if *n == 0 {
+                kept.1.remove(&ptr);
+            }
+        }
+    }
+    if let Some(ptr) = new {
+        kept.0 += 1;
+        *kept.1.entry(ptr).or_insert(0) += 1;
+    }
+}
+
+/// Whether any heap slot keeps `shadow` (host copy at raw pointer `ptr`) in
+/// its [`Kept`]: a copy so held is never given up by
+/// [`crate::shadow::evict_unused`] (draws find and refresh that copy through
+/// the slot).
+pub(crate) fn keeping(ptr: usize) -> bool {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner()).1.contains_key(&ptr)
+}
+
+impl Drop for HostHeap {
+    /// The heap is gone: its slots keep no copies now. Each kept slot added
+    /// one to the census ([`note_kept`]); take each back, or stale pointers
+    /// would block eviction of later copies at the same addresses.
+    fn drop(&mut self) {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let none: Kept = None;
+        for slot in kept.iter() {
+            note_kept(slot, &none);
+        }
+    }
+}
+
+/// Heap slots holding a host copy, and the distinct copies: beside
+/// [`crate::shadow::log_shadow`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn kept_census() -> (u64, usize) {
+    let kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    (kept.0, kept.1.len())
+}
 
 /// Buffer views refused so far (diagnostics: the first are logged).
 #[cfg(feature = "diagnostics")]
@@ -1435,7 +1502,10 @@ fn buffer_srv(
             host.device
                 .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
         };
-        return Some(Some((shadow.buffer.clone(), own.then_some(shadow))));
+        return Some(Some((
+            shadow.buffer.clone(),
+            own.then_some(shadow).filter(|s| !s.is_transient()),
+        )));
     }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
@@ -1491,7 +1561,10 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((
+        shadow.buffer.clone(),
+        own.then_some(shadow).filter(|s| !s.is_transient()),
+    )))
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -1570,7 +1643,10 @@ fn buffer_uav(
             )
         };
         MARK.with(|m| m.set(shadow.mark_entry(start)));
-        return Some(Some((shadow.buffer.clone(), own.then_some(shadow))));
+        return Some(Some((
+            shadow.buffer.clone(),
+            own.then_some(shadow).filter(|s| !s.is_transient()),
+        )));
     }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -1618,7 +1694,10 @@ fn buffer_uav(
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
     MARK.with(|m| m.set(shadow.mark_entry(start)));
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((
+        shadow.buffer.clone(),
+        own.then_some(shadow).filter(|s| !s.is_transient()),
+    )))
 }
 
 thread_local! {

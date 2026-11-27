@@ -1546,9 +1546,10 @@ fn made(r: &Resource) -> Option<std::sync::Arc<HostTexture>> {
     r.host.lock().unwrap_or_else(|e| e.into_inner()).clone().flatten()
 }
 
-/// Milliseconds since the first call: host textures' use stamps.
+/// Milliseconds since the first call: host textures' use stamps (and host
+/// copies' in `crate::shadow`).
 #[cfg(windows)]
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
