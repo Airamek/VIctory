@@ -296,6 +296,26 @@ fn wait_for_submission(
     }
 }
 
+/// Serializes GPU-touching tests process-wide: every test in this crate
+/// holds it for its whole body, so two tests' GPU work and process-global
+/// state (registries, guard pages, title memory) never overlap. This
+/// generalizes `submissions::GATE_LOCK`: one lock means no lock ordering
+/// to get wrong. Poison-tolerant, so a failed test never wedges the suite.
+/// Production code never takes it, and tests never call other tests, so it
+/// cannot deadlock. Ported from eval/test-determinism for the heap-shard
+/// release-count fix (Held snapshots add_ref heaps; without serialization
+/// a concurrent snapshot inflates a heap's count and the release==0 assert
+/// flakes).
+#[cfg(test)]
+pub(crate) static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds [`GPU_TEST_LOCK`] for a whole test body: the first line of every
+/// test in this crate.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host GPU if it was made (never makes it).
