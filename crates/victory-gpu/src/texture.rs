@@ -661,6 +661,15 @@ pub(crate) fn record_upload(
     list.move_texture(copy, SHADER_RESOURCE)
 }
 
+/// Serializes the tests that assert on the process-global [`ALIAS_COPIES`]
+/// counter (the established single-test-lock pattern): an alias copy one
+/// of them triggers would otherwise land in another's before/after window.
+/// Every test that can trigger an alias copy holds it for the window it
+/// measures (the holders below call `host_texture`/`readable` on aliasing
+/// textures; per-texture counters like [`uploads`] need no such lock).
+#[cfg(test)]
+pub(crate) static ALIAS_ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The uploads [`record_upload`] recorded into `resource`'s host texture
 /// (tests: counts of their own texture, whatever other tests upload
 /// meanwhile).

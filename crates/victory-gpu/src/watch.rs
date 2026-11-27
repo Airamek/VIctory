@@ -1017,6 +1017,13 @@ pub(crate) mod tests {
     };
     pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    /// Serializes the watch tests: the guard/page registries, the hole
+    /// cache, the alias table, and the fault handler are process-global
+    /// (the established single-test-lock pattern), so one watch test runs
+    /// at a time. Cross-module `pool` users keep disjoint pages and stay
+    /// out unless measurement implicates them.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
     /// A write-watched allocation of `pages` pages (as the runtime's pools),
     /// on a 64 KiB boundary (the allocation granularity).
     pub(crate) fn pool(pages: usize) -> usize {
@@ -1040,6 +1047,7 @@ pub(crate) mod tests {
 
     #[test]
     fn overlapping_kernel_writers_keep_pages_open_until_both_finish() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let p = pool(6);
         let t = track(p, 6 * PAGE, true).expect("tracked pool");
         assert_eq!(t.take(p, p + 6 * PAGE), [(p, p + 6 * PAGE)]);
@@ -1071,6 +1079,7 @@ pub(crate) mod tests {
     /// (by faults, or reported) is, and every tracker of a page sees it.
     #[test]
     fn writes_mark_every_tracker_of_their_page() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let p = pool(4);
         let a = track(p, 4 * PAGE, true).expect("pool memory is tracked");
         let b = track(p + PAGE, 2 * PAGE, true).expect("tracked");
@@ -1109,6 +1118,7 @@ pub(crate) mod tests {
     /// and leaves the other allocation alone: taking guards the pool only.
     #[test]
     fn a_range_over_foreign_memory_guards_only_the_runtimes() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
         const WINDOW: usize = 4 << 20;
         // In a free 4 MiB-aligned window: plain committed memory (as the
@@ -1156,6 +1166,7 @@ pub(crate) mod tests {
     /// starts dirty on it (everything changed at first).
     #[test]
     fn a_new_tracker_starts_dirty_on_a_bit_given_back() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let p = pool(1);
         let a = track(p, PAGE, true).expect("tracked");
         assert_eq!(a.take(p, p + PAGE).len(), 1);
@@ -1172,6 +1183,7 @@ pub(crate) mod tests {
     /// apart from the pages to copy.
     #[test]
     fn unmapped_pages_are_taken_apart() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a fresh write-watched reservation of two pages, the first
         // committed; freed below.
         let p = unsafe {
@@ -1191,6 +1203,7 @@ pub(crate) mod tests {
     /// changed; edge pages count whole when the tracked part is covered.
     #[test]
     fn partial_pages_stay_changed() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let p = pool(3);
         let t = track(p + 100, 2 * PAGE, true).expect("tracked");
         assert_eq!(t.take(p + 100, p + PAGE + 10), [(p + 100, p + PAGE + 10)]);
@@ -1296,6 +1309,7 @@ pub(crate) mod tests {
     /// is, reads as taken, and changes when the runtime maps it.
     #[test]
     fn heap_memory_is_not_tracked_and_placeholders_wait_for_mappings() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let plain = vec![0u8; 2 * PAGE];
         assert!(track(plain.as_ptr() as usize, plain.len(), true).is_none());
         // SAFETY: a reservation of ours, freed below.
@@ -1315,6 +1329,7 @@ pub(crate) mod tests {
     /// retry while still unmapped, and a remap makes them retried.
     #[test]
     fn unmapped_holes_are_cached_until_remapped() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a reservation of ours, freed below.
         let r = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
         assert_ne!(r, 0);
@@ -1346,6 +1361,7 @@ pub(crate) mod tests {
     /// lands and the block counts as changed.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -1425,6 +1441,7 @@ pub(crate) mod tests {
     /// so does a write the runtime reports at the other mapping.
     #[test]
     fn writes_through_another_mapping_mark_the_tracker() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let (a, b) = twin_views(2);
         let t = track(a, 2 * PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
@@ -1450,6 +1467,7 @@ pub(crate) mod tests {
     /// was opened, and the pages it went unseen in stayed clean).
     #[test]
     fn a_tracker_dropped_on_one_mapping_leaves_the_other_guarded() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let (a, b) = twin_views(1);
         let t = track(a, PAGE, true).expect("views are tracked");
         let u = track(b, PAGE, true).expect("views are tracked");
@@ -1465,6 +1483,7 @@ pub(crate) mod tests {
     /// take it again, and leaves it guarded: a later write still counts.
     #[test]
     fn a_retake_marks_the_copies_and_keeps_the_guard() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
         let protection = |at: usize| {
             // SAFETY: plain data filled in by the query.
@@ -1507,6 +1526,7 @@ pub(crate) mod tests {
     /// copies. A title write still marks both.
     #[test]
     fn a_retake_marks_buffer_copies_alone() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let p = pool(2);
         let copy = track_copy(p, 2 * PAGE, true).expect("pool memory is tracked");
         let texture = track(p, 2 * PAGE, true).expect("pool memory is tracked");
@@ -1560,6 +1580,7 @@ pub(crate) mod tests {
     /// to overflow. Up there no test has guarded blocks.
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);

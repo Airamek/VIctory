@@ -1237,8 +1237,14 @@ pub(crate) mod tests {
     #[test]
     fn read_marks_of_both_bitmaps_are_taken() {
         let Some(host) = host() else { return };
-        // No submission takes the marks meanwhile.
+        // The read-mark registry and both bitmaps are process-global: no
+        // sibling mark test runs meanwhile, and no submission takes the
+        // marks (lock order: the mark lock first, the submission lock second).
+        let _marks = crate::shadow::tests::MARKS_ONE.lock().unwrap_or_else(|e| e.into_inner());
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Finish in-flight submissions first: their completions drain the
+        // same read marks this test asserts on.
+        host.drain();
         let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
         crate::shadow::tests::mark_read(false, plain);
         crate::shadow::tests::mark_read(true, memory);
@@ -1277,8 +1283,12 @@ pub(crate) mod tests {
         assert!(heap_host.mirror(0, title_heap.start, true).is_some());
         let texture = crate::resource::texture_at(address, &words).expect("its resource");
         let raw = windows::core::Interface::as_raw(&crate::resource::made_copy(texture).unwrap().texture) as usize;
-        // No submission takes the marks meanwhile.
+        // No sibling mark test and no submission takes the marks meanwhile
+        // (lock order: the mark lock first, the submission lock second).
+        let _marks = crate::shadow::tests::MARKS_ONE.lock().unwrap_or_else(|e| e.into_inner());
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Finish in-flight submissions first (as above).
+        host.drain();
         for _ in 0..2 {
             crate::shadow::tests::mark_read(false, 0);
             let slots = crate::shadow::reads_since();
@@ -1324,8 +1334,12 @@ pub(crate) mod tests {
         let owned: Vec<_> = textures.iter().map(|&t| crate::resource::owned(t).expect("may be given up")).collect();
         let (idle_frames, idle_ms) = (crate::resource::IDLE_FRAMES, crate::resource::IDLE_MS);
         {
-            // No submission takes the marks meanwhile.
+            // No sibling mark test and no submission takes the marks meanwhile
+            // (lock order: the mark lock first, the submission lock second).
+            let _marks = crate::shadow::tests::MARKS_ONE.lock().unwrap_or_else(|e| e.into_inner());
             let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            // Finish in-flight submissions first (as above).
+            host.drain();
             // Passes a third of the idle limits apart, over three times them.
             for k in 0..10 {
                 crate::shadow::tests::mark_read(false, 5);
@@ -2601,6 +2615,17 @@ impl Host {
     #[cfg(test)]
     fn execute_gated(&self, runs: &[&std::sync::Arc<HostList>], gate: &ID3D12Fence) {
         self.execute_inner(runs, Some(gate));
+    }
+
+    /// Test helper: holds the submission lock, so no submission (and with it
+    /// no submission-driven drain of the process-global read marks, mark
+    /// bitmaps, snapshot block, or eviction pass) runs while the caller
+    /// asserts on that shared state. Callers must not submit while holding
+    /// it; lock order with the test-only family locks is the family lock
+    /// first, this one second.
+    #[cfg(test)]
+    pub(crate) fn submitted_lock(&'static self) -> std::sync::MutexGuard<'static, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn execute_inner(&self, runs: &[&std::sync::Arc<HostList>], #[cfg(test)] gate: Option<&ID3D12Fence>) {

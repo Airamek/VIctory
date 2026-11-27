@@ -280,6 +280,9 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return;
         };
+        // May trigger alias copies (as all four tests in this module do):
+        // keep them out of the siblings' counter windows.
+        let _alias = crate::texture::ALIAS_ONE.lock().unwrap_or_else(|e| e.into_inner());
         let pool = crate::watch::tests::pool(2);
         // Linear 4x4 R8G8B8A8_UNORM (`layout = 1`, 256-byte row pitch on console).
         let tex = texture_at(pool as u64, &texture_words(4, 4, 28, 1, 0));
@@ -350,6 +353,9 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return;
         };
+        // Asserts a +1 on the process-global alias-copy counter: no sibling
+        // alias copy may land in the window.
+        let _alias = crate::texture::ALIAS_ONE.lock().unwrap_or_else(|e| e.into_inner());
         let pool = crate::watch::tests::pool(16);
         // 16x16 R32G32_UINT (UAV) and 64x64 BC1_UNORM share 16x16 8-byte blocks.
         let writer = texture_at(pool as u64, &texture_words(16, 16, 17, 0, 4));
@@ -451,6 +457,8 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return;
         };
+        // As above: alias-copy producer, keep out of siblings' windows.
+        let _alias = crate::texture::ALIAS_ONE.lock().unwrap_or_else(|e| e.into_inner());
         let pool = crate::watch::tests::pool(4);
         // Single-plane `D32_FLOAT` (`40`) with `DEPTH | UAV` (`6`).
         let depth = texture_at(pool as u64, &texture_words(8, 8, 40, 0, 6));
@@ -558,6 +566,8 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return;
         };
+        // Asserts a +1 on the process-global alias-copy counter (as above).
+        let _alias = crate::texture::ALIAS_ONE.lock().unwrap_or_else(|e| e.into_inner());
         let pool = crate::watch::tests::pool(16);
 
         // 1. Alias path: capture `placed_copy`, then evict `placed`'s cached
